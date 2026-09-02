@@ -37,7 +37,12 @@ public:
 
 private:
 
-	void SpawnSun();
+    void SpawnSun();
+
     void SpawnPlanets();
-    bool SetPlanetSeed(AActor* PlanetActor, int64 PlanetSeed);
+
+    bool SetPlanetGenerationData(
+        AActor* PlanetActor,
+        const FPlanetGenerationData& PlanetData
+    );
 };

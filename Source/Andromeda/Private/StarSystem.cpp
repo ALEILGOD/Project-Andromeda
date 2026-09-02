@@ -3,10 +3,12 @@
 #include "Engine/World.h"
 #include "UObject/UnrealType.h"
 
+
 AStarSystem::AStarSystem()
 {
     PrimaryActorTick.bCanEverTick = false;
 }
+
 
 void AStarSystem::BeginPlay()
 {
@@ -19,8 +21,10 @@ void AStarSystem::BeginPlay()
         );
 
     SpawnSun();
+
     SpawnPlanets();
 }
+
 
 void AStarSystem::SpawnSun()
 {
@@ -48,7 +52,8 @@ void AStarSystem::SpawnSun()
         return;
     }
 
-    const FVector SunPosition = FVector::ZeroVector;
+    const FVector SunPosition =
+        GetActorLocation();
 
     const FTransform SpawnTransform(
         FRotator::ZeroRotator,
@@ -85,11 +90,12 @@ void AStarSystem::SpawnSun()
         Log,
         TEXT(
             "StarSystem: Sun spawned at center | "
-            "Location: %s"
+            "World Location: %s"
         ),
         *SunPosition.ToString()
     );
 }
+
 
 void AStarSystem::SpawnPlanets()
 {
@@ -116,6 +122,7 @@ void AStarSystem::SpawnPlanets()
 
         return;
     }
+
 
     for (const FPlanetGenerationData& PlanetData : SystemData.Planets)
     {
@@ -145,11 +152,22 @@ void AStarSystem::SpawnPlanets()
             * PlanetData.OrbitDistance
             * FMath::Sin(InclinationRadians);
 
+
+        // =====================================================
+        // CONVERT ORBIT POSITION TO WORLD SPACE
+        // =====================================================
+
+        const FVector PlanetWorldPosition =
+            GetActorLocation()
+            + OrbitPosition;
+
+
         const FTransform SpawnTransform(
             FRotator::ZeroRotator,
-            OrbitPosition,
+            PlanetWorldPosition,
             FVector::OneVector
         );
+
 
         AActor* PlanetActor =
             World->SpawnActorDeferred<AActor>(
@@ -166,7 +184,8 @@ void AStarSystem::SpawnPlanets()
                 LogTemp,
                 Error,
                 TEXT(
-                    "StarSystem: impossibile creare il pianeta %lld."
+                    "StarSystem: impossibile creare "
+                    "il pianeta %lld."
                 ),
                 PlanetData.PlanetID
             );
@@ -174,17 +193,18 @@ void AStarSystem::SpawnPlanets()
             continue;
         }
 
-        if (!SetPlanetSeed(
+
+        if (!SetPlanetGenerationData(
             PlanetActor,
-            PlanetData.PlanetSeed
+            PlanetData
         ))
         {
             UE_LOG(
                 LogTemp,
                 Error,
                 TEXT(
-                    "StarSystem: impossibile impostare PlanetSeed "
-                    "sul pianeta %lld."
+                    "StarSystem: impossibile impostare "
+                    "i dati del pianeta %lld."
                 ),
                 PlanetData.PlanetID
             );
@@ -194,9 +214,11 @@ void AStarSystem::SpawnPlanets()
             continue;
         }
 
+
         PlanetActor->FinishSpawning(
             SpawnTransform
         );
+
 
         UE_LOG(
             LogTemp,
@@ -205,19 +227,22 @@ void AStarSystem::SpawnPlanets()
                 "StarSystem: Planet %lld spawned | "
                 "Seed: %lld | "
                 "Radius: %.2f | "
-                "Location: %s"
+                "TerrainHeight: %.2f | "
+                "World Location: %s"
             ),
             PlanetData.PlanetID,
             PlanetData.PlanetSeed,
             PlanetData.PlanetRadius,
-            *OrbitPosition.ToString()
+            PlanetData.TerrainHeight,
+            *PlanetWorldPosition.ToString()
         );
     }
 }
 
-bool AStarSystem::SetPlanetSeed(
+
+bool AStarSystem::SetPlanetGenerationData(
     AActor* PlanetActor,
-    int64 PlanetSeed
+    const FPlanetGenerationData& PlanetData
 )
 {
     if (!PlanetActor)
@@ -225,12 +250,17 @@ bool AStarSystem::SetPlanetSeed(
         return false;
     }
 
-    FProperty* Property =
+
+    // =========================================================
+    // PLANET SEED
+    // =========================================================
+
+    FProperty* PlanetSeedProperty =
         PlanetActor->GetClass()->FindPropertyByName(
             TEXT("PlanetSeed")
         );
 
-    if (!Property)
+    if (!PlanetSeedProperty)
     {
         UE_LOG(
             LogTemp,
@@ -244,26 +274,276 @@ bool AStarSystem::SetPlanetSeed(
         return false;
     }
 
-    FInt64Property* Int64Property =
-        CastField<FInt64Property>(Property);
+    FInt64Property* PlanetSeedInt64 =
+        CastField<FInt64Property>(
+            PlanetSeedProperty
+        );
 
-    if (!Int64Property)
+    if (!PlanetSeedInt64)
     {
         UE_LOG(
             LogTemp,
             Error,
             TEXT(
-                "StarSystem: PlanetSeed non e' di tipo Integer64."
+                "StarSystem: PlanetSeed non e' "
+                "di tipo Integer64."
             )
         );
 
         return false;
     }
 
-    Int64Property->SetPropertyValue_InContainer(
+    PlanetSeedInt64->SetPropertyValue_InContainer(
         PlanetActor,
-        PlanetSeed
+        PlanetData.PlanetSeed
     );
+
+
+    // =========================================================
+    // PLANET RADIUS
+    // =========================================================
+
+    FProperty* PlanetRadiusProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("PlanetRadius")
+        );
+
+    if (!PlanetRadiusProperty)
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT(
+                "StarSystem: BP_Planet non contiene "
+                "la variabile PlanetRadius."
+            )
+        );
+
+        return false;
+    }
+
+    FFloatProperty* PlanetRadiusFloat =
+        CastField<FFloatProperty>(
+            PlanetRadiusProperty
+        );
+
+    if (!PlanetRadiusFloat)
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT(
+                "StarSystem: PlanetRadius non e' "
+                "di tipo Float."
+            )
+        );
+
+        return false;
+    }
+
+    PlanetRadiusFloat->SetPropertyValue_InContainer(
+        PlanetActor,
+        PlanetData.PlanetRadius
+    );
+
+
+    // =========================================================
+    // TERRAIN HEIGHT
+    // =========================================================
+
+    FProperty* TerrainHeightProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("TerrainHeight")
+        );
+
+    if (!TerrainHeightProperty)
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT(
+                "StarSystem: BP_Planet non contiene "
+                "la variabile TerrainHeight."
+            )
+        );
+
+        return false;
+    }
+
+    FFloatProperty* TerrainHeightFloat =
+        CastField<FFloatProperty>(
+            TerrainHeightProperty
+        );
+
+    if (!TerrainHeightFloat)
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT(
+                "StarSystem: TerrainHeight non e' "
+                "di tipo Float."
+            )
+        );
+
+        return false;
+    }
+
+    TerrainHeightFloat->SetPropertyValue_InContainer(
+        PlanetActor,
+        PlanetData.TerrainHeight
+    );
+
+
+    // =========================================================
+    // CONTINENTAL SCALE
+    // =========================================================
+
+    FProperty* ContinentalScaleProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("ContinentalScale")
+        );
+
+    if (!ContinentalScaleProperty)
+    {
+        return false;
+    }
+
+    FFloatProperty* ContinentalScaleFloat =
+        CastField<FFloatProperty>(
+            ContinentalScaleProperty
+        );
+
+    if (!ContinentalScaleFloat)
+    {
+        return false;
+    }
+
+    ContinentalScaleFloat->SetPropertyValue_InContainer(
+        PlanetActor,
+        PlanetData.ContinentalScale
+    );
+
+
+    // =========================================================
+    // MOUNTAIN SCALE
+    // =========================================================
+
+    FProperty* MountainScaleProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("MountainScale")
+        );
+
+    if (!MountainScaleProperty)
+    {
+        return false;
+    }
+
+    FFloatProperty* MountainScaleFloat =
+        CastField<FFloatProperty>(
+            MountainScaleProperty
+        );
+
+    if (!MountainScaleFloat)
+    {
+        return false;
+    }
+
+    MountainScaleFloat->SetPropertyValue_InContainer(
+        PlanetActor,
+        PlanetData.MountainScale
+    );
+
+
+    // =========================================================
+    // DETAIL SCALE
+    // =========================================================
+
+    FProperty* DetailScaleProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("DetailScale")
+        );
+
+    if (!DetailScaleProperty)
+    {
+        return false;
+    }
+
+    FFloatProperty* DetailScaleFloat =
+        CastField<FFloatProperty>(
+            DetailScaleProperty
+        );
+
+    if (!DetailScaleFloat)
+    {
+        return false;
+    }
+
+    DetailScaleFloat->SetPropertyValue_InContainer(
+        PlanetActor,
+        PlanetData.DetailScale
+    );
+
+
+    // =========================================================
+    // MOUNTAIN STRENGTH
+    // =========================================================
+
+    FProperty* MountainStrengthProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("MountainStrength")
+        );
+
+    if (!MountainStrengthProperty)
+    {
+        return false;
+    }
+
+    FFloatProperty* MountainStrengthFloat =
+        CastField<FFloatProperty>(
+            MountainStrengthProperty
+        );
+
+    if (!MountainStrengthFloat)
+    {
+        return false;
+    }
+
+    MountainStrengthFloat->SetPropertyValue_InContainer(
+        PlanetActor,
+        PlanetData.MountainStrength
+    );
+
+
+    // =========================================================
+    // DETAIL STRENGTH
+    // =========================================================
+
+    FProperty* DetailStrengthProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("DetailStrength")
+        );
+
+    if (!DetailStrengthProperty)
+    {
+        return false;
+    }
+
+    FFloatProperty* DetailStrengthFloat =
+        CastField<FFloatProperty>(
+            DetailStrengthProperty
+        );
+
+    if (!DetailStrengthFloat)
+    {
+        return false;
+    }
+
+    DetailStrengthFloat->SetPropertyValue_InContainer(
+        PlanetActor,
+        PlanetData.DetailStrength
+    );
+
 
     return true;
 }

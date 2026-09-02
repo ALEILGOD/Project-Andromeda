@@ -29,7 +29,7 @@ public:
     TObjectPtr<class UPointLightComponent> SunLight;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Sun")
-    float LightIntensity = 500000.0f;
+    float LightIntensity = 10000000000000.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Sun")
     float LightAttenuationRadius = 100000000.0f;
