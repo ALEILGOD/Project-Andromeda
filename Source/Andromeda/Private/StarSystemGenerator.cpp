@@ -9,6 +9,7 @@ namespace
     constexpr int64 VegetationSubsystemID = 4;
     constexpr int64 GeologicalSubsystemID = 5;
     constexpr int64 VolumetricSubsystemID = 6;
+    constexpr int64 OrbitSubsystemID = 7;
 }
 
 FStarSystemData UStarSystemGenerator::GenerateSystem(
@@ -18,10 +19,8 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
 {
     FStarSystemData SystemData;
 
-    // Salva le coordinate del sistema
     SystemData.SystemCoordinate = SystemCoordinate;
 
-    // Genera il seed deterministico del sistema
     SystemData.SystemSeed =
         UAndromedaSeedLibrary::GenerateSystemSeed(
             UniverseSeed,
@@ -30,15 +29,12 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
             SystemCoordinate.Z
         );
 
-    // Random deterministico del sistema.
-    // Viene usato solo per determinare il numero di pianeti.
     FRandomStream RandomStream(
         static_cast<int32>(
             SystemData.SystemSeed & 0x7FFFFFFF
             )
     );
 
-    // Numero di pianeti
     SystemData.PlanetCount =
         RandomStream.RandRange(1, 8);
 
@@ -46,24 +42,20 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
         SystemData.PlanetCount
     );
 
-    // Generazione dei dati di ogni pianeta
     for (int32 PlanetIndex = 0;
         PlanetIndex < SystemData.PlanetCount;
         ++PlanetIndex)
     {
         FPlanetGenerationData PlanetData;
 
-        // ID del pianeta all'interno del sistema
         PlanetData.PlanetID = PlanetIndex;
 
-        // Seed principale del pianeta
         PlanetData.PlanetSeed =
             UAndromedaSeedLibrary::GeneratePlanetSeed(
                 SystemData.SystemSeed,
                 PlanetData.PlanetID
             );
 
-        // Seed indipendenti dei sottosistemi
         PlanetData.RadiusSeed =
             UAndromedaSeedLibrary::GenerateSubsystemSeed(
                 PlanetData.PlanetSeed,
@@ -100,7 +92,12 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
                 VolumetricSubsystemID
             );
 
-        // Random indipendente per il raggio
+        const int64 OrbitSeed =
+            UAndromedaSeedLibrary::GenerateSubsystemSeed(
+                PlanetData.PlanetSeed,
+                OrbitSubsystemID
+            );
+
         FRandomStream RadiusRandom(
             static_cast<int32>(
                 PlanetData.RadiusSeed & 0x7FFFFFFF
@@ -113,7 +110,6 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
                 700000.0f
             );
 
-        // Random indipendente per i parametri del terreno
         FRandomStream TerrainRandom(
             static_cast<int32>(
                 PlanetData.TerrainSeed & 0x7FFFFFFF
@@ -156,6 +152,30 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
                 0.2f
             );
 
+        FRandomStream OrbitRandom(
+            static_cast<int32>(
+                OrbitSeed & 0x7FFFFFFF
+                )
+        );
+
+        PlanetData.OrbitDistance =
+            OrbitRandom.FRandRange(
+                5000000.0f,
+                50000000.0f
+            );
+
+        PlanetData.OrbitAngle =
+            OrbitRandom.FRandRange(
+                0.0f,
+                360.0f
+            );
+
+        PlanetData.OrbitInclination =
+            OrbitRandom.FRandRange(
+                -10.0f,
+                10.0f
+            );
+
         SystemData.Planets.Add(
             PlanetData
         );
@@ -169,7 +189,6 @@ bool UStarSystemGenerator::VerifyDeterminism(
     FAndromedaInt64Vector SystemCoordinate
 )
 {
-    // Genera due volte lo stesso sistema
     const FStarSystemData FirstSystem =
         GenerateSystem(
             UniverseSeed,
@@ -182,19 +201,16 @@ bool UStarSystemGenerator::VerifyDeterminism(
             SystemCoordinate
         );
 
-    // Il numero di pianeti deve essere identico
     if (FirstSystem.PlanetCount != SecondSystem.PlanetCount)
     {
         return false;
     }
 
-    // Il seed del sistema deve essere identico
     if (FirstSystem.SystemSeed != SecondSystem.SystemSeed)
     {
         return false;
     }
 
-    // Controlla ogni pianeta
     for (int32 PlanetIndex = 0;
         PlanetIndex < FirstSystem.Planets.Num();
         ++PlanetIndex)
@@ -290,6 +306,27 @@ bool UStarSystemGenerator::VerifyDeterminism(
         if (!FMath::IsNearlyEqual(
             FirstPlanet.DetailStrength,
             SecondPlanet.DetailStrength))
+        {
+            return false;
+        }
+
+        if (!FMath::IsNearlyEqual(
+            FirstPlanet.OrbitDistance,
+            SecondPlanet.OrbitDistance))
+        {
+            return false;
+        }
+
+        if (!FMath::IsNearlyEqual(
+            FirstPlanet.OrbitAngle,
+            SecondPlanet.OrbitAngle))
+        {
+            return false;
+        }
+
+        if (!FMath::IsNearlyEqual(
+            FirstPlanet.OrbitInclination,
+            SecondPlanet.OrbitInclination))
         {
             return false;
         }

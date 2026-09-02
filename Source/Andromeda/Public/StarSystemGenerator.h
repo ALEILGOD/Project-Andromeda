@@ -68,6 +68,15 @@ struct FPlanetGenerationData
 
     UPROPERTY(BlueprintReadOnly)
     float DetailStrength = 0.0f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float OrbitDistance = 0.0f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float OrbitAngle = 0.0f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float OrbitInclination = 0.0f;
 };
 
 USTRUCT(BlueprintType)
