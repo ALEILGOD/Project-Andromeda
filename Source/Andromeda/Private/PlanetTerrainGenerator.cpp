@@ -3,7 +3,7 @@
 
 float UPlanetTerrainGenerator::GetTerrainHeight(
     FVector Direction,
-    int32 Seed,
+    int64 Seed,
     float ContinentalScale,
     float MountainScale,
     float DetailScale,
@@ -23,9 +23,9 @@ float UPlanetTerrainGenerator::GetTerrainHeight(
     ) * TerrainHeight;
 }
 
-FPlanetSurfaceData UPlanetTerrainGenerator::GetSurfaceData(
+FVector UPlanetTerrainGenerator::GetTerrainNormal(
     FVector Direction,
-    int32 Seed,
+    int64 Seed,
     float ContinentalScale,
     float MountainScale,
     float DetailScale,
@@ -34,13 +34,7 @@ FPlanetSurfaceData UPlanetTerrainGenerator::GetSurfaceData(
     float TerrainHeight
 ) const
 {
-    FPlanetSurfaceData SurfaceData;
-
-    Direction = Direction.GetSafeNormal();
-
-    SurfaceData.Direction = Direction;
-
-    SurfaceData.Height = GetTerrainHeight(
+    return UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
         Direction,
         Seed,
         ContinentalScale,
@@ -50,14 +44,60 @@ FPlanetSurfaceData UPlanetTerrainGenerator::GetSurfaceData(
         DetailStrength,
         TerrainHeight
     );
+}
 
-    SurfaceData.NormalizedHeight =
-        TerrainHeight != 0.0f
-        ? SurfaceData.Height / TerrainHeight
-        : 0.0f;
+FPlanetSurfaceData UPlanetTerrainGenerator::GetSurfaceData(
+    FVector Direction,
+    int64 Seed,
+    float ContinentalScale,
+    float MountainScale,
+    float DetailScale,
+    float MountainStrength,
+    float DetailStrength,
+    float TerrainHeight
+) const
+{
+    return UAndromedaNoiseLibrary::GetPlanetSurfaceData(
+        Direction,
+        Seed,
+        ContinentalScale,
+        MountainScale,
+        DetailScale,
+        MountainStrength,
+        DetailStrength,
+        TerrainHeight
+    );
+}
 
-    SurfaceData.Normal =
-        Direction;
-
-    return SurfaceData;
+void UPlanetTerrainGenerator::GenerateTerrainMeshData(
+    int32 Resolution,
+    float PlanetRadius,
+    int64 Seed,
+    float ContinentalScale,
+    float MountainScale,
+    float DetailScale,
+    float MountainStrength,
+    float DetailStrength,
+    float TerrainHeight,
+    TArray<FVector>& OutVertices,
+    TArray<int32>& OutTriangles,
+    TArray<FVector>& OutNormals,
+    TArray<FProcMeshTangent>& OutTangents
+) const
+{
+    UAndromedaNoiseLibrary::GeneratePlanetMeshData(
+        Resolution,
+        PlanetRadius,
+        Seed,
+        ContinentalScale,
+        MountainScale,
+        DetailScale,
+        MountainStrength,
+        DetailStrength,
+        TerrainHeight,
+        OutVertices,
+        OutTriangles,
+        OutNormals,
+        OutTangents
+    );
 }

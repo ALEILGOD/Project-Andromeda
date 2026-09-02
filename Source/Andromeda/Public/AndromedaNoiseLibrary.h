@@ -16,7 +16,7 @@ public:
     UFUNCTION(BlueprintPure, Category = "Andromeda|Terrain")
     static float GeneratePlanetHeight(
         FVector Direction,
-        int32 Seed,
+        int64 Seed,
         float ContinentalScale,
         float MountainScale,
         float DetailScale,
@@ -25,9 +25,9 @@ public:
     );
 
     UFUNCTION(BlueprintPure, Category = "Andromeda|Terrain")
-    static FPlanetSurfaceData GetPlanetSurfaceData(
+    static FVector CalculatePlanetSurfaceNormal(
         FVector Direction,
-        int32 Seed,
+        int64 Seed,
         float ContinentalScale,
         float MountainScale,
         float DetailScale,
@@ -37,9 +37,9 @@ public:
     );
 
     UFUNCTION(BlueprintPure, Category = "Andromeda|Terrain")
-    static FVector CalculatePlanetSurfaceNormal(
+    static FPlanetSurfaceData GetPlanetSurfaceData(
         FVector Direction,
-        int32 Seed,
+        int64 Seed,
         float ContinentalScale,
         float MountainScale,
         float DetailScale,
@@ -53,7 +53,7 @@ public:
         int32 Resolution,
         float PlanetRadius,
         int32 FaceIndex,
-        int32 Seed,
+        int64 Seed,
         float ContinentalScale,
         float MountainScale,
         float DetailScale,
@@ -67,7 +67,7 @@ public:
     static void GeneratePlanetMeshData(
         int32 Resolution,
         float PlanetRadius,
-        int32 Seed,
+        int64 Seed,
         float ContinentalScale,
         float MountainScale,
         float DetailScale,

@@ -4,6 +4,12 @@ namespace
 {
     // =========================================================
     // HASH DETERMINISTICO DEL SEED
+    //
+    // Permette di usare seed fino a 16 cifre senza mai
+    // trasformare direttamente il seed in coordinate enormi.
+    //
+    // Stesso seed -> stesso hash
+    // Seed diverso -> hash diverso
     // =========================================================
 
     uint64 HashSeed(uint64 Seed)
@@ -22,7 +28,11 @@ namespace
     }
 
     // =========================================================
-    // CONVERSIONE HASH -> FLOAT
+    // CONVERSIONE HASH -> FLOAT DETERMINISTICO
+    //
+    // Produce un valore nell'intervallo [0, 1).
+    // Usiamo 24 bit per mantenere una precisione stabile
+    // quando il valore viene convertito in float.
     // =========================================================
 
     float HashToUnitFloat(uint64 Hash)
@@ -38,7 +48,16 @@ namespace
     }
 
     // =========================================================
-    // OFFSET DETERMINISTICO DEL SEED
+    // CREAZIONE OFFSET DEL SEED
+    //
+    // L'offset rimane volutamente piccolo.
+    //
+    // Non facciamo più:
+    //
+    // Seed * 12.9898
+    //
+    // perché con seed da 16 cifre produrrebbe coordinate
+    // enormi e numericamente inadatte al campionamento del noise.
     // =========================================================
 
     FVector MakeSeedOffset(int64 Seed)
@@ -86,20 +105,14 @@ float UAndromedaNoiseLibrary::GeneratePlanetHeight(
         Direction.GetSafeNormal();
 
     // =========================================================
-    // OFFSET DETERMINISTICO
+    // OFFSET DETERMINISTICO DEL SEED
     // =========================================================
 
     const FVector SeedOffset =
         MakeSeedOffset(Seed);
 
     // =========================================================
-    // NOISE CONTINENTALE
-    //
-    // Questo noise NON viene più usato come interruttore
-    // ON/OFF del terreno.
-    //
-    // Diventa invece la variazione di grande scala
-    // della superficie.
+    // CONTINENTI
     // =========================================================
 
     const float ContinentalNoise =
@@ -112,27 +125,12 @@ float UAndromedaNoiseLibrary::GeneratePlanetHeight(
         (ContinentalNoise + 1.0f) * 0.5f;
 
     // =========================================================
-    // TERRENO BASE
-    //
-    // Il terreno cambia quota anche nelle zone dove il
-    // continental noise è basso.
-    //
-    // Questo elimina le enormi aree perfettamente piatte.
-    // =========================================================
-
-    const float ContinentalHeight =
-        ContinentalNoise * 0.20f;
-
-    // =========================================================
     // MASCHERA MONTAGNE
-    //
-    // Le montagne sono più frequenti nelle zone alte,
-    // ma non vengono completamente escluse dalle altre zone.
     // =========================================================
 
     const float MountainMask =
         FMath::Clamp(
-            (Continental01 - 0.35f) / 0.50f,
+            (Continental01 - 0.50f) / 0.30f,
             0.0f,
             1.0f
         );
@@ -166,9 +164,6 @@ float UAndromedaNoiseLibrary::GeneratePlanetHeight(
 
     // =========================================================
     // DETTAGLIO
-    //
-    // Il dettaglio non viene più completamente spento.
-    // Rimane presente anche nelle zone pianeggianti.
     // =========================================================
 
     const float DetailNoise =
@@ -177,21 +172,35 @@ float UAndromedaNoiseLibrary::GeneratePlanetHeight(
             SeedOffset * 2.71f
         );
 
-    const float DetailMask =
-        0.35f +
-        MountainMask * 0.65f;
-
     const float Detail =
         DetailNoise *
-        DetailStrength *
-        DetailMask;
+        MountainMask *
+        DetailStrength;
+
+    // =========================================================
+    // PIANURE
+    // =========================================================
+
+    const float LandMask =
+        FMath::Clamp(
+            (Continental01 - 0.42f) / 0.20f,
+            0.0f,
+            1.0f
+        );
+
+    const float Plains =
+        FMath::Pow(
+            LandMask,
+            1.5f
+        ) *
+        0.25f;
 
     // =========================================================
     // ALTEZZA FINALE
     // =========================================================
 
     return
-        ContinentalHeight +
+        Plains +
         Mountains +
         Detail;
 }
@@ -215,7 +224,7 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
         Direction.GetSafeNormal();
 
     // =========================================================
-    // BASE TANGENTE
+    // COSTRUZIONE DELLA BASE TANGENTE
     // =========================================================
 
     FVector ReferenceAxis =
@@ -245,7 +254,7 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
         ).GetSafeNormal();
 
     // =========================================================
-    // CAMPIONAMENTO
+    // CAMPIONAMENTO DEL TERRENO
     // =========================================================
 
     const float SampleDistance =
@@ -300,24 +309,20 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
         TerrainHeight;
 
     // =========================================================
-    // POSIZIONI REALI SULLA SUPERFICIE
-    //
-    // Include PlanetRadius + TerrainHeight.
+    // POSIZIONI LOCALI
     // =========================================================
-
-    const float PlanetRadius = 1.0f;
 
     const FVector CenterPosition =
         Direction *
-        (PlanetRadius + CenterHeight);
+        CenterHeight;
 
     const FVector TangentPosition =
         DirectionTangent *
-        (PlanetRadius + TangentHeight);
+        TangentHeight;
 
     const FVector BitangentPosition =
         DirectionBitangent *
-        (PlanetRadius + BitangentHeight);
+        BitangentHeight;
 
     // =========================================================
     // TANGENTI DELLA SUPERFICIE
@@ -342,7 +347,7 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
         ).GetSafeNormal();
 
     // =========================================================
-    // CONTROLLO VERSO
+    // CONTROLLO DEL VERSO
     // =========================================================
 
     if (FVector::DotProduct(
@@ -407,7 +412,7 @@ FPlanetSurfaceData UAndromedaNoiseLibrary::GetPlanetSurfaceData(
         TerrainHeight;
 
     // =========================================================
-    // NORMALE
+    // NORMALE DELLA SUPERFICIE
     // =========================================================
 
     SurfaceData.Normal =
@@ -551,14 +556,14 @@ void UAndromedaNoiseLibrary::GeneratePlanetVertices(
             }
 
             // =================================================
-            // DIREZIONE SFERICA
+            // DIREZIONE SULLA SFERA
             // =================================================
 
             const FVector Direction =
                 CubePosition.GetSafeNormal();
 
             // =================================================
-            // ALTEZZA
+            // ALTEZZA TERRAIN
             // =================================================
 
             const float Height =
@@ -574,7 +579,7 @@ void UAndromedaNoiseLibrary::GeneratePlanetVertices(
                 TerrainHeight;
 
             // =================================================
-            // RAGGIO FINALE
+            // POSIZIONE FINALE
             // =================================================
 
             const float FinalRadius =
@@ -773,6 +778,10 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
                 C - A
             ).GetSafeNormal();
 
+        // =====================================================
+        // CONTROLLO NORMALE VERSO L'ESTERNO
+        // =====================================================
+
         const FVector TriangleCenter =
             (A + B + C) /
             3.0f;
@@ -799,7 +808,7 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
     }
 
     // =========================================================
-    // SMOOTHING VERTICI DUPLICATI
+    // SMOOTHING DEI VERTICI DUPLICATI
     // =========================================================
 
     TMap<FIntVector, TArray<int32>>
