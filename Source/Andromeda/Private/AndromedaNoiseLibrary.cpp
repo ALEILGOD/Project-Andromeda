@@ -100,6 +100,207 @@ float UAndromedaNoiseLibrary::GeneratePlanetHeight(
 }
 
 
+FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
+    FVector Direction,
+    int32 Seed,
+    float ContinentalScale,
+    float MountainScale,
+    float DetailScale,
+    float MountainStrength,
+    float DetailStrength,
+    float TerrainHeight
+)
+{
+    Direction = Direction.GetSafeNormal();
+
+    // =========================================================
+    // COSTRUZIONE DI UNA BASE TANGENTE
+    // =========================================================
+
+    FVector ReferenceAxis = FVector::UpVector;
+
+    if (FMath::Abs(
+        FVector::DotProduct(
+            Direction,
+            ReferenceAxis
+        )
+    ) > 0.95f)
+    {
+        ReferenceAxis = FVector::ForwardVector;
+    }
+
+    FVector Tangent =
+        FVector::CrossProduct(
+            ReferenceAxis,
+            Direction
+        ).GetSafeNormal();
+
+    FVector Bitangent =
+        FVector::CrossProduct(
+            Direction,
+            Tangent
+        ).GetSafeNormal();
+
+    // =========================================================
+    // CAMPIONAMENTO DEL TERRENO
+    // =========================================================
+
+    const float SampleDistance = 0.0001f;
+
+    const FVector DirectionTangent =
+        (Direction + Tangent * SampleDistance).GetSafeNormal();
+
+    const FVector DirectionBitangent =
+        (Direction + Bitangent * SampleDistance).GetSafeNormal();
+
+    const float CenterHeight =
+        GeneratePlanetHeight(
+            Direction,
+            Seed,
+            ContinentalScale,
+            MountainScale,
+            DetailScale,
+            MountainStrength,
+            DetailStrength
+        ) * TerrainHeight;
+
+    const float TangentHeight =
+        GeneratePlanetHeight(
+            DirectionTangent,
+            Seed,
+            ContinentalScale,
+            MountainScale,
+            DetailScale,
+            MountainStrength,
+            DetailStrength
+        ) * TerrainHeight;
+
+    const float BitangentHeight =
+        GeneratePlanetHeight(
+            DirectionBitangent,
+            Seed,
+            ContinentalScale,
+            MountainScale,
+            DetailScale,
+            MountainStrength,
+            DetailStrength
+        ) * TerrainHeight;
+
+    // =========================================================
+    // POSIZIONI LOCALI
+    // =========================================================
+
+    const FVector CenterPosition =
+        Direction * CenterHeight;
+
+    const FVector TangentPosition =
+        DirectionTangent * (TangentHeight + CenterHeight);
+
+    const FVector BitangentPosition =
+        DirectionBitangent * (BitangentHeight + CenterHeight);
+
+    // =========================================================
+    // TANGENTI DELLA SUPERFICIE
+    // =========================================================
+
+    const FVector SurfaceTangent =
+        TangentPosition - CenterPosition;
+
+    const FVector SurfaceBitangent =
+        BitangentPosition - CenterPosition;
+
+    // =========================================================
+    // NORMALE
+    // =========================================================
+
+    FVector Normal =
+        FVector::CrossProduct(
+            SurfaceTangent,
+            SurfaceBitangent
+        ).GetSafeNormal();
+
+    // =========================================================
+    // CONTROLLO DEL VERSO
+    // =========================================================
+
+    if (FVector::DotProduct(
+        Normal,
+        Direction
+    ) < 0.0f)
+    {
+        Normal *= -1.0f;
+    }
+
+    return Normal;
+}
+
+
+FPlanetSurfaceData UAndromedaNoiseLibrary::GetPlanetSurfaceData(
+    FVector Direction,
+    int32 Seed,
+    float ContinentalScale,
+    float MountainScale,
+    float DetailScale,
+    float MountainStrength,
+    float DetailStrength,
+    float TerrainHeight
+)
+{
+    FPlanetSurfaceData SurfaceData;
+
+    // =========================================================
+    // DIREZIONE NORMALIZZATA
+    // =========================================================
+
+    Direction = Direction.GetSafeNormal();
+
+    SurfaceData.Direction = Direction;
+
+    // =========================================================
+    // ALTEZZA NORMALIZZATA
+    // =========================================================
+
+    const float NormalizedHeight =
+        GeneratePlanetHeight(
+            Direction,
+            Seed,
+            ContinentalScale,
+            MountainScale,
+            DetailScale,
+            MountainStrength,
+            DetailStrength
+        );
+
+    SurfaceData.NormalizedHeight =
+        NormalizedHeight;
+
+    // =========================================================
+    // ALTEZZA FISICA
+    // =========================================================
+
+    SurfaceData.Height =
+        NormalizedHeight * TerrainHeight;
+
+    // =========================================================
+    // NORMALE DELLA SUPERFICIE
+    // =========================================================
+
+    SurfaceData.Normal =
+        CalculatePlanetSurfaceNormal(
+            Direction,
+            Seed,
+            ContinentalScale,
+            MountainScale,
+            DetailScale,
+            MountainStrength,
+            DetailStrength,
+            TerrainHeight
+        );
+
+    return SurfaceData;
+}
+
+
 void UAndromedaNoiseLibrary::GeneratePlanetVertices(
     int32 Resolution,
     float PlanetRadius,
@@ -424,13 +625,6 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
 
     // =========================================================
     // NORMALI GEOMETRICHE
-    // =========================================================
-    //
-    // Calcoliamo la normale di ogni triangolo.
-    //
-    // IMPORTANTE:
-    // controlliamo esplicitamente che la normale punti verso
-    // l'esterno del pianeta.
     // =========================================================
 
     for (int32 TriangleIndex = 0;

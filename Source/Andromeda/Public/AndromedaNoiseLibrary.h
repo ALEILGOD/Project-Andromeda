@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "ProceduralMeshComponent.h"
+#include "PlanetSurfaceData.h"
 #include "AndromedaNoiseLibrary.generated.h"
 
 UCLASS()
@@ -21,6 +22,30 @@ public:
         float DetailScale,
         float MountainStrength,
         float DetailStrength
+    );
+
+    UFUNCTION(BlueprintPure, Category = "Andromeda|Terrain")
+    static FPlanetSurfaceData GetPlanetSurfaceData(
+        FVector Direction,
+        int32 Seed,
+        float ContinentalScale,
+        float MountainScale,
+        float DetailScale,
+        float MountainStrength,
+        float DetailStrength,
+        float TerrainHeight
+    );
+
+    UFUNCTION(BlueprintPure, Category = "Andromeda|Terrain")
+    static FVector CalculatePlanetSurfaceNormal(
+        FVector Direction,
+        int32 Seed,
+        float ContinentalScale,
+        float MountainScale,
+        float DetailScale,
+        float MountainStrength,
+        float DetailStrength,
+        float TerrainHeight
     );
 
     UFUNCTION(BlueprintCallable, Category = "Andromeda|Planet")
