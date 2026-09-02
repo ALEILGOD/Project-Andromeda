@@ -29,11 +29,15 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Star System")
     TSubclassOf<AActor> PlanetClass;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Star System")
+    TSubclassOf<AActor> SunClass;
+
     UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System")
     FStarSystemData SystemData;
 
 private:
 
+	void SpawnSun();
     void SpawnPlanets();
     bool SetPlanetSeed(AActor* PlanetActor, int64 PlanetSeed);
 };

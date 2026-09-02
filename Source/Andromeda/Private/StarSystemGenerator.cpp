@@ -1,15 +1,25 @@
 #include "StarSystemGenerator.h"
+
 #include "AndromedaSeedLibrary.h"
 
 namespace
 {
-    constexpr int64 RadiusSubsystemID = 1;
-    constexpr int64 TerrainSubsystemID = 2;
-    constexpr int64 BiomeSubsystemID = 3;
-    constexpr int64 VegetationSubsystemID = 4;
-    constexpr int64 GeologicalSubsystemID = 5;
-    constexpr int64 VolumetricSubsystemID = 6;
-    constexpr int64 OrbitSubsystemID = 7;
+    constexpr int32 MinPlanets = 3;
+    constexpr int32 MaxPlanets = 8;
+
+    constexpr float MinPlanetRadius = 250000.0f;
+    constexpr float MaxPlanetRadius = 1200000.0f;
+
+    constexpr float MinTerrainHeightRatio = 0.035f;
+    constexpr float MaxTerrainHeightRatio = 0.090f;
+
+    constexpr float MinimumOrbitDistance = 2000000.0f;
+    constexpr float OrbitSpacing = 1100000.0f;
+    constexpr float OrbitJitter = 350000.0f;
+
+    constexpr float GoldenAngle = 137.507764f;
+    constexpr float AngleVariation = 25.0f;
+    constexpr float MaxInclination = 25.0f;
 }
 
 FStarSystemData UStarSystemGenerator::GenerateSystem(
@@ -29,14 +39,19 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
             SystemCoordinate.Z
         );
 
-    FRandomStream RandomStream(
+    FRandomStream SystemRandom(
         static_cast<int32>(
-            SystemData.SystemSeed & 0x7FFFFFFF
+            UAndromedaSeedLibrary::HashSeed(
+                SystemData.SystemSeed
+            )
             )
     );
 
     SystemData.PlanetCount =
-        RandomStream.RandRange(1, 8);
+        SystemRandom.RandRange(
+            MinPlanets,
+            MaxPlanets
+        );
 
     SystemData.Planets.Reserve(
         SystemData.PlanetCount
@@ -59,79 +74,110 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
         PlanetData.RadiusSeed =
             UAndromedaSeedLibrary::GenerateSubsystemSeed(
                 PlanetData.PlanetSeed,
-                RadiusSubsystemID
+                0
             );
 
         PlanetData.TerrainSeed =
             UAndromedaSeedLibrary::GenerateSubsystemSeed(
                 PlanetData.PlanetSeed,
-                TerrainSubsystemID
+                1
             );
 
         PlanetData.BiomeSeed =
             UAndromedaSeedLibrary::GenerateSubsystemSeed(
                 PlanetData.PlanetSeed,
-                BiomeSubsystemID
+                2
             );
 
         PlanetData.VegetationSeed =
             UAndromedaSeedLibrary::GenerateSubsystemSeed(
                 PlanetData.PlanetSeed,
-                VegetationSubsystemID
+                3
             );
 
         PlanetData.GeologicalSeed =
             UAndromedaSeedLibrary::GenerateSubsystemSeed(
                 PlanetData.PlanetSeed,
-                GeologicalSubsystemID
+                4
             );
 
         PlanetData.VolumetricSeed =
             UAndromedaSeedLibrary::GenerateSubsystemSeed(
                 PlanetData.PlanetSeed,
-                VolumetricSubsystemID
+                5
             );
 
-        const int64 OrbitSeed =
-            UAndromedaSeedLibrary::GenerateSubsystemSeed(
-                PlanetData.PlanetSeed,
-                OrbitSubsystemID
-            );
-
+        /*
+         * ------------------------------------------------------------
+         * PLANET SIZE
+         * ------------------------------------------------------------
+         *
+         * Ogni pianeta riceve una dimensione indipendente e
+         * deterministica dal proprio PlanetSeed.
+         *
+         * Range:
+         * 250000 cm = 2.5 km
+         * 1200000 cm = 12 km
+         */
         FRandomStream RadiusRandom(
             static_cast<int32>(
-                PlanetData.RadiusSeed & 0x7FFFFFFF
+                UAndromedaSeedLibrary::HashSeed(
+                    PlanetData.RadiusSeed
+                )
                 )
         );
 
         PlanetData.PlanetRadius =
             RadiusRandom.FRandRange(
-                300000.0f,
-                700000.0f
+                MinPlanetRadius,
+                MaxPlanetRadius
             );
+
+        /*
+         * ------------------------------------------------------------
+         * TERRAIN HEIGHT
+         * ------------------------------------------------------------
+         *
+         * L'altezza del terreno dipende dalla dimensione del pianeta,
+         * ma mantiene una variazione indipendente.
+         *
+         * Un pianeta più grande può quindi avere montagne
+         * proporzionalmente più alte.
+         */
+        const float TerrainHeightRatio =
+            RadiusRandom.FRandRange(
+                MinTerrainHeightRatio,
+                MaxTerrainHeightRatio
+            );
+
+        PlanetData.TerrainHeight =
+            PlanetData.PlanetRadius
+            * TerrainHeightRatio;
+
+        /*
+         * ------------------------------------------------------------
+         * TERRAIN PARAMETERS
+         * ------------------------------------------------------------
+         */
 
         FRandomStream TerrainRandom(
             static_cast<int32>(
-                PlanetData.TerrainSeed & 0x7FFFFFFF
+                UAndromedaSeedLibrary::HashSeed(
+                    PlanetData.TerrainSeed
+                )
                 )
         );
 
-        PlanetData.TerrainHeight =
-            TerrainRandom.FRandRange(
-                10000.0f,
-                30000.0f
-            );
-
         PlanetData.ContinentalScale =
             TerrainRandom.FRandRange(
-                0.3f,
-                0.8f
+                0.35f,
+                0.70f
             );
 
         PlanetData.MountainScale =
             TerrainRandom.FRandRange(
                 2.0f,
-                5.0f
+                4.5f
             );
 
         PlanetData.DetailScale =
@@ -142,38 +188,82 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
 
         PlanetData.MountainStrength =
             TerrainRandom.FRandRange(
-                0.8f,
+                1.0f,
                 2.0f
             );
 
         PlanetData.DetailStrength =
             TerrainRandom.FRandRange(
                 0.05f,
-                0.2f
+                0.15f
             );
+
+        /*
+         * ------------------------------------------------------------
+         * ORBIT
+         * ------------------------------------------------------------
+         *
+         * Le orbite rimangono ordinate per distanza dal sistema,
+         * ma con jitter deterministico.
+         */
 
         FRandomStream OrbitRandom(
             static_cast<int32>(
-                OrbitSeed & 0x7FFFFFFF
+                UAndromedaSeedLibrary::HashSeed(
+                    UAndromedaSeedLibrary::GenerateSubsystemSeed(
+                        PlanetData.PlanetSeed,
+                        10
+                    )
+                )
                 )
         );
 
-        PlanetData.OrbitDistance =
+        const float BaseOrbitDistance =
+            MinimumOrbitDistance
+            + PlanetIndex * OrbitSpacing;
+
+        const float OrbitJitterValue =
             OrbitRandom.FRandRange(
-                5000000.0f,
-                50000000.0f
+                -OrbitJitter,
+                OrbitJitter
+            );
+
+        PlanetData.OrbitDistance =
+            BaseOrbitDistance
+            + OrbitJitterValue;
+
+        /*
+         * Ogni pianeta viene distribuito usando il Golden Angle,
+         * con una variazione deterministica.
+         */
+        const float AngleOffset =
+            OrbitRandom.FRandRange(
+                -AngleVariation,
+                AngleVariation
             );
 
         PlanetData.OrbitAngle =
-            OrbitRandom.FRandRange(
-                0.0f,
+            PlanetIndex * GoldenAngle
+            + AngleOffset;
+
+        PlanetData.OrbitAngle =
+            FMath::Fmod(
+                PlanetData.OrbitAngle,
                 360.0f
             );
 
+        if (PlanetData.OrbitAngle < 0.0f)
+        {
+            PlanetData.OrbitAngle += 360.0f;
+        }
+
+        /*
+         * Inclinazione orbitale deterministica.
+         */
         PlanetData.OrbitInclination =
             OrbitRandom.FRandRange(
-                -10.0f,
-                10.0f
+                -MaxInclination,
+                MaxInclination
             );
 
         SystemData.Planets.Add(
@@ -189,144 +279,159 @@ bool UStarSystemGenerator::VerifyDeterminism(
     FAndromedaInt64Vector SystemCoordinate
 )
 {
-    const FStarSystemData FirstSystem =
+    const FStarSystemData First =
         GenerateSystem(
             UniverseSeed,
             SystemCoordinate
         );
 
-    const FStarSystemData SecondSystem =
+    const FStarSystemData Second =
         GenerateSystem(
             UniverseSeed,
             SystemCoordinate
         );
 
-    if (FirstSystem.PlanetCount != SecondSystem.PlanetCount)
+    if (First.SystemSeed != Second.SystemSeed)
     {
         return false;
     }
 
-    if (FirstSystem.SystemSeed != SecondSystem.SystemSeed)
+    if (First.PlanetCount != Second.PlanetCount)
     {
         return false;
     }
 
-    for (int32 PlanetIndex = 0;
-        PlanetIndex < FirstSystem.Planets.Num();
-        ++PlanetIndex)
+    if (First.Planets.Num() != Second.Planets.Num())
     {
-        const FPlanetGenerationData& FirstPlanet =
-            FirstSystem.Planets[PlanetIndex];
+        return false;
+    }
 
-        const FPlanetGenerationData& SecondPlanet =
-            SecondSystem.Planets[PlanetIndex];
+    for (int32 Index = 0;
+        Index < First.Planets.Num();
+        ++Index)
+    {
+        const FPlanetGenerationData& A =
+            First.Planets[Index];
 
-        if (FirstPlanet.PlanetID != SecondPlanet.PlanetID)
+        const FPlanetGenerationData& B =
+            Second.Planets[Index];
+
+        if (A.PlanetID != B.PlanetID)
         {
             return false;
         }
 
-        if (FirstPlanet.PlanetSeed != SecondPlanet.PlanetSeed)
+        if (A.PlanetSeed != B.PlanetSeed)
         {
             return false;
         }
 
-        if (FirstPlanet.RadiusSeed != SecondPlanet.RadiusSeed)
+        if (A.RadiusSeed != B.RadiusSeed)
         {
             return false;
         }
 
-        if (FirstPlanet.TerrainSeed != SecondPlanet.TerrainSeed)
+        if (A.TerrainSeed != B.TerrainSeed)
         {
             return false;
         }
 
-        if (FirstPlanet.BiomeSeed != SecondPlanet.BiomeSeed)
+        if (A.BiomeSeed != B.BiomeSeed)
         {
             return false;
         }
 
-        if (FirstPlanet.VegetationSeed != SecondPlanet.VegetationSeed)
+        if (A.VegetationSeed != B.VegetationSeed)
         {
             return false;
         }
 
-        if (FirstPlanet.GeologicalSeed != SecondPlanet.GeologicalSeed)
+        if (A.GeologicalSeed != B.GeologicalSeed)
         {
             return false;
         }
 
-        if (FirstPlanet.VolumetricSeed != SecondPlanet.VolumetricSeed)
-        {
-            return false;
-        }
-
-        if (!FMath::IsNearlyEqual(
-            FirstPlanet.PlanetRadius,
-            SecondPlanet.PlanetRadius))
-        {
-            return false;
-        }
-
-        if (!FMath::IsNearlyEqual(
-            FirstPlanet.TerrainHeight,
-            SecondPlanet.TerrainHeight))
+        if (A.VolumetricSeed != B.VolumetricSeed)
         {
             return false;
         }
 
         if (!FMath::IsNearlyEqual(
-            FirstPlanet.ContinentalScale,
-            SecondPlanet.ContinentalScale))
+            A.PlanetRadius,
+            B.PlanetRadius
+        ))
         {
             return false;
         }
 
         if (!FMath::IsNearlyEqual(
-            FirstPlanet.MountainScale,
-            SecondPlanet.MountainScale))
+            A.TerrainHeight,
+            B.TerrainHeight
+        ))
         {
             return false;
         }
 
         if (!FMath::IsNearlyEqual(
-            FirstPlanet.DetailScale,
-            SecondPlanet.DetailScale))
+            A.ContinentalScale,
+            B.ContinentalScale
+        ))
         {
             return false;
         }
 
         if (!FMath::IsNearlyEqual(
-            FirstPlanet.MountainStrength,
-            SecondPlanet.MountainStrength))
+            A.MountainScale,
+            B.MountainScale
+        ))
         {
             return false;
         }
 
         if (!FMath::IsNearlyEqual(
-            FirstPlanet.DetailStrength,
-            SecondPlanet.DetailStrength))
+            A.DetailScale,
+            B.DetailScale
+        ))
         {
             return false;
         }
 
         if (!FMath::IsNearlyEqual(
-            FirstPlanet.OrbitDistance,
-            SecondPlanet.OrbitDistance))
+            A.MountainStrength,
+            B.MountainStrength
+        ))
         {
             return false;
         }
 
         if (!FMath::IsNearlyEqual(
-            FirstPlanet.OrbitAngle,
-            SecondPlanet.OrbitAngle))
+            A.DetailStrength,
+            B.DetailStrength
+        ))
         {
             return false;
         }
 
         if (!FMath::IsNearlyEqual(
-            FirstPlanet.OrbitInclination,
-            SecondPlanet.OrbitInclination))
+            A.OrbitDistance,
+            B.OrbitDistance
+        ))
+        {
+            return false;
+        }
+
+        if (!FMath::IsNearlyEqual(
+            A.OrbitAngle,
+            B.OrbitAngle
+        ))
+        {
+            return false;
+        }
+
+        if (!FMath::IsNearlyEqual(
+            A.OrbitInclination,
+            B.OrbitInclination
+        ))
         {
             return false;
         }

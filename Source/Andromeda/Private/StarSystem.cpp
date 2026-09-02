@@ -18,7 +18,77 @@ void AStarSystem::BeginPlay()
             SystemCoordinate
         );
 
+    SpawnSun();
     SpawnPlanets();
+}
+
+void AStarSystem::SpawnSun()
+{
+    if (!SunClass)
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT("StarSystem: SunClass non impostata.")
+        );
+
+        return;
+    }
+
+    UWorld* World = GetWorld();
+
+    if (!World)
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT("StarSystem: World non valido.")
+        );
+
+        return;
+    }
+
+    const FVector SunPosition = FVector::ZeroVector;
+
+    const FTransform SpawnTransform(
+        FRotator::ZeroRotator,
+        SunPosition,
+        FVector::OneVector
+    );
+
+    AActor* SunActor =
+        World->SpawnActorDeferred<AActor>(
+            SunClass,
+            SpawnTransform,
+            this,
+            nullptr,
+            ESpawnActorCollisionHandlingMethod::AlwaysSpawn
+        );
+
+    if (!SunActor)
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT("StarSystem: impossibile creare il Sole.")
+        );
+
+        return;
+    }
+
+    SunActor->FinishSpawning(
+        SpawnTransform
+    );
+
+    UE_LOG(
+        LogTemp,
+        Log,
+        TEXT(
+            "StarSystem: Sun spawned at center | "
+            "Location: %s"
+        ),
+        *SunPosition.ToString()
+    );
 }
 
 void AStarSystem::SpawnPlanets()
@@ -81,15 +151,6 @@ void AStarSystem::SpawnPlanets()
             FVector::OneVector
         );
 
-        /*
-         * IMPORTANT:
-         *
-         * SpawnActorDeferred crea il pianeta ma NON esegue
-         * ancora il Construction Script del Blueprint.
-         *
-         * Questo ci permette di impostare PlanetSeed prima
-         * che BP_Planet generi la mesh procedurale.
-         */
         AActor* PlanetActor =
             World->SpawnActorDeferred<AActor>(
                 PlanetClass,
@@ -113,9 +174,6 @@ void AStarSystem::SpawnPlanets()
             continue;
         }
 
-        /*
-         * Imposta PlanetSeed PRIMA del Construction Script.
-         */
         if (!SetPlanetSeed(
             PlanetActor,
             PlanetData.PlanetSeed
@@ -136,12 +194,6 @@ void AStarSystem::SpawnPlanets()
             continue;
         }
 
-        /*
-         * Ora eseguiamo definitivamente il processo di spawn.
-         *
-         * Da questo momento BP_Planet può eseguire il suo
-         * Construction Script vedendo già il PlanetSeed corretto.
-         */
         PlanetActor->FinishSpawning(
             SpawnTransform
         );
