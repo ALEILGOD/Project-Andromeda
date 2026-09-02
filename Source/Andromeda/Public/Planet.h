@@ -4,17 +4,22 @@
 #include "GameFramework/Actor.h"
 #include "Planet.generated.h"
 
+
 class UProceduralMeshComponent;
 class UPlanetTerrainGenerator;
+class UPlanetAtmosphereComponent;
+
 
 UCLASS()
 class ANDROMEDA_API APlanet : public AActor
 {
     GENERATED_BODY()
 
+
 public:
 
     APlanet();
+
 
 protected:
 
@@ -23,6 +28,7 @@ protected:
     virtual void OnConstruction(
         const FTransform& Transform
     ) override;
+
 
 public:
 
@@ -51,6 +57,30 @@ public:
 
 
     // =========================================================
+    // PLANET ATMOSPHERE
+    // =========================================================
+
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Planet|Atmosphere"
+    )
+    TObjectPtr<UPlanetAtmosphereComponent> Atmosphere;
+
+
+    // =========================================================
+    // ATMOSPHERE MESH
+    // =========================================================
+
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Planet|Atmosphere"
+    )
+    TObjectPtr<UProceduralMeshComponent> AtmosphereMesh;
+
+
+    // =========================================================
     // PLANET PARAMETERS
     // =========================================================
 
@@ -62,6 +92,7 @@ public:
     )
     int64 PlanetSeed = 0;
 
+
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -69,6 +100,7 @@ public:
         meta = (ExposeOnSpawn = "true")
     )
     float PlanetRadius = 500000.0f;
+
 
     UPROPERTY(
         EditAnywhere,
@@ -90,12 +122,14 @@ public:
     )
     int32 Resolution = 150;
 
+
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Planet|Terrain"
     )
     float ContinentalScale = 0.5f;
+
 
     UPROPERTY(
         EditAnywhere,
@@ -104,6 +138,7 @@ public:
     )
     float MountainScale = 3.0f;
 
+
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -111,12 +146,14 @@ public:
     )
     float DetailScale = 12.0f;
 
+
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Planet|Terrain"
     )
     float MountainStrength = 1.5f;
+
 
     UPROPERTY(
         EditAnywhere,
@@ -147,4 +184,6 @@ protected:
     void InitializePlanet();
 
     void GeneratePlanetMesh();
+
+    void GenerateAtmosphereMesh();
 };
