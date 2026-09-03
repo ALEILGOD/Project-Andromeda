@@ -1,6 +1,6 @@
 // ============================================================
 // UAS - Unlimited Atmosphere System
-// Initial GPU shader test
+// GPU post-process pipeline test
 // ============================================================
 
 #include "/Engine/Public/Platform.ush"
@@ -10,18 +10,15 @@ struct FUASAtmosphereVertexOutput
     float4 Position : SV_POSITION;
 };
 
+// ============================================================
 // VERTEX SHADER
+// ============================================================
+
 FUASAtmosphereVertexOutput MainVS(
     uint VertexID : SV_VertexID
 )
 {
     FUASAtmosphereVertexOutput Output;
-
-    // Simple fullscreen triangle.
-    //
-    // This is only a pipeline test.
-    // The actual atmosphere geometry/ray setup
-    // will be implemented later.
 
     float2 Positions[3];
 
@@ -37,4 +34,28 @@ FUASAtmosphereVertexOutput MainVS(
         );
 
     return Output;
+}
+
+// ============================================================
+// PIXEL SHADER
+// ============================================================
+
+float4 MainPS(
+    FUASAtmosphereVertexOutput Input
+) : SV_Target0
+{
+    // ========================================================
+    // UAS GPU PIPELINE TEST
+    //
+    // Temporary diagnostic output.
+    // If this appears on screen, our custom global shader
+    // is successfully modifying the post-process output.
+    // ========================================================
+
+    return float4(
+        0.05,
+        0.25,
+        1.0,
+        1.0
+    );
 }

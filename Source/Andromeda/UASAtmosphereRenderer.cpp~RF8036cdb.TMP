@@ -1,0 +1,73 @@
+#include "UASAtmosphereRenderer.h"
+
+#include "UASAtmosphereShader.h"
+
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "ShaderParameterStruct.h"
+#include "PixelShaderUtils.h"
+
+void FUASAtmosphereRenderer::Render(
+    FRDGBuilder& GraphBuilder
+)
+{
+    const FIntPoint RenderTargetSize(
+        1920,
+        1080
+    );
+
+    FRDGTextureDesc TextureDesc =
+        FRDGTextureDesc::Create2D(
+            RenderTargetSize,
+            PF_FloatRGBA,
+            FClearValueBinding::Black,
+            TexCreate_RenderTargetable
+        );
+
+    FRDGTextureRef AtmosphereTarget =
+        GraphBuilder.CreateTexture(
+            TextureDesc,
+            TEXT("UAS.AtmosphereTarget")
+        );
+
+    auto ShaderMap =
+        GetGlobalShaderMap(
+            GMaxRHIFeatureLevel
+        );
+
+    TShaderMapRef<FUASAtmosphereVertexShader>
+        VertexShader(
+            ShaderMap
+        );
+
+    TShaderMapRef<FUASAtmospherePixelShader>
+        PixelShader(
+            ShaderMap
+        );
+
+    FUASAtmospherePixelShader::FParameters*
+        PassParameters =
+        GraphBuilder.AllocParameters<
+        FUASAtmospherePixelShader::FParameters
+        >();
+
+    PassParameters->RenderTargets[0] =
+        FRenderTargetBinding(
+            AtmosphereTarget,
+            ERenderTargetLoadAction::EClear
+        );
+
+    FPixelShaderUtils::AddFullscreenPass(
+        GraphBuilder,
+        ShaderMap,
+        RDG_EVENT_NAME(
+            "UAS Atmosphere Test"
+        ),
+        PixelShader,
+        PassParameters,
+        FIntRect(
+            FIntPoint::ZeroValue,
+            RenderTargetSize
+        )
+    );
+}

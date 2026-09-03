@@ -23,7 +23,8 @@ public class Andromeda : ModuleRules
             new string[]
             {
                 "RenderCore",
-                "RHI"
+                "RHI",
+                "Renderer"
             }
         );
     }
