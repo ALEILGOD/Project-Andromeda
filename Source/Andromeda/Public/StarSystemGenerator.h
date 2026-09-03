@@ -4,6 +4,7 @@
 #include "UObject/NoExportTypes.h"
 #include "StarSystemGenerator.generated.h"
 
+
 USTRUCT(BlueprintType)
 struct FAndromedaInt64Vector
 {
@@ -18,6 +19,7 @@ struct FAndromedaInt64Vector
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     int64 Z = 0;
 };
+
 
 USTRUCT(BlueprintType)
 struct FPlanetGenerationData
@@ -48,11 +50,21 @@ struct FPlanetGenerationData
     UPROPERTY(BlueprintReadOnly)
     int64 VolumetricSeed = 0;
 
+
+    // =========================================================
+    // PLANET
+    // =========================================================
+
     UPROPERTY(BlueprintReadOnly)
     float PlanetRadius = 0.0f;
 
     UPROPERTY(BlueprintReadOnly)
     float TerrainHeight = 0.0f;
+
+
+    // =========================================================
+    // TERRAIN
+    // =========================================================
 
     UPROPERTY(BlueprintReadOnly)
     float ContinentalScale = 0.0f;
@@ -69,6 +81,11 @@ struct FPlanetGenerationData
     UPROPERTY(BlueprintReadOnly)
     float DetailStrength = 0.0f;
 
+
+    // =========================================================
+    // ORBIT
+    // =========================================================
+
     UPROPERTY(BlueprintReadOnly)
     float OrbitDistance = 0.0f;
 
@@ -77,7 +94,11 @@ struct FPlanetGenerationData
 
     UPROPERTY(BlueprintReadOnly)
     float OrbitInclination = 0.0f;
+
+    UPROPERTY(BlueprintReadOnly)
+    float OrbitalPeriod = 0.0f;
 };
+
 
 USTRUCT(BlueprintType)
 struct FStarSystemData
@@ -96,6 +117,7 @@ struct FStarSystemData
     UPROPERTY(BlueprintReadOnly)
     TArray<FPlanetGenerationData> Planets;
 };
+
 
 UCLASS(BlueprintType)
 class ANDROMEDA_API UStarSystemGenerator : public UObject

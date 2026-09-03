@@ -5,10 +5,6 @@
 #include "PlanetAtmosphereRenderer.generated.h"
 
 
-// =========================================================
-// PLANET ATMOSPHERE RENDERER
-// =========================================================
-
 UCLASS(BlueprintType)
 class ANDROMEDA_API UPlanetAtmosphereRenderer
     : public UObject
@@ -37,8 +33,7 @@ public:
         FVector InStarWorldPosition,
         uint8 InQuality,
         int64 InAtmosphereSeed,
-        FVector InPlanetWorldPosition,
-        float InTerrainHeight
+        FVector InPlanetWorldPosition
     );
 
 
@@ -52,13 +47,11 @@ public:
 
     static float GetActiveAtmosphereRadius();
 
-    static float GetActiveTerrainHeight();
-
     static FVector GetActiveStarWorldPosition();
 
 
     // =========================================================
-    // GEOMETRY
+    // ATMOSPHERE GEOMETRY
     // =========================================================
 
     UPROPERTY(
@@ -75,13 +68,6 @@ public:
     float AtmosphereRadius = 0.0f;
 
 
-    UPROPERTY(
-        BlueprintReadOnly,
-        Category = "Andromeda|UAS"
-    )
-    float TerrainHeight = 0.0f;
-
-
     // =========================================================
     // RAYLEIGH
     // =========================================================
@@ -90,8 +76,7 @@ public:
         BlueprintReadOnly,
         Category = "Andromeda|UAS|Rayleigh"
     )
-    FVector RayleighScattering =
-        FVector::ZeroVector;
+    FVector RayleighScattering = FVector::ZeroVector;
 
 
     UPROPERTY(
@@ -109,8 +94,7 @@ public:
         BlueprintReadOnly,
         Category = "Andromeda|UAS|Mie"
     )
-    FVector MieScattering =
-        FVector::ZeroVector;
+    FVector MieScattering = FVector::ZeroVector;
 
 
     UPROPERTY(
@@ -135,8 +119,7 @@ public:
         BlueprintReadOnly,
         Category = "Andromeda|UAS"
     )
-    FVector Absorption =
-        FVector::ZeroVector;
+    FVector Absorption = FVector::ZeroVector;
 
 
     // =========================================================
@@ -147,8 +130,7 @@ public:
         BlueprintReadOnly,
         Category = "Andromeda|UAS|Lighting"
     )
-    FVector StarWorldPosition =
-        FVector::ZeroVector;
+    FVector StarWorldPosition = FVector::ZeroVector;
 
 
     // =========================================================
@@ -163,7 +145,7 @@ public:
 
 
     // =========================================================
-    // SEED
+    // DETERMINISTIC SEED
     // =========================================================
 
     UPROPERTY(
@@ -180,8 +162,6 @@ private:
     static float ActiveGroundRadius;
 
     static float ActiveAtmosphereRadius;
-
-    static float ActiveTerrainHeight;
 
     static FVector ActiveStarWorldPosition;
 };

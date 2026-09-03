@@ -10,6 +10,10 @@ namespace
 }
 
 
+// =========================================================
+// CONSTRUCTOR
+// =========================================================
+
 UPlanetAtmosphereComponent::UPlanetAtmosphereComponent()
 {
     PrimaryComponentTick.bCanEverTick = false;
@@ -20,18 +24,33 @@ UPlanetAtmosphereComponent::UPlanetAtmosphereComponent()
 }
 
 
+// =========================================================
+// INITIALIZE ATMOSPHERE
+// =========================================================
+
 void UPlanetAtmosphereComponent::InitializeAtmosphere(
     float PlanetRadius,
     float TerrainHeight,
     int64 Seed
 )
 {
+    // =========================================================
+    // GROUND RADIUS
+    // =========================================================
+
     Parameters.GroundRadius =
         PlanetRadius;
 
+
+    // =========================================================
+    // ATMOSPHERE HEIGHT
+    // =========================================================
+
     const float RequiredAtmosphereHeight =
         TerrainHeight
-        + AtmosphereTerrainClearance;
+        +
+        AtmosphereTerrainClearance;
+
 
     Parameters.AtmosphereHeight =
         FMath::Max(
@@ -39,27 +58,55 @@ void UPlanetAtmosphereComponent::InitializeAtmosphere(
             RequiredAtmosphereHeight
         );
 
+
+    // =========================================================
+    // ATMOSPHERE RADIUS
+    // =========================================================
+
     Parameters.AtmosphereRadius =
         PlanetRadius
-        + Parameters.AtmosphereHeight;
+        +
+        Parameters.AtmosphereHeight;
+
+
+    // =========================================================
+    // SEED
+    // =========================================================
 
     Parameters.AtmosphereSeed =
         Seed;
+
+
+    // =========================================================
+    // COMPONENT TRANSFORM
+    // =========================================================
 
     SetRelativeLocation(
         FVector::ZeroVector
     );
 
+
     SetRelativeRotation(
         FRotator::ZeroRotator
     );
+
 
     SetRelativeScale3D(
         FVector::OneVector
     );
 
+
+    // =========================================================
+    // STAR
+    // =========================================================
+
     StarWorldPosition =
         FVector::ZeroVector;
+
+
+    // =========================================================
+    // CREATE RENDERER
+    // =========================================================
 
     if (!Renderer)
     {
@@ -70,15 +117,28 @@ void UPlanetAtmosphereComponent::InitializeAtmosphere(
             );
     }
 
+
     if (!Renderer)
     {
         return;
     }
 
+
+    // =========================================================
+    // PLANET WORLD POSITION
+    // =========================================================
+
     const FVector PlanetWorldPosition =
         GetOwner()
-        ? GetOwner()->GetActorLocation()
-        : FVector::ZeroVector;
+        ?
+        GetOwner()->GetActorLocation()
+        :
+        FVector::ZeroVector;
+
+
+    // =========================================================
+    // INITIALIZE RENDERER
+    // =========================================================
 
     Renderer->Initialize(
         Parameters.GroundRadius,
@@ -94,6 +154,7 @@ void UPlanetAtmosphereComponent::InitializeAtmosphere(
             Parameters.Quality
             ),
         Parameters.AtmosphereSeed,
-        PlanetWorldPosition
+        PlanetWorldPosition,
+        TerrainHeight
     );
 }

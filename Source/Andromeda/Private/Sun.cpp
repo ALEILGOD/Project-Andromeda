@@ -3,9 +3,15 @@
 #include "Components/PointLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 
+
 ASun::ASun()
 {
     PrimaryActorTick.bCanEverTick = false;
+
+
+    // =========================================================
+    // ROOT
+    // =========================================================
 
     Root =
         CreateDefaultSubobject<USceneComponent>(
@@ -13,6 +19,11 @@ ASun::ASun()
         );
 
     SetRootComponent(Root);
+
+
+    // =========================================================
+    // SUN MESH
+    // =========================================================
 
     SunMesh =
         CreateDefaultSubobject<UStaticMeshComponent>(
@@ -27,6 +38,11 @@ ASun::ASun()
 
     SunMesh->SetCastShadow(false);
 
+
+    // =========================================================
+    // SUN LIGHT
+    // =========================================================
+
     SunLight =
         CreateDefaultSubobject<UPointLightComponent>(
             TEXT("SunLight")
@@ -39,7 +55,23 @@ ASun::ASun()
     );
 
     SunLight->SetCastShadows(true);
+
+
+    // =========================================================
+    // INITIAL POINT LIGHT SETTINGS
+    // =========================================================
+
+    SunLight->SetIntensity(
+        LightIntensity
+    );
+
+    SunLight->SetAttenuationRadius(
+        LightAttenuationRadius
+    );
+
+    SunLight->SetCastShadows(true);
 }
+
 
 void ASun::BeginPlay()
 {
@@ -48,6 +80,7 @@ void ASun::BeginPlay()
     ConfigureSunLight();
 }
 
+
 void ASun::ConfigureSunLight()
 {
     if (!SunLight)
@@ -55,11 +88,22 @@ void ASun::ConfigureSunLight()
         return;
     }
 
+
+    // =========================================================
+    // POINT LIGHT
+    // =========================================================
+
     SunLight->SetIntensity(
         LightIntensity
     );
 
+
     SunLight->SetAttenuationRadius(
         LightAttenuationRadius
+    );
+
+
+    SunLight->SetCastShadows(
+        true
     );
 }

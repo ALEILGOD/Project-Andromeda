@@ -9,6 +9,10 @@ class UMaterialInterface;
 class UPlanetAtmosphereRenderer;
 
 
+// =========================================================
+// ATMOSPHERE QUALITY
+// =========================================================
+
 UENUM(BlueprintType)
 enum class EPlanetAtmosphereQuality : uint8
 {
@@ -20,6 +24,10 @@ enum class EPlanetAtmosphereQuality : uint8
 };
 
 
+// =========================================================
+// ATMOSPHERE PARAMETERS
+// =========================================================
+
 USTRUCT(BlueprintType)
 struct FPlanetAtmosphereParameters
 {
@@ -27,7 +35,7 @@ struct FPlanetAtmosphereParameters
 
 
     // =========================================================
-    // ATMOSPHERE GEOMETRY
+    // GEOMETRY
     // =========================================================
 
     UPROPERTY(
@@ -55,7 +63,7 @@ struct FPlanetAtmosphereParameters
 
 
     // =========================================================
-    // RAYLEIGH SCATTERING
+    // RAYLEIGH
     // =========================================================
 
     UPROPERTY(
@@ -71,7 +79,7 @@ struct FPlanetAtmosphereParameters
 
 
     // =========================================================
-    // MIE SCATTERING
+    // MIE
     // =========================================================
 
     UPROPERTY(
@@ -111,7 +119,7 @@ struct FPlanetAtmosphereParameters
 
 
     // =========================================================
-    // ATMOSPHERE DENSITY
+    // DENSITY
     // =========================================================
 
     UPROPERTY(
@@ -156,6 +164,10 @@ struct FPlanetAtmosphereParameters
 };
 
 
+// =========================================================
+// PLANET ATMOSPHERE COMPONENT
+// =========================================================
+
 UCLASS(
     ClassGroup = (Andromeda),
     BlueprintType,
@@ -197,7 +209,7 @@ public:
 
 
     // =========================================================
-    // STAR POSITION
+    // STAR
     // =========================================================
 
     UPROPERTY(
@@ -205,7 +217,8 @@ public:
         BlueprintReadWrite,
         Category = "Andromeda|Atmosphere|Lighting"
     )
-    FVector StarWorldPosition = FVector::ZeroVector;
+    FVector StarWorldPosition =
+        FVector::ZeroVector;
 
 
     // =========================================================

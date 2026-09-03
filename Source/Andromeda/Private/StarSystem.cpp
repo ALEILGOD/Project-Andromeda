@@ -2,17 +2,21 @@
 
 #include "Engine/World.h"
 #include "UObject/UnrealType.h"
+#include "PlanetaryLightingComponent.h"
 
 
 AStarSystem::AStarSystem()
 {
-    PrimaryActorTick.bCanEverTick = false;
+    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.bStartWithTickEnabled = true;
 }
 
 
 void AStarSystem::BeginPlay()
 {
     Super::BeginPlay();
+
+    SystemSimulationTime = 0.0f;
 
     SystemData =
         UStarSystemGenerator::GenerateSystem(
@@ -23,6 +27,41 @@ void AStarSystem::BeginPlay()
     SpawnSun();
 
     SpawnPlanets();
+}
+
+
+void AStarSystem::Tick(
+    float DeltaTime
+)
+{
+    Super::Tick(
+        DeltaTime
+    );
+
+    if (DeltaTime <= 0.0f)
+    {
+        return;
+    }
+
+    const float SafeTimeScale =
+        FMath::Max(
+            SimulationTimeScale,
+            0.0f
+        );
+
+    const float SimulationDeltaTime =
+        DeltaTime * SafeTimeScale;
+
+    SystemSimulationTime +=
+        SimulationDeltaTime;
+
+    UpdatePlanetOrbits(
+        SimulationDeltaTime
+    );
+
+    UpdatePlanetRotations(
+        SimulationDeltaTime
+    );
 }
 
 
@@ -85,6 +124,14 @@ void AStarSystem::SpawnSun()
         SpawnTransform
     );
 
+
+    // =========================================================
+    // STORE SPAWNED SUN
+    // =========================================================
+
+    SpawnedSun = SunActor;
+
+
     UE_LOG(
         LogTemp,
         Log,
@@ -123,47 +170,39 @@ void AStarSystem::SpawnPlanets()
         return;
     }
 
+    SpawnedPlanets.Empty();
 
-    for (const FPlanetGenerationData& PlanetData : SystemData.Planets)
+    SpawnedPlanets.Reserve(
+        SystemData.Planets.Num()
+    );
+
+
+    for (
+        const FPlanetGenerationData& PlanetData :
+        SystemData.Planets
+        )
     {
-        const float OrbitAngleRadians =
-            FMath::DegreesToRadians(
-                PlanetData.OrbitAngle
+        const FVector OrbitPosition =
+            CalculateOrbitPosition(
+                PlanetData,
+                0.0f
             );
 
-        const float InclinationRadians =
-            FMath::DegreesToRadians(
-                PlanetData.OrbitInclination
-            );
-
-        FVector OrbitPosition;
-
-        OrbitPosition.X =
-            FMath::Cos(OrbitAngleRadians)
-            * PlanetData.OrbitDistance;
-
-        OrbitPosition.Y =
-            FMath::Sin(OrbitAngleRadians)
-            * PlanetData.OrbitDistance
-            * FMath::Cos(InclinationRadians);
-
-        OrbitPosition.Z =
-            FMath::Sin(OrbitAngleRadians)
-            * PlanetData.OrbitDistance
-            * FMath::Sin(InclinationRadians);
-
-
-        // =====================================================
-        // CONVERT ORBIT POSITION TO WORLD SPACE
-        // =====================================================
 
         const FVector PlanetWorldPosition =
             GetActorLocation()
             + OrbitPosition;
 
 
+        const FRotator InitialRotation =
+            CalculatePlanetRotation(
+                PlanetData,
+                0.0f
+            );
+
+
         const FTransform SpawnTransform(
-            FRotator::ZeroRotator,
+            InitialRotation,
             PlanetWorldPosition,
             FVector::OneVector
         );
@@ -177,6 +216,7 @@ void AStarSystem::SpawnPlanets()
                 nullptr,
                 ESpawnActorCollisionHandlingMethod::AlwaysSpawn
             );
+
 
         if (!PlanetActor)
         {
@@ -215,9 +255,69 @@ void AStarSystem::SpawnPlanets()
         }
 
 
+        // =====================================================
+        // CONNECT PLANETARY LIGHTING TO THE SPAWNED SUN
+        // =====================================================
+
+        UPlanetaryLightingComponent* PlanetaryLighting =
+            PlanetActor->FindComponentByClass<
+            UPlanetaryLightingComponent
+            >();
+
+
+        if (PlanetaryLighting)
+        {
+            PlanetaryLighting->SetStarActor(
+                SpawnedSun
+            );
+        }
+        else
+        {
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT(
+                    "StarSystem: Planet %lld non contiene "
+                    "un PlanetaryLightingComponent."
+                ),
+                PlanetData.PlanetID
+            );
+        }
+
+
         PlanetActor->FinishSpawning(
             SpawnTransform
         );
+
+
+        FSpawnedPlanetData SpawnedPlanet;
+
+        SpawnedPlanet.PlanetActor =
+            PlanetActor;
+
+        SpawnedPlanet.GenerationData =
+            PlanetData;
+
+
+        SpawnedPlanets.Add(
+            SpawnedPlanet
+        );
+
+
+        const float RotationPeriod =
+            CalculateRotationPeriod(
+                PlanetData
+            );
+
+        const float AxialTilt =
+            CalculateAxialTilt(
+                PlanetData
+            );
+
+        const float RotationDirection =
+            CalculateRotationDirection(
+                PlanetData
+            );
 
 
         UE_LOG(
@@ -228,15 +328,377 @@ void AStarSystem::SpawnPlanets()
                 "Seed: %lld | "
                 "Radius: %.2f | "
                 "TerrainHeight: %.2f | "
+                "OrbitDistance: %.2f | "
+                "OrbitInclination: %.2f | "
+                "OrbitPeriod: %.2f s | "
+                "RotationPeriod: %.2f s | "
+                "AxialTilt: %.2f deg | "
+                "RotationDirection: %.0f | "
                 "World Location: %s"
             ),
             PlanetData.PlanetID,
             PlanetData.PlanetSeed,
             PlanetData.PlanetRadius,
             PlanetData.TerrainHeight,
+            PlanetData.OrbitDistance,
+            PlanetData.OrbitInclination,
+            PlanetData.OrbitalPeriod,
+            RotationPeriod,
+            AxialTilt,
+            RotationDirection,
             *PlanetWorldPosition.ToString()
         );
     }
+}
+
+
+void AStarSystem::UpdatePlanetOrbits(
+    float DeltaTime
+)
+{
+    if (DeltaTime <= 0.0f)
+    {
+        return;
+    }
+
+
+    for (
+        FSpawnedPlanetData& SpawnedPlanet :
+        SpawnedPlanets
+        )
+    {
+        if (!SpawnedPlanet.PlanetActor)
+        {
+            continue;
+        }
+
+
+        const FVector OrbitPosition =
+            CalculateOrbitPosition(
+                SpawnedPlanet.GenerationData,
+                SystemSimulationTime
+            );
+
+
+        const FVector PlanetWorldPosition =
+            GetActorLocation()
+            + OrbitPosition;
+
+
+        SpawnedPlanet.PlanetActor->SetActorLocation(
+            PlanetWorldPosition
+        );
+    }
+}
+
+
+void AStarSystem::UpdatePlanetRotations(
+    float DeltaTime
+)
+{
+    if (DeltaTime <= 0.0f)
+    {
+        return;
+    }
+
+
+    for (
+        FSpawnedPlanetData& SpawnedPlanet :
+        SpawnedPlanets
+        )
+    {
+        if (!SpawnedPlanet.PlanetActor)
+        {
+            continue;
+        }
+
+
+        const FRotator PlanetRotation =
+            CalculatePlanetRotation(
+                SpawnedPlanet.GenerationData,
+                SystemSimulationTime
+            );
+
+
+        SpawnedPlanet.PlanetActor->SetActorRotation(
+            PlanetRotation
+        );
+    }
+}
+
+
+FVector AStarSystem::CalculateOrbitPosition(
+    const FPlanetGenerationData& PlanetData,
+    float SimulationTime
+) const
+{
+    if (PlanetData.OrbitalPeriod <= KINDA_SMALL_NUMBER)
+    {
+        return FVector::ZeroVector;
+    }
+
+
+    const float OrbitalCycles =
+        SimulationTime
+        / PlanetData.OrbitalPeriod;
+
+
+    const float CurrentOrbitAngle =
+        PlanetData.OrbitAngle
+        + OrbitalCycles * 360.0f;
+
+
+    const float OrbitAngleRadians =
+        FMath::DegreesToRadians(
+            CurrentOrbitAngle
+        );
+
+
+    const float InclinationRadians =
+        FMath::DegreesToRadians(
+            PlanetData.OrbitInclination
+        );
+
+
+    FVector OrbitPosition;
+
+
+    OrbitPosition.X =
+        FMath::Cos(
+            OrbitAngleRadians
+        )
+        * PlanetData.OrbitDistance;
+
+
+    OrbitPosition.Y =
+        FMath::Sin(
+            OrbitAngleRadians
+        )
+        * PlanetData.OrbitDistance
+        * FMath::Cos(
+            InclinationRadians
+        );
+
+
+    OrbitPosition.Z =
+        FMath::Sin(
+            OrbitAngleRadians
+        )
+        * PlanetData.OrbitDistance
+        * FMath::Sin(
+            InclinationRadians
+        );
+
+
+    return OrbitPosition;
+}
+
+
+float AStarSystem::CalculateRotationPeriod(
+    const FPlanetGenerationData& PlanetData
+) const
+{
+    uint64 Seed =
+        static_cast<uint64>(
+            PlanetData.PlanetSeed
+            );
+
+    Seed ^= Seed >> 30;
+    Seed *= 0xBF58476D1CE4E5B9ULL;
+    Seed ^= Seed >> 27;
+    Seed *= 0x94D049BB133111EBULL;
+    Seed ^= Seed >> 31;
+
+    const double Normalized =
+        static_cast<double>(
+            Seed & 0xFFFFFFFFULL
+            )
+        / 4294967295.0;
+
+
+    const float MinimumRotationPeriod =
+        1800.0f;
+
+    const float MaximumRotationPeriod =
+        259200.0f;
+
+
+    return FMath::Lerp(
+        MinimumRotationPeriod,
+        MaximumRotationPeriod,
+        static_cast<float>(Normalized)
+    );
+}
+
+
+float AStarSystem::CalculateAxialTilt(
+    const FPlanetGenerationData& PlanetData
+) const
+{
+    uint64 Seed =
+        static_cast<uint64>(
+            PlanetData.PlanetSeed
+            );
+
+    Seed ^= 0x9E3779B97F4A7C15ULL;
+    Seed ^= Seed >> 30;
+    Seed *= 0xBF58476D1CE4E5B9ULL;
+    Seed ^= Seed >> 27;
+    Seed *= 0x94D049BB133111EBULL;
+    Seed ^= Seed >> 31;
+
+
+    const double Normalized =
+        static_cast<double>(
+            Seed & 0xFFFFFFFFULL
+            )
+        / 4294967295.0;
+
+
+    return FMath::Lerp(
+        0.0f,
+        45.0f,
+        static_cast<float>(Normalized)
+    );
+}
+
+
+float AStarSystem::CalculateInitialRotation(
+    const FPlanetGenerationData& PlanetData
+) const
+{
+    uint64 Seed =
+        static_cast<uint64>(
+            PlanetData.PlanetSeed
+            );
+
+    Seed ^= 0xD1B54A32D192ED03ULL;
+    Seed ^= Seed >> 30;
+    Seed *= 0xBF58476D1CE4E5B9ULL;
+    Seed ^= Seed >> 27;
+    Seed *= 0x94D049BB133111EBULL;
+    Seed ^= Seed >> 31;
+
+
+    const double Normalized =
+        static_cast<double>(
+            Seed & 0xFFFFFFFFULL
+            )
+        / 4294967295.0;
+
+
+    return FMath::Lerp(
+        0.0f,
+        360.0f,
+        static_cast<float>(Normalized)
+    );
+}
+
+
+float AStarSystem::CalculateRotationDirection(
+    const FPlanetGenerationData& PlanetData
+) const
+{
+    uint64 Seed =
+        static_cast<uint64>(
+            PlanetData.PlanetSeed
+            );
+
+    Seed ^= 0xA24BAED4963EE407ULL;
+    Seed ^= Seed >> 30;
+    Seed *= 0xBF58476D1CE4E5B9ULL;
+    Seed ^= Seed >> 27;
+    Seed *= 0x94D049BB133111EBULL;
+    Seed ^= Seed >> 31;
+
+
+    const double Normalized =
+        static_cast<double>(
+            Seed & 0xFFFFFFFFULL
+            )
+        / 4294967295.0;
+
+
+    if (Normalized < 0.10)
+    {
+        return -1.0f;
+    }
+
+
+    return 1.0f;
+}
+
+
+FRotator AStarSystem::CalculatePlanetRotation(
+    const FPlanetGenerationData& PlanetData,
+    float SimulationTime
+) const
+{
+    const float RotationPeriod =
+        CalculateRotationPeriod(
+            PlanetData
+        );
+
+
+    if (RotationPeriod <= KINDA_SMALL_NUMBER)
+    {
+        return FRotator::ZeroRotator;
+    }
+
+
+    const float AxialTilt =
+        CalculateAxialTilt(
+            PlanetData
+        );
+
+
+    const float InitialRotation =
+        CalculateInitialRotation(
+            PlanetData
+        );
+
+
+    const float RotationDirection =
+        CalculateRotationDirection(
+            PlanetData
+        );
+
+
+    const float RotationCycles =
+        SimulationTime
+        / RotationPeriod;
+
+
+    const float SpinAngle =
+        InitialRotation
+        + RotationCycles
+        * 360.0f
+        * RotationDirection;
+
+
+    const FQuat TiltQuat =
+        FQuat(
+            FVector::ForwardVector,
+            FMath::DegreesToRadians(
+                AxialTilt
+            )
+        );
+
+
+    const FQuat SpinQuat =
+        FQuat(
+            FVector::UpVector,
+            FMath::DegreesToRadians(
+                SpinAngle
+            )
+        );
+
+
+    const FQuat FinalQuat =
+        TiltQuat * SpinQuat;
+
+
+    return FinalQuat.Rotator();
 }
 
 
@@ -250,10 +712,6 @@ bool AStarSystem::SetPlanetGenerationData(
         return false;
     }
 
-
-    // =========================================================
-    // PLANET SEED
-    // =========================================================
 
     FProperty* PlanetSeedProperty =
         PlanetActor->GetClass()->FindPropertyByName(
@@ -299,10 +757,6 @@ bool AStarSystem::SetPlanetGenerationData(
     );
 
 
-    // =========================================================
-    // PLANET RADIUS
-    // =========================================================
-
     FProperty* PlanetRadiusProperty =
         PlanetActor->GetClass()->FindPropertyByName(
             TEXT("PlanetRadius")
@@ -346,10 +800,6 @@ bool AStarSystem::SetPlanetGenerationData(
         PlanetData.PlanetRadius
     );
 
-
-    // =========================================================
-    // TERRAIN HEIGHT
-    // =========================================================
 
     FProperty* TerrainHeightProperty =
         PlanetActor->GetClass()->FindPropertyByName(
@@ -395,10 +845,6 @@ bool AStarSystem::SetPlanetGenerationData(
     );
 
 
-    // =========================================================
-    // CONTINENTAL SCALE
-    // =========================================================
-
     FProperty* ContinentalScaleProperty =
         PlanetActor->GetClass()->FindPropertyByName(
             TEXT("ContinentalScale")
@@ -424,10 +870,6 @@ bool AStarSystem::SetPlanetGenerationData(
         PlanetData.ContinentalScale
     );
 
-
-    // =========================================================
-    // MOUNTAIN SCALE
-    // =========================================================
 
     FProperty* MountainScaleProperty =
         PlanetActor->GetClass()->FindPropertyByName(
@@ -455,10 +897,6 @@ bool AStarSystem::SetPlanetGenerationData(
     );
 
 
-    // =========================================================
-    // DETAIL SCALE
-    // =========================================================
-
     FProperty* DetailScaleProperty =
         PlanetActor->GetClass()->FindPropertyByName(
             TEXT("DetailScale")
@@ -485,10 +923,6 @@ bool AStarSystem::SetPlanetGenerationData(
     );
 
 
-    // =========================================================
-    // MOUNTAIN STRENGTH
-    // =========================================================
-
     FProperty* MountainStrengthProperty =
         PlanetActor->GetClass()->FindPropertyByName(
             TEXT("MountainStrength")
@@ -514,10 +948,6 @@ bool AStarSystem::SetPlanetGenerationData(
         PlanetData.MountainStrength
     );
 
-
-    // =========================================================
-    // DETAIL STRENGTH
-    // =========================================================
 
     FProperty* DetailStrengthProperty =
         PlanetActor->GetClass()->FindPropertyByName(

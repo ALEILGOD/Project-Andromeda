@@ -3,6 +3,7 @@
 #include "PlanetTerrainGenerator.h"
 #include "PlanetAtmosphereComponent.h"
 #include "ProceduralMeshComponent.h"
+#include "UObject/ConstructorHelpers.h"
 
 
 namespace
@@ -46,6 +47,36 @@ APlanet::APlanet()
 
 
     // =========================================================
+    // PLANET MATERIAL
+    // =========================================================
+
+    static ConstructorHelpers::FObjectFinder<UMaterialInterface>
+        PlanetMaterialFinder(
+            TEXT("/Game/Materials/M_Planet")
+        );
+
+
+    if (PlanetMaterialFinder.Succeeded())
+    {
+        PlanetProceduralMesh->SetMaterial(
+            0,
+            PlanetMaterialFinder.Object
+        );
+    }
+    else
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT(
+                "Planet: impossibile trovare "
+                "M_Planet in /Game/Materials/M_Planet."
+            )
+        );
+    }
+
+
+    // =========================================================
     // PLANET ATMOSPHERE COMPONENT
     // =========================================================
 
@@ -78,6 +109,23 @@ APlanet::APlanet()
 
     AtmosphereMesh->SetCastShadow(
         false
+    );
+
+
+    // ---------------------------------------------------------
+    // UAS OWNS THE ATMOSPHERE VISUALIZATION.
+    //
+    // The old spherical atmosphere mesh is kept alive for
+    // debugging/future use, but is no longer rendered.
+    // ---------------------------------------------------------
+
+    AtmosphereMesh->SetVisibility(
+        false,
+        true
+    );
+
+    AtmosphereMesh->SetHiddenInGame(
+        true
     );
 }
 
@@ -322,6 +370,22 @@ void APlanet::GenerateAtmosphereMesh()
             Atmosphere->AtmosphereMaterial
         );
     }
+
+
+    // ---------------------------------------------------------
+    // KEEP THE LEGACY MESH DISABLED.
+    //
+    // UAS is now responsible for the atmospheric rendering.
+    // ---------------------------------------------------------
+
+    AtmosphereMesh->SetVisibility(
+        false,
+        true
+    );
+
+    AtmosphereMesh->SetHiddenInGame(
+        true
+    );
 }
 
 
@@ -332,6 +396,7 @@ void APlanet::GeneratePlanetMesh()
         return;
     }
 
+
     if (!TerrainGenerator)
     {
         TerrainGenerator =
@@ -340,6 +405,7 @@ void APlanet::GeneratePlanetMesh()
                 UPlanetTerrainGenerator::StaticClass()
             );
     }
+
 
     if (!TerrainGenerator)
     {
@@ -384,6 +450,7 @@ void APlanet::GeneratePlanetMesh()
 
     PlanetProceduralMesh->ClearAllMeshSections();
 
+
     PlanetProceduralMesh->CreateMeshSection(
         0,
         Vertices,
@@ -394,4 +461,17 @@ void APlanet::GeneratePlanetMesh()
         Tangents,
         true
     );
+
+
+    // =========================================================
+    // MATERIAL ALREADY ASSIGNED IN CONSTRUCTOR
+    // =========================================================
+    //
+    // M_Planet is assigned once when the component is created.
+    // No asset lookup is required every time the procedural
+    // terrain is regenerated.
+    //
+    // This is important because GeneratePlanetMesh() can be
+    // called repeatedly during construction/regeneration.
+    // =========================================================
 }

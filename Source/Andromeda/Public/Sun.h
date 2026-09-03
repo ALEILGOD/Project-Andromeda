@@ -4,35 +4,85 @@
 #include "GameFramework/Actor.h"
 #include "Sun.generated.h"
 
+
+class UPointLightComponent;
+class UStaticMeshComponent;
+class USceneComponent;
+
+
 UCLASS()
 class ANDROMEDA_API ASun : public AActor
 {
     GENERATED_BODY()
 
+
 public:
 
     ASun();
+
 
 protected:
 
     virtual void BeginPlay() override;
 
+
 public:
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Andromeda|Sun")
+    // =========================================================
+    // ROOT
+    // =========================================================
+
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Sun"
+    )
     TObjectPtr<USceneComponent> Root;
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Andromeda|Sun")
+
+    // =========================================================
+    // SUN MESH
+    // =========================================================
+
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Sun"
+    )
     TObjectPtr<UStaticMeshComponent> SunMesh;
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Andromeda|Sun")
-    TObjectPtr<class UPointLightComponent> SunLight;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Sun")
-    float LightIntensity = 10000000000000.0f;
+    // =========================================================
+    // SUN LIGHT
+    // =========================================================
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Sun")
-    float LightAttenuationRadius = 100000000.0f;
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Sun"
+    )
+    TObjectPtr<UPointLightComponent> SunLight;
+
+
+    // =========================================================
+    // LIGHT PARAMETERS
+    // =========================================================
+
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category = "Andromeda|Sun"
+    )
+    float LightIntensity = 1000000000000000.0f;
+
+
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category = "Andromeda|Sun"
+    )
+    float LightAttenuationRadius = 500000000.0f;
+
 
 private:
 
