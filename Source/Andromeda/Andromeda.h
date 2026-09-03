@@ -3,7 +3,7 @@
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
 
-class FUASAtmosphereViewExtension;
+class FUASViewExtension;
 
 class FAndromedaModule
     : public FDefaultGameModuleImpl
@@ -16,6 +16,5 @@ public:
 
 private:
 
-    TSharedPtr<FUASAtmosphereViewExtension>
-        UASViewExtension;
+    TSharedPtr<FUASViewExtension> UASViewExtension;
 };

@@ -1,18 +1,19 @@
-// Fill out your copyright notice in the Description page of Project Settings.
-
 #include "Andromeda.h"
 
-#include "UASAtmosphereViewExtension.h"
+#include "UASViewExtension.h"
 
+#include "Misc/CoreDelegates.h"
 #include "Misc/Paths.h"
 #include "SceneViewExtension.h"
 #include "ShaderCore.h"
 
 void FAndromedaModule::StartupModule()
 {
-    // ========================================================
-    // UAS SHADER DIRECTORY
-    // ========================================================
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("[UAS TEST] StartupModule")
+    );
 
     const FString ShaderDirectory =
         FPaths::Combine(
@@ -21,38 +22,50 @@ void FAndromedaModule::StartupModule()
         );
 
     AddShaderSourceDirectoryMapping(
-        TEXT("/Project/Andromeda"),
+        TEXT("/Andromeda"),
         ShaderDirectory
     );
 
-    // ========================================================
-    // UAS VIEW EXTENSION
-    // ========================================================
-
     UE_LOG(
         LogTemp,
         Warning,
-        TEXT("[UAS] Creating View Extension")
+        TEXT("[UAS TEST] Shader directory mapped: %s"),
+        *ShaderDirectory
     );
 
-    UASViewExtension =
-        FSceneViewExtensions::NewExtension<
-        FUASAtmosphereViewExtension
-        >();
+    FCoreDelegates::OnPostEngineInit.AddLambda(
+        [this]()
+        {
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("[UAS TEST] Creating View Extension AFTER ENGINE INIT")
+            );
 
-    UE_LOG(
-        LogTemp,
-        Warning,
-        TEXT("[UAS] View Extension IsValid = %s"),
-        UASViewExtension.IsValid()
-        ? TEXT("TRUE")
-        : TEXT("FALSE")
+            UASViewExtension =
+                FSceneViewExtensions::NewExtension<
+                FUASViewExtension
+                >();
+
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT(
+                    "[UAS TEST] View Extension IsValid = %s"
+                ),
+                UASViewExtension.IsValid()
+                ? TEXT("TRUE")
+                : TEXT("FALSE")
+            );
+        }
     );
 }
 
 void FAndromedaModule::ShutdownModule()
 {
     UASViewExtension.Reset();
+
+    ResetAllShaderSourceDirectoryMappings();
 }
 
 IMPLEMENT_PRIMARY_GAME_MODULE(

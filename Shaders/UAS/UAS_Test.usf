@@ -1,0 +1,258 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Generated/GeneratedUniformBuffers.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
+
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+
+
+float2 ViewportMin;
+float2 ViewportSize;
+
+
+float3 PlanetCenter;
+float AtmosphereRadius;
+
+
+struct FUASTestVSOutput
+{
+    float4 Position : SV_POSITION;
+};
+
+
+FUASTestVSOutput MainVS(uint VertexID : SV_VertexID)
+{
+    FUASTestVSOutput Output;
+
+    float2 Positions[3];
+
+    Positions[0] = float2(-1.0, -1.0);
+    Positions[1] = float2(-1.0,  3.0);
+    Positions[2] = float2( 3.0, -1.0);
+
+    Output.Position =
+        float4(
+            Positions[VertexID],
+            0.0,
+            1.0
+        );
+
+    return Output;
+}
+
+
+float3 BuildWorldRay(
+    float4 SvPosition
+)
+{
+    float2 ScreenPosition =
+        SvPositionToScreenPosition(
+            SvPosition
+        ).xy;
+
+
+    const float Depth =
+        1000000.0f;
+
+
+    float4 TranslatedWorldPosition =
+        mul(
+            float4(
+                GetScreenPositionForProjectionType(
+                    ScreenPosition,
+                    Depth
+                ),
+                Depth,
+                1.0f
+            ),
+            View.ScreenToTranslatedWorld
+        );
+
+
+    TranslatedWorldPosition.xyz /=
+        TranslatedWorldPosition.w;
+
+
+    return normalize(
+        TranslatedWorldPosition.xyz
+        - View.TranslatedWorldCameraOrigin
+    );
+}
+
+
+bool RaySphereIntersection(
+    float3 RayOrigin,
+    float3 RayDirection,
+    float3 SphereCenter,
+    float SphereRadius,
+    out float TNear,
+    out float TFar
+)
+{
+    float3 Offset =
+        RayOrigin - SphereCenter;
+
+
+    float B =
+        dot(
+            Offset,
+            RayDirection
+        );
+
+
+    float C =
+        dot(
+            Offset,
+            Offset
+        )
+        - SphereRadius * SphereRadius;
+
+
+    float Discriminant =
+        B * B - C;
+
+
+    if (Discriminant < 0.0f)
+    {
+        TNear = 0.0f;
+        TFar = 0.0f;
+
+        return false;
+    }
+
+
+    float SqrtDiscriminant =
+        sqrt(
+            Discriminant
+        );
+
+
+    TNear =
+        -B
+        - SqrtDiscriminant;
+
+
+    TFar =
+        -B
+        + SqrtDiscriminant;
+
+
+    if (TFar < 0.0f)
+    {
+        return false;
+    }
+
+
+    return true;
+}
+
+
+float4 MainPS(
+    FUASTestVSOutput Input
+) : SV_Target0
+{
+    float2 UV =
+        (
+            Input.Position.xy
+            - ViewportMin
+        )
+        / ViewportSize;
+
+
+    float4 SceneColor =
+        SceneColorTexture.Sample(
+            SceneColorSampler,
+            UV
+        );
+
+
+    float3 RayDirection =
+        BuildWorldRay(
+            Input.Position
+        );
+
+
+    float TNear;
+    float TFar;
+
+
+    bool HitsAtmosphere =
+        RaySphereIntersection(
+            View.TranslatedWorldCameraOrigin,
+            RayDirection,
+            PlanetCenter,
+            AtmosphereRadius,
+            TNear,
+            TFar
+        );
+
+
+    if (!HitsAtmosphere)
+    {
+        return SceneColor;
+    }
+
+
+    /*
+     * Read the actual scene depth at this pixel.
+     *
+     * SV_POSITION.xy is converted to buffer UV because
+     * SceneDepth covers the full render target, not only
+     * the current viewport.
+     */
+    float2 BufferUV =
+        SvPositionToBufferUV(
+            Input.Position
+        );
+
+
+    float DeviceZ =
+        LookupDeviceZ(
+            BufferUV
+        );
+
+
+    /*
+     * Convert DeviceZ into Unreal scene depth.
+     *
+     * For the first depth test we only need to distinguish
+     * an actual scene surface from the far plane.
+     */
+    float SceneDepth =
+        ConvertFromDeviceZ(
+            DeviceZ
+        );
+
+
+    /*
+     * DEBUG DEPTH TEST
+     *
+     * If there is a real scene surface between the camera
+     * and the atmosphere entry point, keep the original
+     * SceneColor.
+     *
+     * Otherwise show the atmosphere intersection.
+     *
+     * The small epsilon prevents precision noise around
+     * coincident surfaces.
+     */
+    const float DepthEpsilon =
+        1.0f;
+
+
+    if (SceneDepth > 0.0f
+        && SceneDepth < TNear - DepthEpsilon)
+    {
+        return SceneColor;
+    }
+
+
+    return float4(
+        1.0,
+        0.0,
+        1.0,
+        1.0
+    );
+}

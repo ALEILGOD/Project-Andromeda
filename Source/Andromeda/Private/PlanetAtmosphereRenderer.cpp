@@ -1,6 +1,13 @@
 #include "PlanetAtmosphereRenderer.h"
 
 
+FVector UPlanetAtmosphereRenderer::ActivePlanetWorldPosition =
+FVector::ZeroVector;
+
+float UPlanetAtmosphereRenderer::ActiveAtmosphereRadius =
+0.0f;
+
+
 UPlanetAtmosphereRenderer::UPlanetAtmosphereRenderer()
 {
 }
@@ -17,34 +24,21 @@ void UPlanetAtmosphereRenderer::Initialize(
     float InMieScaleHeight,
     FVector InStarWorldPosition,
     uint8 InQuality,
-    int64 InAtmosphereSeed
+    int64 InAtmosphereSeed,
+    FVector InPlanetWorldPosition
 )
 {
-    // =========================================================
-    // ATMOSPHERE GEOMETRY
-    // =========================================================
-
     GroundRadius =
         InGroundRadius;
 
     AtmosphereRadius =
         InAtmosphereRadius;
 
-
-    // =========================================================
-    // RAYLEIGH
-    // =========================================================
-
     RayleighScattering =
         InRayleighScattering;
 
     RayleighScaleHeight =
         InRayleighScaleHeight;
-
-
-    // =========================================================
-    // MIE
-    // =========================================================
 
     MieScattering =
         InMieScattering;
@@ -55,35 +49,33 @@ void UPlanetAtmosphereRenderer::Initialize(
     MieScaleHeight =
         InMieScaleHeight;
 
-
-    // =========================================================
-    // ABSORPTION
-    // =========================================================
-
     Absorption =
         InAbsorption;
-
-
-    // =========================================================
-    // LIGHTING
-    // =========================================================
 
     StarWorldPosition =
         InStarWorldPosition;
 
-
-    // =========================================================
-    // QUALITY
-    // =========================================================
-
     Quality =
         InQuality;
 
-
-    // =========================================================
-    // DETERMINISTIC SEED
-    // =========================================================
-
     AtmosphereSeed =
         InAtmosphereSeed;
+
+    ActivePlanetWorldPosition =
+        InPlanetWorldPosition;
+
+    ActiveAtmosphereRadius =
+        InAtmosphereRadius;
+}
+
+
+FVector UPlanetAtmosphereRenderer::GetActivePlanetWorldPosition()
+{
+    return ActivePlanetWorldPosition;
+}
+
+
+float UPlanetAtmosphereRenderer::GetActiveAtmosphereRadius()
+{
+    return ActiveAtmosphereRadius;
 }

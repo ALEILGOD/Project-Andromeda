@@ -32,8 +32,18 @@ public:
         float InMieScaleHeight,
         FVector InStarWorldPosition,
         uint8 InQuality,
-        int64 InAtmosphereSeed
+        int64 InAtmosphereSeed,
+        FVector InPlanetWorldPosition
     );
+
+
+    // =========================================================
+    // ACTIVE PLANET DATA
+    // =========================================================
+
+    static FVector GetActivePlanetWorldPosition();
+
+    static float GetActiveAtmosphereRadius();
 
 
     // =========================================================
@@ -139,4 +149,11 @@ public:
         Category = "Andromeda|UAS"
     )
     int64 AtmosphereSeed = 0;
+
+
+private:
+
+    static FVector ActivePlanetWorldPosition;
+
+    static float ActiveAtmosphereRadius;
 };

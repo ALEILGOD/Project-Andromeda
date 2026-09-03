@@ -3,29 +3,30 @@
 #include "CoreMinimal.h"
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
+#include "SceneView.h"
+#include "SceneTexturesConfig.h"
 
-// ============================================================
-// UAS - Atmosphere Vertex Shader
-// ============================================================
 
-class FUASAtmosphereVertexShader
+class FUASTestVertexShader
     : public FGlobalShader
 {
 public:
 
     DECLARE_GLOBAL_SHADER(
-        FUASAtmosphereVertexShader
+        FUASTestVertexShader
     );
 
     SHADER_USE_PARAMETER_STRUCT(
-        FUASAtmosphereVertexShader,
+        FUASTestVertexShader,
         FGlobalShader
     );
+
 
     BEGIN_SHADER_PARAMETER_STRUCT(
         FParameters,
         )
     END_SHADER_PARAMETER_STRUCT()
+
 
     static bool ShouldCompilePermutation(
         const FGlobalShaderPermutationParameters& Parameters
@@ -38,27 +39,36 @@ public:
     }
 };
 
-// ============================================================
-// UAS - Atmosphere Pixel Shader
-// ============================================================
 
-class FUASAtmospherePixelShader
+class FUASTestPixelShader
     : public FGlobalShader
 {
 public:
 
     DECLARE_GLOBAL_SHADER(
-        FUASAtmospherePixelShader
+        FUASTestPixelShader
     );
 
     SHADER_USE_PARAMETER_STRUCT(
-        FUASAtmospherePixelShader,
+        FUASTestPixelShader,
         FGlobalShader
     );
+
 
     BEGIN_SHADER_PARAMETER_STRUCT(
         FParameters,
         )
+
+        SHADER_PARAMETER_STRUCT_REF(
+            FViewUniformShaderParameters,
+            View
+        )
+
+        SHADER_PARAMETER_STRUCT_INCLUDE(
+            FSceneTextureShaderParameters,
+            SceneTextures
+        )
+
         SHADER_PARAMETER_RDG_TEXTURE(
             Texture2D,
             SceneColorTexture
@@ -69,8 +79,30 @@ public:
             SceneColorSampler
         )
 
+        SHADER_PARAMETER(
+            FVector2f,
+            ViewportMin
+        )
+
+        SHADER_PARAMETER(
+            FVector2f,
+            ViewportSize
+        )
+
+        SHADER_PARAMETER(
+            FVector3f,
+            PlanetCenter
+        )
+
+        SHADER_PARAMETER(
+            float,
+            AtmosphereRadius
+        )
+
         RENDER_TARGET_BINDING_SLOTS()
+
     END_SHADER_PARAMETER_STRUCT()
+
 
     static bool ShouldCompilePermutation(
         const FGlobalShaderPermutationParameters& Parameters

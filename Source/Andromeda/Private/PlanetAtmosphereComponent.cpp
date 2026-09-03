@@ -5,18 +5,14 @@
 
 namespace
 {
-    constexpr float AtmosphereTerrainClearance = 10000.0f;
+    constexpr float AtmosphereTerrainClearance =
+        10000.0f;
 }
 
 
 UPlanetAtmosphereComponent::UPlanetAtmosphereComponent()
 {
     PrimaryComponentTick.bCanEverTick = false;
-
-
-    // =========================================================
-    // DEFAULT TRANSFORM
-    // =========================================================
 
     SetMobility(
         EComponentMobility::Movable
@@ -30,22 +26,12 @@ void UPlanetAtmosphereComponent::InitializeAtmosphere(
     int64 Seed
 )
 {
-    // =========================================================
-    // PLANET GEOMETRY
-    // =========================================================
-
     Parameters.GroundRadius =
         PlanetRadius;
-
-
-    // =========================================================
-    // ATMOSPHERE HEIGHT
-    // =========================================================
 
     const float RequiredAtmosphereHeight =
         TerrainHeight
         + AtmosphereTerrainClearance;
-
 
     Parameters.AtmosphereHeight =
         FMath::Max(
@@ -53,23 +39,12 @@ void UPlanetAtmosphereComponent::InitializeAtmosphere(
             RequiredAtmosphereHeight
         );
 
-
     Parameters.AtmosphereRadius =
         PlanetRadius
         + Parameters.AtmosphereHeight;
 
-
-    // =========================================================
-    // DETERMINISTIC SEED
-    // =========================================================
-
     Parameters.AtmosphereSeed =
         Seed;
-
-
-    // =========================================================
-    // ATMOSPHERE TRANSFORM
-    // =========================================================
 
     SetRelativeLocation(
         FVector::ZeroVector
@@ -83,18 +58,8 @@ void UPlanetAtmosphereComponent::InitializeAtmosphere(
         FVector::OneVector
     );
 
-
-    // =========================================================
-    // STAR POSITION
-    // =========================================================
-
     StarWorldPosition =
         FVector::ZeroVector;
-
-
-    // =========================================================
-    // CREATE UAS RENDERER
-    // =========================================================
 
     if (!Renderer)
     {
@@ -105,16 +70,15 @@ void UPlanetAtmosphereComponent::InitializeAtmosphere(
             );
     }
 
-
     if (!Renderer)
     {
         return;
     }
 
-
-    // =========================================================
-    // INITIALIZE UAS RENDERER
-    // =========================================================
+    const FVector PlanetWorldPosition =
+        GetOwner()
+        ? GetOwner()->GetActorLocation()
+        : FVector::ZeroVector;
 
     Renderer->Initialize(
         Parameters.GroundRadius,
@@ -129,6 +93,7 @@ void UPlanetAtmosphereComponent::InitializeAtmosphere(
         static_cast<uint8>(
             Parameters.Quality
             ),
-        Parameters.AtmosphereSeed
+        Parameters.AtmosphereSeed,
+        PlanetWorldPosition
     );
 }

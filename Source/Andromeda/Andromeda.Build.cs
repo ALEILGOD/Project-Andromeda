@@ -1,6 +1,5 @@
-// Fill out your copyright notice in the Description page of Project Settings.
-
 using UnrealBuildTool;
+using System.IO;
 
 public class Andromeda : ModuleRules
 {
@@ -27,5 +26,21 @@ public class Andromeda : ModuleRules
                 "Renderer"
             }
         );
+
+        PrivateIncludePaths.Add(
+    Path.Combine(
+        EngineDirectory,
+        "Source/Runtime/Renderer/Public"
+    )
+);
+
+        PrivateIncludePaths.Add(
+            Path.Combine(
+                EngineDirectory,
+                "Source/Runtime/Renderer/Internal"
+            )
+        );
+
+
     }
 }
