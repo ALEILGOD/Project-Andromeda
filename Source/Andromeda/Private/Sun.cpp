@@ -2,16 +2,11 @@
 
 #include "Components/PointLightComponent.h"
 #include "Components/StaticMeshComponent.h"
-
+#include "Components/SceneComponent.h"
 
 ASun::ASun()
 {
     PrimaryActorTick.bCanEverTick = false;
-
-
-    // =========================================================
-    // ROOT
-    // =========================================================
 
     Root =
         CreateDefaultSubobject<USceneComponent>(
@@ -19,11 +14,6 @@ ASun::ASun()
         );
 
     SetRootComponent(Root);
-
-
-    // =========================================================
-    // SUN MESH
-    // =========================================================
 
     SunMesh =
         CreateDefaultSubobject<UStaticMeshComponent>(
@@ -38,11 +28,6 @@ ASun::ASun()
 
     SunMesh->SetCastShadow(false);
 
-
-    // =========================================================
-    // SUN LIGHT
-    // =========================================================
-
     SunLight =
         CreateDefaultSubobject<UPointLightComponent>(
             TEXT("SunLight")
@@ -56,10 +41,28 @@ ASun::ASun()
 
     SunLight->SetCastShadows(true);
 
+    SunLight->SetIntensity(
+        LightIntensity
+    );
 
-    // =========================================================
-    // INITIAL POINT LIGHT SETTINGS
-    // =========================================================
+    SunLight->SetAttenuationRadius(
+        LightAttenuationRadius
+    );
+}
+
+void ASun::BeginPlay()
+{
+    Super::BeginPlay();
+
+    ConfigureSunLight();
+}
+
+void ASun::ConfigureSunLight()
+{
+    if (!SunLight)
+    {
+        return;
+    }
 
     SunLight->SetIntensity(
         LightIntensity
@@ -70,40 +73,4 @@ ASun::ASun()
     );
 
     SunLight->SetCastShadows(true);
-}
-
-
-void ASun::BeginPlay()
-{
-    Super::BeginPlay();
-
-    ConfigureSunLight();
-}
-
-
-void ASun::ConfigureSunLight()
-{
-    if (!SunLight)
-    {
-        return;
-    }
-
-
-    // =========================================================
-    // POINT LIGHT
-    // =========================================================
-
-    SunLight->SetIntensity(
-        LightIntensity
-    );
-
-
-    SunLight->SetAttenuationRadius(
-        LightAttenuationRadius
-    );
-
-
-    SunLight->SetCastShadows(
-        true
-    );
 }
