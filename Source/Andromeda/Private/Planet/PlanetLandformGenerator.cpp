@@ -2,9 +2,9 @@
 
 namespace
 {
-    // ============================================================
-    // HASH DETERMINISTICO
-    // ============================================================
+    // ========================================================================
+    // DETERMINISTIC HASH & OFFSET GENERATION (SPLITMIX64)
+    // ========================================================================
 
     uint64 HashSeed(uint64 Seed)
     {
@@ -21,17 +21,13 @@ namespace
         return Seed ^ (Seed >> 31);
     }
 
-
     FVector MakeSeedOffset(
         int64 Seed,
         uint64 Salt
     )
     {
-        uint64 Base =
-            static_cast<uint64>(Seed);
-
-        Base ^=
-            Salt;
+        const uint64 Base =
+            static_cast<uint64>(Seed) ^ Salt;
 
         const uint64 HashX =
             HashSeed(Base);
@@ -66,17 +62,10 @@ namespace
             200.0f -
             100.0f;
 
-        return FVector(
-            X,
-            Y,
-            Z
-        );
+        return FVector(X, Y, Z);
     }
 
-
-    float NormalizeNoise(
-        float Noise
-    )
+    float NormalizeNoise(float Noise)
     {
         return FMath::Clamp(
             (Noise + 1.0f) * 0.5f,
@@ -85,17 +74,10 @@ namespace
         );
     }
 
-
-    float SafeScale(
-        float Scale
-    )
+    float SafeScale(float Scale)
     {
-        return FMath::Max(
-            Scale,
-            0.0001f
-        );
+        return FMath::Max(Scale, 0.0001f);
     }
-
 
     float SmoothMask(
         float Value,
@@ -106,245 +88,380 @@ namespace
         return FMath::SmoothStep(
             Start,
             End,
-            FMath::Clamp(
-                Value,
-                0.0f,
-                1.0f
-            )
+            FMath::Clamp(Value, 0.0f, 1.0f)
         );
     }
 
 
-    // ============================================================
-    // CONTINUOUS REGION
+    // ========================================================================
+    // CONTINUOUS DOMAIN WARPING
     //
-    // Crea una regione ampia e morbida.
-    //
-    // Non esiste un bordo netto.
-    // La regione entra lentamente nel terreno.
-    // ============================================================
+    // Esegue una distorsione a bassa frequenza e derivata continua sul versore
+    // sferico, evitando schemi artificiali e garantendo cinture tettoniche
+    // curvilinee organiche su scala globale.
+    // ========================================================================
 
-    float GenerateRegion(
-        FVector Direction,
+    FVector EvaluateOrogenicWarp(
+        const FVector& Direction,
         float Scale,
-        const FVector& Offset,
-        float Threshold,
-        float Softness
-    )
-    {
-        const float Noise =
-            NormalizeNoise(
-                FMath::PerlinNoise3D(
-                    Direction *
-                    Scale +
-                    Offset
-                )
-            );
-
-        return SmoothMask(
-            Noise,
-            Threshold - Softness,
-            Threshold + Softness
-        );
-    }
-
-
-    // ============================================================
-    // MOUNTAIN REGION
-    //
-    // Ogni regione usa:
-    //
-    // 1. noise macro
-    // 2. noise regionale
-    // 3. domain warp
-    //
-    // Questo evita che le montagne sembrino distribuite
-    // uniformemente su tutto il pianeta.
-    // ============================================================
-
-    float GenerateMountainRegion(
-        FVector Direction,
-        float Scale,
-        int64 Seed,
-        uint64 Salt,
-        float Threshold,
-        float Softness
+        int64 Seed
     )
     {
         const FVector WarpOffset =
             MakeSeedOffset(
                 Seed,
-                Salt ^ 0x19A7D43C82F651B0ULL
+                0x7A93F1C2B54E8D01ULL
             );
+
+        const float WarpFrequency =
+            Scale * 0.22f;
 
         const float WarpA =
             FMath::PerlinNoise3D(
-                Direction *
-                Scale *
-                0.22f +
+                Direction * WarpFrequency +
                 WarpOffset
             );
 
         const float WarpB =
             FMath::PerlinNoise3D(
-                Direction *
-                Scale *
-                0.19f +
-                WarpOffset *
-                1.71f
+                Direction * WarpFrequency +
+                WarpOffset * 1.57f
             );
 
         const float WarpC =
             FMath::PerlinNoise3D(
-                Direction *
-                Scale *
-                0.25f +
-                WarpOffset *
-                2.13f
+                Direction * WarpFrequency +
+                WarpOffset * 2.11f
             );
+
+        return (
+            Direction +
+            FVector(WarpA, WarpB, WarpC) * 0.35f
+            ).GetSafeNormal();
+    }
+
+
+    // ========================================================================
+    // OROGENIC BELT EVALUATOR
+    //
+    // Costruisce la spina orogenica continua integrando:
+    // 1. Corridoio orogenico macro (bassa frequenza globale);
+    // 2. Cresta dorsale differenziabile C1 (1 - sqrt(N^2 + eps^2));
+    // 3. Modulazione regionale continua (valichi, depressioni, valli trasversali).
+    // ========================================================================
+
+    float EvaluateOrogenicBelt(
+        FVector Direction,
+        int64 Seed,
+        float Scale
+    )
+    {
+        Direction =
+            Direction.GetSafeNormal();
+
+        const float S =
+            SafeScale(Scale);
 
         const FVector WarpedDirection =
-            (
-                Direction +
-                FVector(
-                    WarpA,
-                    WarpB,
-                    WarpC
-                ) *
-                0.28f
-                ).GetSafeNormal();
+            EvaluateOrogenicWarp(Direction, S, Seed);
 
-        const FVector RegionOffset =
+        const FVector OffsetMacro =
             MakeSeedOffset(
                 Seed,
-                Salt
+                0xA17C39D482E651F0ULL
             );
 
-        const float MacroNoise =
-            NormalizeNoise(
-                FMath::PerlinNoise3D(
-                    WarpedDirection *
-                    Scale *
-                    0.48f +
-                    RegionOffset
-                )
-            );
-
-        const float RegionalNoise =
-            NormalizeNoise(
-                FMath::PerlinNoise3D(
-                    WarpedDirection *
-                    Scale *
-                    0.92f +
-                    RegionOffset *
-                    1.43f
-                )
-            );
-
-        const float RegionField =
-            MacroNoise *
-            0.70f +
-            RegionalNoise *
-            0.30f;
-
-        return SmoothMask(
-            RegionField,
-            Threshold - Softness,
-            Threshold + Softness
-        );
-    }
-
-
-    // ============================================================
-    // HILL REGION
-    // ============================================================
-
-    float GenerateHillRegion(
-        FVector Direction,
-        float Scale,
-        int64 Seed,
-        uint64 Salt,
-        float Threshold,
-        float Softness
-    )
-    {
-        const FVector Offset =
+        const FVector OffsetSpine =
             MakeSeedOffset(
                 Seed,
-                Salt
+                0x5D8E2A1F4C73B902ULL
             );
 
-        const float LargeNoise =
+        const FVector OffsetRegional =
+            MakeSeedOffset(
+                Seed,
+                0xE36B91F8402CA7D5ULL
+            );
+
+        // Corridoio orogenico macro su scala continentale
+        const float MacroBelt =
             NormalizeNoise(
                 FMath::PerlinNoise3D(
-                    Direction *
-                    Scale *
-                    0.50f +
-                    Offset
+                    WarpedDirection * (S * 0.34f) +
+                    OffsetMacro
                 )
             );
 
-        const float RegionalNoise =
-            NormalizeNoise(
-                FMath::PerlinNoise3D(
-                    Direction *
-                    Scale *
-                    1.05f +
-                    Offset *
-                    1.51f
-                )
+        // Spina dorsale tettonica continua (regolarizzata con C1 continuo)
+        const float RidgeNoise =
+            FMath::PerlinNoise3D(
+                WarpedDirection * (S * 0.58f) +
+                OffsetSpine
             );
 
-        const float Field =
-            LargeNoise *
-            0.68f +
-            RegionalNoise *
-            0.32f;
-
-        return SmoothMask(
-            Field,
-            Threshold - Softness,
-            Threshold + Softness
-        );
-    }
-
-
-    // ============================================================
-    // COMBINE REGIONS
-    //
-    // Le regioni vengono sommate in modo controllato.
-    //
-    // Non vogliamo che 4 montagne sovrapposte producano
-    // automaticamente un'altezza assurda.
-    // ============================================================
-
-    float CombineRegions(
-        float A,
-        float B,
-        float C,
-        float D
-    )
-    {
-        const float Combined =
+        const float SmoothSpine =
             1.0f -
-            (
-                (1.0f - A) *
-                (1.0f - B) *
-                (1.0f - C) *
-                (1.0f - D)
-                );
+            FMath::Sqrt(
+                RidgeNoise * RidgeNoise +
+                0.04f
+            );
 
-        return FMath::Clamp(
-            Combined,
-            0.0f,
-            1.0f
+        const float NormalizedSpine =
+            FMath::Clamp(
+                (SmoothSpine - 0.15f) / 0.75f,
+                0.0f,
+                1.0f
+            );
+
+        // Modulazione strutturale regionale lungo l'arco della cintura
+        const float RegionalBelt =
+            NormalizeNoise(
+                FMath::PerlinNoise3D(
+                    WarpedDirection * (S * 0.88f) +
+                    OffsetRegional
+                )
+            );
+
+        // Campo orogenico continuo composito
+        const float RawBelt =
+            MacroBelt * 0.42f +
+            NormalizedSpine * 0.44f +
+            RegionalBelt * 0.14f;
+
+        // Transizione Hermite ampia: definisce grandi sistemi e sfumature progressive
+        return SmoothMask(
+            RawBelt,
+            0.34f,
+            0.72f
         );
     }
 }
 
 
 // ============================================================================
-// LANDFORM MASK
+// OROGENIC BELT MASK
+// ============================================================================
+
+float UPlanetLandformGenerator::GetOrogenicBeltMask(
+    FVector Direction,
+    int64 Seed,
+    float Scale
+)
+{
+    return EvaluateOrogenicBelt(
+        Direction,
+        Seed,
+        Scale
+    );
+}
+
+
+// ============================================================================
+// CORRELATED MOUNTAIN MASK (MOUNTAIN CORE)
+//
+// Occupa il nucleo della cintura orogenica. Non e' una bolla isolata ma il cuore
+// strutturale delle catene, con variazioni regionali di estensione dei massicci.
+// ============================================================================
+
+float UPlanetLandformGenerator::GetCorrelatedMountainMask(
+    FVector Direction,
+    int64 Seed,
+    float Scale
+)
+{
+    Direction =
+        Direction.GetSafeNormal();
+
+    const float S =
+        SafeScale(Scale);
+
+    const float OrogenicBelt =
+        EvaluateOrogenicBelt(
+            Direction,
+            Seed,
+            Scale
+        );
+
+    if (OrogenicBelt <= 0.001f)
+    {
+        return 0.0f;
+    }
+
+    const FVector WarpedDirection =
+        EvaluateOrogenicWarp(Direction, S, Seed);
+
+    // Variazione regionale dei massicci: differenzia larghezza e intensita' dei gruppi montuosi
+    const FVector MassifOffset =
+        MakeSeedOffset(
+            Seed,
+            0x4D2E8B91C3F7A055ULL
+        );
+
+    const float MassifNoise =
+        NormalizeNoise(
+            FMath::PerlinNoise3D(
+                WarpedDirection * (S * 0.72f) +
+                MassifOffset
+            )
+        );
+
+    // Modulazione morbida (+-0.08) della larghezza del nucleo lungo la cintura
+    const float ShiftedBelt =
+        OrogenicBelt +
+        (MassifNoise - 0.5f) * 0.16f;
+
+    return SmoothMask(
+        ShiftedBelt,
+        0.44f,
+        0.78f
+    );
+}
+
+
+// ============================================================================
+// CORRELATED FOOTHILL MASK
+//
+// Circonda naturalmente il nucleo montuoso all'interno dell'orogenesi.
+// Non usa esclusioni distruttive ma forma la base di transizione verso le pianure.
+// ============================================================================
+
+float UPlanetLandformGenerator::GetCorrelatedFoothillMask(
+    FVector Direction,
+    int64 Seed,
+    float Scale
+)
+{
+    Direction =
+        Direction.GetSafeNormal();
+
+    const float S =
+        SafeScale(Scale);
+
+    const float OrogenicBelt =
+        EvaluateOrogenicBelt(
+            Direction,
+            Seed,
+            Scale
+        );
+
+    if (OrogenicBelt <= 0.001f)
+    {
+        return 0.0f;
+    }
+
+    // Salita graduale dai bordi esterni della cintura orogenica
+    const float FoothillRise =
+        SmoothMask(
+            OrogenicBelt,
+            0.12f,
+            0.42f
+        );
+
+    // Transizione verso il nucleo: sostiene la base dei massicci senza azzerarsi bruscamente
+    const float FoothillFall =
+        1.0f -
+        SmoothMask(
+            OrogenicBelt,
+            0.56f,
+            0.88f
+        ) * 0.65f;
+
+    return FMath::Clamp(
+        FoothillRise * FoothillFall,
+        0.0f,
+        1.0f
+    );
+}
+
+
+// ============================================================================
+// REGIONAL HILL MASK (INTERNAL CONTINENTAL HILLS & PLATEAUS)
+//
+// Genera province collinari e altopiani all'interno delle masse continentali,
+// impedendo che l'entroterra rimanga una gigantesca pianura uniforme e piatta.
+// ============================================================================
+
+float UPlanetLandformGenerator::GetRegionalHillMask(
+    FVector Direction,
+    int64 Seed,
+    float Scale
+)
+{
+    Direction =
+        Direction.GetSafeNormal();
+
+    const float S =
+        SafeScale(Scale);
+
+    const FVector HillWarpOffset =
+        MakeSeedOffset(
+            Seed,
+            0x3B9F1C74E2A85D06ULL
+        );
+
+    const float WarpA =
+        FMath::PerlinNoise3D(
+            Direction * (S * 0.28f) +
+            HillWarpOffset
+        );
+
+    const float WarpB =
+        FMath::PerlinNoise3D(
+            Direction * (S * 0.24f) +
+            HillWarpOffset * 1.63f
+        );
+
+    const FVector WarpedDir =
+        (
+            Direction +
+            FVector(WarpA, WarpB, -WarpA) * 0.26f
+            ).GetSafeNormal();
+
+    const FVector HillOffsetMacro =
+        MakeSeedOffset(
+            Seed,
+            0x7E14C9A250B83DF1ULL
+        );
+
+    const FVector HillOffsetRegional =
+        MakeSeedOffset(
+            Seed,
+            0xD4A82F109C5E76B3ULL
+        );
+
+    // Campo macro che definisce la distribuzione delle province collinari
+    const float MacroHills =
+        NormalizeNoise(
+            FMath::PerlinNoise3D(
+                WarpedDir * (S * 0.46f) +
+                HillOffsetMacro
+            )
+        );
+
+    // Rilievo regionale interno
+    const float RegionalHills =
+        NormalizeNoise(
+            FMath::PerlinNoise3D(
+                WarpedDir * (S * 0.95f) +
+                HillOffsetRegional
+            )
+        );
+
+    const float CombinedField =
+        MacroHills * 0.65f +
+        RegionalHills * 0.35f;
+
+    // Transizione graduale Hermite: le colline si sviluppano dolcemente sui territori interni
+    return SmoothMask(
+        CombinedField,
+        0.38f,
+        0.72f
+    );
+}
+
+
+// ============================================================================
+// COMPATIBILITY IMPLEMENTATIONS
 // ============================================================================
 
 float UPlanetLandformGenerator::GetLandformMask(
@@ -353,69 +470,34 @@ float UPlanetLandformGenerator::GetLandformMask(
     float Scale
 )
 {
-    Direction =
-        Direction.GetSafeNormal();
-
-    const float S =
-        SafeScale(Scale);
-
-    const FVector Offset =
-        MakeSeedOffset(
+    const float OrogenicBelt =
+        GetOrogenicBeltMask(
+            Direction,
             Seed,
-            0xA17C39D482E651F0ULL
+            Scale
         );
 
-    const float MacroNoise =
-        NormalizeNoise(
-            FMath::PerlinNoise3D(
-                Direction *
-                S *
-                0.34f +
-                Offset
-            )
+    const float RegionalHills =
+        GetRegionalHillMask(
+            Direction,
+            Seed,
+            Scale
         );
 
-    const float RegionalNoise =
-        NormalizeNoise(
-            FMath::PerlinNoise3D(
-                Direction *
-                S *
-                0.67f +
-                Offset *
-                1.37f
-            )
-        );
+    // Copertura delle forme strutturate del terreno (cinture montuose + colline interne)
+    // Permette alle pianure di esistere nei bacini, senza invadere l'intero continente
+    const float CombinedLandforms =
+        1.0f -
+        (1.0f - OrogenicBelt) *
+        (1.0f - RegionalHills * 0.72f);
 
-    const float LocalNoise =
-        NormalizeNoise(
-            FMath::PerlinNoise3D(
-                Direction *
-                S *
-                1.15f +
-                Offset *
-                1.83f
-            )
-        );
-
-    const float Field =
-        MacroNoise *
-        0.58f +
-        RegionalNoise *
-        0.30f +
-        LocalNoise *
-        0.12f;
-
-    return SmoothMask(
-        Field,
-        0.28f,
-        0.78f
+    return FMath::Clamp(
+        CombinedLandforms,
+        0.0f,
+        1.0f
     );
 }
 
-
-// ============================================================================
-// HILL MASK
-// ============================================================================
 
 float UPlanetLandformGenerator::GetHillMask(
     FVector Direction,
@@ -423,54 +505,33 @@ float UPlanetLandformGenerator::GetHillMask(
     float Scale
 )
 {
-    Direction =
-        Direction.GetSafeNormal();
-
-    const float S =
-        SafeScale(Scale);
-
-    const float HillA =
-        GenerateHillRegion(
+    const float Foothills =
+        GetCorrelatedFoothillMask(
             Direction,
-            S,
             Seed,
-            0x1234ABCD5678EF01ULL,
-            0.50f,
-            0.18f
+            Scale
         );
 
-    const float HillB =
-        GenerateHillRegion(
+    const float RegionalHills =
+        GetRegionalHillMask(
             Direction,
-            S * 0.82f,
             Seed,
-            0x7B29D4E68153ACF0ULL,
-            0.56f,
-            0.20f
+            Scale
         );
 
-    const float HillC =
-        GenerateHillRegion(
-            Direction,
-            S * 1.18f,
-            Seed,
-            0xD8316FA249C75BE0ULL,
-            0.53f,
-            0.17f
-        );
+    // Unione non-distruttiva: combina i contrafforti orogenici con le province collinari interne
+    const float CombinedHills =
+        1.0f -
+        (1.0f - Foothills) *
+        (1.0f - RegionalHills);
 
-    return CombineRegions(
-        HillA,
-        HillB,
-        HillC,
-        0.0f
+    return FMath::Clamp(
+        CombinedHills,
+        0.0f,
+        1.0f
     );
 }
 
-
-// ============================================================================
-// MOUNTAIN MASK
-// ============================================================================
 
 float UPlanetLandformGenerator::GetMountainMask(
     FVector Direction,
@@ -478,70 +539,13 @@ float UPlanetLandformGenerator::GetMountainMask(
     float Scale
 )
 {
-    Direction =
-        Direction.GetSafeNormal();
-
-    const float S =
-        SafeScale(Scale);
-
-    // ============================================================
-    // QUATTRO REGIONI MONTUOSE INDIPENDENTI
-    //
-    // Hanno scale, seed e soglie diverse.
-    // ============================================================
-
-    const float MountainA =
-        GenerateMountainRegion(
-            Direction,
-            S * 0.72f,
-            Seed,
-            0x1A73C59E42B8D601ULL,
-            0.67f,
-            0.20f
-        );
-
-    const float MountainB =
-        GenerateMountainRegion(
-            Direction,
-            S * 0.91f,
-            Seed,
-            0xB46D218F7395CA02ULL,
-            0.72f,
-            0.18f
-        );
-
-    const float MountainC =
-        GenerateMountainRegion(
-            Direction,
-            S * 1.13f,
-            Seed,
-            0x58E2A941C637BD03ULL,
-            0.70f,
-            0.21f
-        );
-
-    const float MountainD =
-        GenerateMountainRegion(
-            Direction,
-            S * 0.57f,
-            Seed,
-            0xC9137F6A42DE8504ULL,
-            0.75f,
-            0.19f
-        );
-
-    return CombineRegions(
-        MountainA,
-        MountainB,
-        MountainC,
-        MountainD
+    return GetCorrelatedMountainMask(
+        Direction,
+        Seed,
+        Scale
     );
 }
 
-
-// ============================================================================
-// MOUNTAIN CHAIN MASK
-// ============================================================================
 
 float UPlanetLandformGenerator::GetMountainChainMask(
     FVector Direction,
@@ -555,186 +559,57 @@ float UPlanetLandformGenerator::GetMountainChainMask(
     const float S =
         SafeScale(Scale);
 
-    // ============================================================
-    // CHAIN A
-    // ============================================================
+    const FVector WarpedDirection =
+        EvaluateOrogenicWarp(Direction, S, Seed);
 
-    const FVector OffsetA =
+    const FVector ChainOffsetA =
         MakeSeedOffset(
             Seed,
-            0xA1B2C3D4E5F60718ULL
+            0x8C15E394A2D7B0F1ULL
         );
 
-    const float WarpA =
+    const FVector ChainOffsetB =
+        MakeSeedOffset(
+            Seed,
+            0x3E7B20A195C84DF6ULL
+        );
+
+    // Spina dorsale continua principale
+    const float RidgeNoiseA =
         FMath::PerlinNoise3D(
-            Direction *
-            S *
-            0.23f +
-            OffsetA
+            WarpedDirection * (S * 0.76f) +
+            ChainOffsetA
         );
-
-    const float WarpB =
-        FMath::PerlinNoise3D(
-            Direction *
-            S *
-            0.19f +
-            OffsetA *
-            1.73f
-        );
-
-    FVector ChainDirectionA =
-        (
-            Direction +
-            FVector(
-                WarpA,
-                WarpB,
-                -WarpA
-            ) *
-            0.30f
-            ).GetSafeNormal();
 
     const float RidgeA =
         1.0f -
-        FMath::Abs(
-            FMath::PerlinNoise3D(
-                ChainDirectionA *
-                S *
-                0.47f +
-                OffsetA *
-                1.31f
-            )
+        FMath::Sqrt(
+            RidgeNoiseA * RidgeNoiseA +
+            0.035f
         );
 
-    const float ChainA =
-        SmoothMask(
-            RidgeA,
-            0.64f,
-            0.84f
-        );
-
-
-    // ============================================================
-    // CHAIN B
-    // ============================================================
-
-    const FVector OffsetB =
-        MakeSeedOffset(
-            Seed,
-            0x9182736455AABBCCULL
-        );
-
-    const float WarpC =
+    // Cresta secondaria di raccordo
+    const float RidgeNoiseB =
         FMath::PerlinNoise3D(
-            Direction *
-            S *
-            0.17f +
-            OffsetB
+            WarpedDirection * (S * 1.28f) +
+            ChainOffsetB
         );
-
-    const float WarpD =
-        FMath::PerlinNoise3D(
-            Direction *
-            S *
-            0.27f +
-            OffsetB *
-            1.61f
-        );
-
-    FVector ChainDirectionB =
-        (
-            Direction +
-            FVector(
-                WarpC,
-                -WarpD,
-                WarpD
-            ) *
-            0.26f
-            ).GetSafeNormal();
 
     const float RidgeB =
         1.0f -
-        FMath::Abs(
-            FMath::PerlinNoise3D(
-                ChainDirectionB *
-                S *
-                0.61f +
-                OffsetB *
-                1.47f
-            )
+        FMath::Sqrt(
+            RidgeNoiseB * RidgeNoiseB +
+            0.035f
         );
 
-    const float ChainB =
-        SmoothMask(
-            RidgeB,
-            0.67f,
-            0.86f
-        );
+    const float CombinedRidge =
+        RidgeA * 0.72f +
+        RidgeB * 0.28f;
 
-
-    // ============================================================
-    // CHAIN C
-    // ============================================================
-
-    const FVector OffsetC =
-        MakeSeedOffset(
-            Seed,
-            0xD6E5F4A3B2918077ULL
-        );
-
-    const float WarpE =
-        FMath::PerlinNoise3D(
-            Direction *
-            S *
-            0.21f +
-            OffsetC
-        );
-
-    FVector ChainDirectionC =
-        (
-            Direction +
-            FVector(
-                WarpE,
-                WarpE * 0.65f,
-                -WarpE * 0.85f
-            ) *
-            0.24f
-            ).GetSafeNormal();
-
-    const float RidgeC =
-        1.0f -
-        FMath::Abs(
-            FMath::PerlinNoise3D(
-                ChainDirectionC *
-                S *
-                0.54f +
-                OffsetC *
-                1.29f
-            )
-        );
-
-    const float ChainC =
-        SmoothMask(
-            RidgeC,
-            0.69f,
-            0.87f
-        );
-
-
-    // ============================================================
-    // COMBINAZIONE
-    // ============================================================
-
-    const float Combined =
-        1.0f -
-        (
-            (1.0f - ChainA) *
-            (1.0f - ChainB) *
-            (1.0f - ChainC)
-            );
-
-    return FMath::Clamp(
-        Combined,
-        0.0f,
-        1.0f
+    // Transizione continua e morbida per evitare creste spezzate
+    return SmoothMask(
+        CombinedRidge,
+        0.32f,
+        0.74f
     );
 }

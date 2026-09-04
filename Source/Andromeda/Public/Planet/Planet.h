@@ -8,6 +8,7 @@
 class UProceduralMeshComponent;
 class UPlanetTerrainGenerator;
 class UPlanetAtmosphereComponent;
+class UPlanetaryLightingComponent;
 
 
 UCLASS()
@@ -78,6 +79,18 @@ public:
         Category = "Andromeda|Planet|Atmosphere"
     )
     TObjectPtr<UProceduralMeshComponent> AtmosphereMesh;
+
+
+    // =========================================================
+    // PLANETARY LIGHTING
+    // =========================================================
+
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Planet|Lighting"
+    )
+    TObjectPtr<UPlanetaryLightingComponent> PlanetaryLighting;
 
 
     // =========================================================

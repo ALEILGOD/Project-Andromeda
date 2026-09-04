@@ -2,6 +2,7 @@
 
 #include "Planet/PlanetTerrainGenerator.h"
 #include "PlanetAtmosphereComponent.h"
+#include "PlanetaryLightingComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -127,6 +128,16 @@ APlanet::APlanet()
     AtmosphereMesh->SetHiddenInGame(
         true
     );
+
+
+    // =========================================================
+    // PLANETARY LIGHTING COMPONENT
+    // =========================================================
+
+    PlanetaryLighting =
+        CreateDefaultSubobject<UPlanetaryLightingComponent>(
+            TEXT("PlanetaryLighting")
+        );
 }
 
 
@@ -445,6 +456,25 @@ void APlanet::GeneratePlanetMesh()
 
 
     // =========================================================
+    // GENERATE UVs AND VERTEX COLORS
+    // =========================================================
+
+    TArray<FVector2D> UVs;
+    TArray<FColor> VertexColors;
+    UVs.Reserve(Vertices.Num());
+    VertexColors.Reserve(Vertices.Num());
+
+    for (const FVector& V : Vertices)
+    {
+        const FVector D = V.GetSafeNormal();
+        const float U = 0.5f + FMath::Atan2(D.Y, D.X) / (2.0f * PI);
+        const float VCoord = 0.5f - FMath::Asin(FMath::Clamp(D.Z, -1.0f, 1.0f)) / PI;
+        UVs.Add(FVector2D(U, VCoord));
+        VertexColors.Add(FColor::White);
+    }
+
+
+    // =========================================================
     // CREATE MESH
     // =========================================================
 
@@ -456,8 +486,8 @@ void APlanet::GeneratePlanetMesh()
         Vertices,
         Triangles,
         Normals,
-        TArray<FVector2D>(),
-        TArray<FColor>(),
+        UVs,
+        VertexColors,
         Tangents,
         true
     );
