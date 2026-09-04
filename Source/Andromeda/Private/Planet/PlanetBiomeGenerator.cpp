@@ -450,56 +450,155 @@ FRegionalBiomeAffinities UPlanetBiomeGenerator::CalculateRegionalAffinities(
 {
     Direction = Direction.GetSafeNormal();
 
-    // Tre canali multiscala per lo spazio latente biogeografico
-    const float U = SampleMultiscaleField(Direction, Seed, 0xA1B2C3D4ULL);
-    const float V = SampleMultiscaleField(Direction, Seed, 0xE5F60718ULL);
-    const float W = SampleMultiscaleField(Direction, Seed, 0x98765432ULL);
+    // ========================================================================
+    // SPHERICAL SEEDED BIOGEOGRAPHIC PROVINCES (PBS v3 - Fase 1)
+    //
+    // 8 province sferiche con centri deterministici (base Fibonacci + perturbazione
+    // angolare seedata), rotazione globale per-pianeta, influenza gaussiana continua
+    // sulla sfera (overlap tra province, niente bordi netti) e conversione in
+    // affinita per i 5 core biomes tramite famiglie ecologiche.
+    // NESSUN nuovo noise: solo geometria sferica deterministica.
+    //
+    // Nota determinismo: l'API del PBS passa a questo livello il seed generazione
+    // del pianeta (identita' unica del pianeta a questo livello della pipeline:
+    // stesso pianeta -> stesso Seed; pianeti diversi -> Seed diversi). L'hash
+    // dedicato sotto decorrela lo scheletro province dagli altri sistemi che
+    // consumano lo stesso Seed raw (temperature, humidity, ecc.).
+    // ========================================================================
 
-    // Rotazione deterministica dello spazio latente basata sul seed per variare la disposizione planetaria
-    const uint64 RotHash = HashSeed64(static_cast<uint64>(Seed), 0xC0FFEEULL);
-    const float Angle = (static_cast<float>(RotHash & 0xFFFF) / 65535.0f) * 2.0f * PI;
-    const float CosA = FMath::Cos(Angle);
-    const float SinA = FMath::Sin(Angle);
+    constexpr int32 ProvinceCount = 8;
+    constexpr float Sigma = 0.35f; // raggio di influenza (~radianti effettivi)
+    constexpr float InvTwoSigmaSq = 0.5f / (Sigma * Sigma);
 
-    const float RotU = U * CosA - V * SinA;
-    const float RotV = U * SinA + V * CosA;
+    // Seed composito dell'ecosistema province (salt dedicato "Province").
+    const uint64 ProvinceSeedHash =
+        HashSeed64(static_cast<uint64>(Seed), 0x50726F76696E6365ULL);
 
-    // 5 domini regionali distribuiti radialmente nello spazio latente (2D + perturbazione W)
-    // k = 0: Forest    (theta = 0 deg)
-    // k = 1: Grassland (theta = 72 deg)
-    // k = 2: Plains    (theta = 144 deg)
-    // k = 3: Desert    (theta = 216 deg)
-    // k = 4: Tundra    (theta = 288 deg)
-    constexpr float InvFive = 2.0f * PI / 5.0f;
+    // Rotazione globale deterministica dello scheletro delle province.
+    const uint64 RotHash = HashSeed64(ProvinceSeedHash, 0x5F3759DFULL);
+    const float Yaw   = (static_cast<float>(RotHash & 0xFFFF) / 65535.0f) * 2.0f * PI;
+    const float Pitch = (static_cast<float>((RotHash >> 16) & 0xFFFF) / 65535.0f) * 2.0f * PI;
+    const float Roll  = (static_cast<float>((RotHash >> 32) & 0xFFFF) / 65535.0f) * 2.0f * PI;
 
-    float Projections[5];
-    for (int32 k = 0; k < 5; ++k)
+    const float Cy = FMath::Cos(Yaw),   Sy = FMath::Sin(Yaw);
+    const float Cp = FMath::Cos(Pitch), Sp = FMath::Sin(Pitch);
+    const float Cr = FMath::Cos(Roll),  Sr = FMath::Sin(Roll);
+
+    // Matrice R = Yaw * Pitch * Roll (row-major)
+    const float R00 = Cy * Cp;
+    const float R01 = Cy * Sp * Sr - Sy * Cr;
+    const float R02 = Cy * Sp * Cr + Sy * Sr;
+    const float R10 = Sy * Cp;
+    const float R11 = Sy * Sp * Sr + Cy * Cr;
+    const float R12 = Sy * Sp * Cr - Cy * Sr;
+    const float R20 = -Sp;
+    const float R21 = Cp * Sr;
+    const float R22 = Cp * Cr;
+
+    const float GoldenAngle = PI * (3.0f - FMath::Sqrt(5.0f));
+
+    float Influences[ProvinceCount];
+    uint8 Families[ProvinceCount];
+    float TotalInfluence = 0.0f;
+
+    for (int32 i = 0; i < ProvinceCount; ++i)
     {
-        const float ThetaK = static_cast<float>(k) * InvFive;
-        const float DirX = FMath::Cos(ThetaK);
-        const float DirY = FMath::Sin(ThetaK);
+        // ---- Centro base: Fibonacci sphere (copertura uniforme) ----
+        const float Y = 1.0f - (2.0f * static_cast<float>(i) + 1.0f) / static_cast<float>(ProvinceCount);
+        const float R = FMath::Sqrt(FMath::Max(0.0f, 1.0f - Y * Y));
+        const float Theta = GoldenAngle * static_cast<float>(i);
+        FVector Center(R * FMath::Cos(Theta), R * FMath::Sin(Theta), Y);
 
-        // Proiezione del punto corrente verso il dominio k
-        Projections[k] = RotU * DirX + RotV * DirY + W * 0.12f * FMath::Sin(2.0f * ThetaK);
+        // ---- Perturbazione angolare deterministica per-centro ----
+        // Evita che pianeti diversi condividano identica Fibonacci ruotata:
+        // ogni centro e' spostato in modo totalmente deterministico dal seed.
+        const uint64 CenterHash = HashSeed64(
+            ProvinceSeedHash,
+            0xD1B54A32D192ED03ULL + static_cast<uint64>(i) * 0x9E3779B97F4A7C15ULL);
+
+        constexpr float JitterScale = 0.35f; // perturbazione moderata (no cluster patologici)
+        const float JX = ((static_cast<float>(CenterHash & 0xFFFF) / 65535.0f) * 2.0f - 1.0f) * JitterScale;
+        const float JY = ((static_cast<float>((CenterHash >> 16) & 0xFFFF) / 65535.0f) * 2.0f - 1.0f) * JitterScale;
+        const float JZ = ((static_cast<float>((CenterHash >> 32) & 0xFFFF) / 65535.0f) * 2.0f - 1.0f) * JitterScale;
+
+        Center.X += JX;
+        Center.Y += JY;
+        Center.Z += JZ;
+
+        // ---- Rotazione globale (orienta l'intero scheletro per pianeta) ----
+        const FVector Rotated(
+            R00 * Center.X + R01 * Center.Y + R02 * Center.Z,
+            R10 * Center.X + R11 * Center.Y + R12 * Center.Z,
+            R20 * Center.X + R21 * Center.Y + R22 * Center.Z
+        );
+
+        Center = Rotated.GetSafeNormal();
+
+        // ---- Famiglia ecologica deterministica (0..3) ----
+        const uint64 FamilyHash = HashSeed64(
+            ProvinceSeedHash,
+            0xA0761D6478BD642FULL + static_cast<uint64>(i) * 0x517CC1B727220A95ULL);
+        Families[i] = static_cast<uint8>(FamilyHash & 0x3ULL);
+
+        // ---- Influenza sferica continua: exp(-d^2 / 2 sigma^2) ----
+        // d^2 (corda) = 2 - 2*dot: monotona rispetto alla distanza angolare,
+        // evita acos. Le province si sovrappongono dolcemente.
+        const float Dot = FVector::DotProduct(Direction, Center);
+        const float ChordSq = FMath::Max(0.0f, 2.0f - 2.0f * Dot);
+        Influences[i] = FMath::Exp(-ChordSq * InvTwoSigmaSq);
+        TotalInfluence += Influences[i];
     }
 
-    // Softmax con sharpness calibrata per produrre province marcate ma transizioni fluide
-    float Weights[5];
-    float SumWeights = 0.0f;
-    for (int32 k = 0; k < 5; ++k)
+    // ========================================================================
+    // NORMALIZZAZIONE INFLUENCE + CONVERSIONE PROVINCE -> BIOME AFFINITIES
+    //
+    // ProvinceWeight[i] = Influence[i] / TotalInfluence (fallback deterministico
+    // se la somma e' circa zero). Poi:
+    // Affinity[k] = Somma_i ProvinceWeight[i] * FamilySupport[Family[i]][k]
+    // con FamilySupport nell'ordine [Forest, Grassland, Plains, Desert, Tundra].
+    // ========================================================================
+
+    float Affinity[5] = { 0.0f };
+
+    if (TotalInfluence > 0.0001f)
     {
-        Weights[k] = FMath::Exp(FMath::Clamp(Projections[k] * 3.2f, -12.0f, 12.0f));
-        SumWeights += Weights[k];
+        static constexpr float FamilySupport[4][5] =
+        {
+            { 1.00f, 0.75f, 0.55f, 0.15f, 0.15f }, // 0 Temperate/Wet -> Forest + Grassland + Plains
+            { 0.12f, 0.55f, 0.60f, 1.00f, 0.08f }, // 1 Dry           -> Desert + Plains + Grassland
+            { 0.40f, 0.20f, 0.50f, 0.08f, 1.00f }, // 2 Cold          -> Tundra + Plains + Forest fredda
+            { 0.75f, 0.75f, 0.70f, 0.50f, 0.50f }  // 3 Mixed         -> combinazioni piu ampie
+        };
+
+        for (int32 i = 0; i < ProvinceCount; ++i)
+        {
+            const float Weight = Influences[i] / TotalInfluence;
+            for (int32 k = 0; k < 5; ++k)
+            {
+                Affinity[k] += Weight * FamilySupport[Families[i]][k];
+            }
+        }
+    }
+    else
+    {
+        // Fallback deterministico sicuro (nessuna divisione per zero).
+        for (int32 k = 0; k < 5; ++k)
+        {
+            Affinity[k] = 0.20f;
+        }
     }
 
-    const float InvSum = (SumWeights > 0.0001f) ? (1.0f / SumWeights) : 0.2f;
+    // Normalizzazione finale a somma 1 (le family weights non sono a somma 1).
+    const float AffinitySum =
+        Affinity[0] + Affinity[1] + Affinity[2] + Affinity[3] + Affinity[4];
+    const float InvAffinitySum = (AffinitySum > 0.0001f) ? (1.0f / AffinitySum) : 1.0f;
 
     FRegionalBiomeAffinities Result;
-    Result.Forest = Weights[0] * InvSum;
-    Result.Grassland = Weights[1] * InvSum;
-    Result.Plains = Weights[2] * InvSum;
-    Result.Desert = Weights[3] * InvSum;
-    Result.Tundra = Weights[4] * InvSum;
+    Result.Forest = Affinity[0] * InvAffinitySum;
+    Result.Grassland = Affinity[1] * InvAffinitySum;
+    Result.Plains = Affinity[2] * InvAffinitySum;
+    Result.Desert = Affinity[3] * InvAffinitySum;
+    Result.Tundra = Affinity[4] * InvAffinitySum;
 
     return Result;
 }
