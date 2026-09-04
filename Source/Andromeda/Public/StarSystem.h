@@ -82,6 +82,14 @@ public:
 
 
     UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category = "Andromeda|Star System"
+    )
+    float OrbitTimeScale = 0.05f;
+
+
+    UPROPERTY(
         BlueprintReadOnly,
         Category = "Andromeda|Star System"
     )

@@ -8,6 +8,7 @@ class UPointLightComponent;
 class USkyLightComponent;
 class UStaticMeshComponent;
 class USceneComponent;
+class UTextureCube;
 
 UCLASS()
 class ANDROMEDA_API ASun : public AActor
@@ -76,7 +77,7 @@ public:
     // LIGHTING PARAMETERS
     // =========================================================
 
-    /** Intensità della luce solare diretta (in lux/candela con falloff normalizzato) */
+    /** Intensità della luce solare diretta */
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -92,7 +93,7 @@ public:
     )
     float LightAttenuationRadius = 50000000000.0f;
 
-    /** Raggio fisico della stella per il calcolo della penombra sferica */
+    /** Raggio fisico della stella */
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -108,21 +109,46 @@ public:
     )
     float LightSoftSourceRadius = 2500000.0f;
 
-    /** Intensità della luce cosmica ambientale (starlight / radiazione di fondo) */
+    /**
+     * Intensità del fill ambientale.
+     *
+     * Deve rimanere molto più debole della luce solare:
+     * serve solamente a mantenere leggibile il lato notturno
+     * senza trasformarlo in una superficie uniformemente illuminata.
+     */
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
-        Category = "Andromeda|Sun"
+        Category = "Andromeda|Sun",
+        meta = (
+            ClampMin = "0.0",
+            UIMin = "0.0",
+            UIMax = "5.0"
+            )
     )
-    float AmbientIntensity = 0.015f;
+    float AmbientIntensity = 0.35f;
 
-    /** Tinta cromatica dello spazio profondo per il lato notturno */
+    /** Tinta fredda e molto scura dello starlight */
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Sun"
     )
-    FLinearColor AmbientColor = FLinearColor(0.04f, 0.05f, 0.08f, 1.0f);
+    FLinearColor AmbientColor =
+        FLinearColor(
+            0.08f,
+            0.11f,
+            0.18f,
+            1.0f
+        );
+
+    /** Cubemap ambientale per il fill a 360 gradi */
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category = "Andromeda|Sun"
+    )
+    TObjectPtr<UTextureCube> AmbientCubemap;
 
 private:
 

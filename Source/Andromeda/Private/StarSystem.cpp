@@ -362,6 +362,17 @@ void AStarSystem::UpdatePlanetOrbits(
     }
 
 
+    const float SafeOrbitTimeScale =
+        FMath::Max(
+            OrbitTimeScale,
+            0.0f
+        );
+
+    const float OrbitSimulationTime =
+        SystemSimulationTime *
+        SafeOrbitTimeScale;
+
+
     for (
         FSpawnedPlanetData& SpawnedPlanet :
         SpawnedPlanets
@@ -376,7 +387,7 @@ void AStarSystem::UpdatePlanetOrbits(
         const FVector OrbitPosition =
             CalculateOrbitPosition(
                 SpawnedPlanet.GenerationData,
-                SystemSimulationTime
+                OrbitSimulationTime
             );
 
 

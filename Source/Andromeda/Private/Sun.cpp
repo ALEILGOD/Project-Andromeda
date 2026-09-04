@@ -4,6 +4,8 @@
 #include "Components/SkyLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SceneComponent.h"
+#include "Engine/TextureCube.h"
+#include "UObject/ConstructorHelpers.h"
 
 ASun::ASun()
 {
@@ -40,14 +42,9 @@ ASun::ASun()
     // =========================================================
     // PRIMARY SOLAR LIGHT
     //
-    // A scala astronomica (centinaia di migliaia di km):
-    // 1. NON usiamo shadow map dalla PointLight: proietterebbero
-    //    solo ~37 pixel sull'intero pianeta, causando aliasing a
-    //    gradini da 270 metri e pop-in binario quando la camera si avvicina.
-    // 2. La transizione giorno/notte della sfera e' naturale e continua
-    //    grazie ai normali di superficie (N . L).
-    // 3. Disattiviamo il falloff quadratico puro (1/d^2 in cm) per evitare
-    //    l'azzeramento dei pianeti esterni e numeri a 12 cifre.
+    // La PointLight rimane la sorgente principale.
+    // Le ombre della PointLight sono disabilitate perché a scala
+    // astronomica producono shadow-map troppo piccole e instabili.
     // =========================================================
 
     SunLight =
@@ -85,12 +82,21 @@ ASun::ASun()
     // =========================================================
     // COSMIC AMBIENT / STARLIGHT FILL
     //
-    // Nello spazio profondo l'assenza totale di luce ambiente
-    // rende il lato notturno un vuoto nero assoluto (0.0), tagliando
-    // il terminatore a rasoio. Lo SpaceAmbientLight fornisce
-    // la luce diffusa delle stelle dell'universo, ammorbidendo
-    // la transizione verso la notte ed evidenziando la sagoma 3D.
+    // Lo SkyLight viene usato esclusivamente come fill molto
+    // debole per evitare che il lato notturno diventi nero.
+    //
+    // Non deve sostituire la luce solare.
     // =========================================================
+
+    static ConstructorHelpers::FObjectFinder<UTextureCube> DefaultCubeFinder(
+        TEXT("/Engine/EngineResources/DefaultTextureCube")
+    );
+
+    if (DefaultCubeFinder.Succeeded())
+    {
+        AmbientCubemap =
+            DefaultCubeFinder.Object;
+    }
 
     SpaceAmbientLight =
         CreateDefaultSubobject<USkyLightComponent>(
@@ -103,15 +109,14 @@ ASun::ASun()
         EComponentMobility::Movable
     );
 
-    SpaceAmbientLight->SetIntensity(
-        AmbientIntensity
-    );
+    SpaceAmbientLight->bLowerHemisphereIsBlack = false;
 
-    SpaceAmbientLight->SetLightColor(
-        AmbientColor
-    );
+    SpaceAmbientLight->LowerHemisphereColor =
+        AmbientColor;
 
     SpaceAmbientLight->SetCastShadows(false);
+
+    ConfigureSunLight();
 }
 
 void ASun::BeginPlay()
@@ -125,13 +130,19 @@ void ASun::OnConstruction(
     const FTransform& Transform
 )
 {
-    Super::OnConstruction(Transform);
+    Super::OnConstruction(
+        Transform
+    );
 
     ConfigureSunLight();
 }
 
 void ASun::ConfigureSunLight()
 {
+    // =========================================================
+    // PRIMARY SOLAR LIGHT
+    // =========================================================
+
     if (SunLight)
     {
         SunLight->SetIntensity(
@@ -156,6 +167,10 @@ void ASun::ConfigureSunLight()
         );
     }
 
+    // =========================================================
+    // COSMIC AMBIENT FILL
+    // =========================================================
+
     if (SpaceAmbientLight)
     {
         SpaceAmbientLight->SetIntensity(
@@ -166,6 +181,25 @@ void ASun::ConfigureSunLight()
             AmbientColor
         );
 
+        SpaceAmbientLight->bLowerHemisphereIsBlack = false;
+
+        SpaceAmbientLight->LowerHemisphereColor =
+            AmbientColor;
+
+        if (AmbientCubemap)
+        {
+            SpaceAmbientLight->SourceType =
+                ESkyLightSourceType::SLS_SpecifiedCubemap;
+
+            SpaceAmbientLight->SetCubemap(
+                AmbientCubemap
+            );
+        }
+
         SpaceAmbientLight->SetCastShadows(false);
+
+        // Nessun RecaptureSky():
+        // stiamo usando un cubemap specificato, non una cattura
+        // dinamica della scena.
     }
 }

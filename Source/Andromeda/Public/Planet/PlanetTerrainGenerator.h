@@ -49,6 +49,18 @@ public:
         float TerrainHeight
     ) const;
 
+    UFUNCTION(BlueprintPure, Category = "Andromeda|Biome")
+    FPlanetBiomeData GetBiomeData(
+        FVector Direction,
+        int64 Seed,
+        float ContinentalScale,
+        float MountainScale,
+        float DetailScale,
+        float MountainStrength,
+        float DetailStrength,
+        float TerrainHeight
+    ) const;
+
     UFUNCTION(BlueprintCallable, Category = "Andromeda|Terrain")
     void GenerateTerrainMeshData(
         int32 Resolution,
