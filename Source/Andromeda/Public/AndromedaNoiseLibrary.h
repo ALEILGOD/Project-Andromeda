@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "ProceduralMeshComponent.h"
+#include "Planet/PlanetProfile.h"
 #include "Planet/PlanetSurfaceData.h"
 #include "AndromedaNoiseLibrary.generated.h"
 
@@ -74,9 +75,11 @@ public:
         float MountainStrength,
         float DetailStrength,
         float TerrainHeight,
+        const FPlanetProfile& PlanetProfile,
         TArray<FVector>& OutVertices,
         TArray<int32>& OutTriangles,
         TArray<FVector>& OutNormals,
-        TArray<FProcMeshTangent>& OutTangents
+        TArray<FProcMeshTangent>& OutTangents,
+        TArray<FColor>& OutVertexColors
     );
 };

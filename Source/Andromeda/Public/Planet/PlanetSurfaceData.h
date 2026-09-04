@@ -21,6 +21,35 @@ enum class EPlanetBiome : uint8
 };
 
 /**
+ * Affinità regionali per i biomi terrestri prodotte dal Regional Biome Field del PBS.
+ */
+USTRUCT(BlueprintType)
+struct FRegionalBiomeAffinities
+{
+    GENERATED_BODY()
+
+    /** Affinità regionale per Plains [0.0 - 1.0] */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Biome")
+    float Plains = 0.0f;
+
+    /** Affinità regionale per Grassland [0.0 - 1.0] */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Biome")
+    float Grassland = 0.0f;
+
+    /** Affinità regionale per Forest [0.0 - 1.0] */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Biome")
+    float Forest = 0.0f;
+
+    /** Affinità regionale per Desert [0.0 - 1.0] */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Biome")
+    float Desert = 0.0f;
+
+    /** Affinità regionale per Tundra [0.0 - 1.0] */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Biome")
+    float Tundra = 0.0f;
+};
+
+/**
  * Dati climatici e di classificazione bioma generati dal PBS per un punto della superficie.
  */
 USTRUCT(BlueprintType)
@@ -55,6 +84,10 @@ struct FPlanetBiomeData
     /** Latitudine normalizzata [0.0 = equatore, 1.0 = poli] */
     UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Biome")
     float Latitude = 0.0f;
+
+    /** Affinità biogeografiche regionali calcolate dal Regional Biome Field */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Biome")
+    FRegionalBiomeAffinities RegionalAffinities;
 };
 
 /**

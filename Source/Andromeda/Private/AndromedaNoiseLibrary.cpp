@@ -1,5 +1,6 @@
 #include "AndromedaNoiseLibrary.h"
 
+#include "Planet/PlanetBiomeGenerator.h"
 #include "Planet/PlanetContinentalGenerator.h"
 #include "Planet/PlanetLandformGenerator.h"
 
@@ -68,9 +69,6 @@ namespace
 
         // ========================================================
         // TERRAIN CLASSIFICATION
-        //
-        // Le forme sono correlate.
-        // Pianura -> collina -> montagna
         // ========================================================
 
         const float PlainsMask =
@@ -137,7 +135,7 @@ namespace
             ContinentalMask;
 
         // ========================================================
-        // CONTINENTAL UNDULATIONS (ONDULAZIONI DEL TERRENO)
+        // CONTINENTAL UNDULATIONS
         // ========================================================
 
         const float UndulationNoiseA =
@@ -180,7 +178,7 @@ namespace
             ContinentalMask;
 
         // ========================================================
-        // PLAINS (CALME E POCO RUMOROSE)
+        // PLAINS
         // ========================================================
 
         const float PlainsNoise =
@@ -205,7 +203,7 @@ namespace
             ContinentalMask;
 
         // ========================================================
-        // HILLS (RILIEVI MORBIDI A CUPOLA, DERIVATA CONTINUA C1)
+        // HILLS
         // ========================================================
 
         const float HillNoise =
@@ -241,7 +239,7 @@ namespace
             ContinentalMask;
 
         // ========================================================
-        // MOUNTAINS (CRESTE RACCORDATE, NESSUNA DERIVATA INFINITA)
+        // MOUNTAINS
         // ========================================================
 
         const uint64 BaseSeed =
@@ -370,7 +368,7 @@ namespace
             ContinentalMask;
 
         // ========================================================
-        // MICRO DETAIL (DELICATO E LOCALIZZATO)
+        // MICRO DETAIL
         // ========================================================
 
         uint64 DetailSeed =
@@ -530,6 +528,111 @@ namespace
             return FVector::UpVector;
         }
     }
+
+
+    // ============================================================
+    // PBS DEBUG DATA
+    // ============================================================
+
+    FColor EncodePBSVertexData(
+        const FVector& Direction,
+        float NormalizedHeight,
+        const FVector& SurfaceNormal,
+        int64 Seed,
+        const FPlanetProfile& PlanetProfile
+    )
+    {
+        const FPlanetBiomeData BiomeData =
+            UPlanetBiomeGenerator::CalculateBiomeWithProfile(
+                Direction,
+                NormalizedHeight,
+                SurfaceNormal,
+                Seed,
+                PlanetProfile
+            );
+
+        // ========================================================
+        // TEMPORARY BIOME ID DEBUG
+        //
+        // R = Biome ID normalizzato
+        //
+        // 0 = Ocean
+        // 1 = Beach
+        // 2 = Plains
+        // 3 = Grassland
+        // 4 = Forest
+        // 5 = Desert
+        // 6 = Tundra
+        // 7 = Snow
+        // 8 = Mountain
+        //
+        // G/B/A = 0
+        // ========================================================
+
+        uint8 BiomeID = 0;
+
+        switch (BiomeData.PrimaryBiome)
+        {
+        case EPlanetBiome::Ocean:
+            BiomeID = 0;
+            break;
+
+        case EPlanetBiome::Beach:
+            BiomeID = 1;
+            break;
+
+        case EPlanetBiome::Plains:
+            BiomeID = 2;
+            break;
+
+        case EPlanetBiome::Grassland:
+            BiomeID = 3;
+            break;
+
+        case EPlanetBiome::Forest:
+            BiomeID = 4;
+            break;
+
+        case EPlanetBiome::Desert:
+            BiomeID = 5;
+            break;
+
+        case EPlanetBiome::Tundra:
+            BiomeID = 6;
+            break;
+
+        case EPlanetBiome::Snow:
+            BiomeID = 7;
+            break;
+
+        case EPlanetBiome::Mountain:
+            BiomeID = 8;
+            break;
+
+        default:
+            BiomeID = 0;
+            break;
+        }
+
+        const float NormalizedBiomeID =
+            static_cast<float>(BiomeID) /
+            8.0f;
+
+        const uint8 EncodedBiomeID =
+            static_cast<uint8>(
+                FMath::RoundToInt(
+                    NormalizedBiomeID *
+                    255.0f
+                )
+                );
+
+        return FColor(
+            EncodedBiomeID,
+            0,
+            0,
+            255
+        );
+    }
 }
 
 
@@ -657,7 +760,10 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
 
     const float ReferencePlanetRadius =
         (TerrainHeight > 0.0f)
-        ? FMath::Max(TerrainHeight * 25.0f, 250000.0f)
+        ? FMath::Max(
+            TerrainHeight * 25.0f,
+            250000.0f
+        )
         : 500000.0f;
 
     const FVector PointCenter =
@@ -855,16 +961,19 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
     float MountainStrength,
     float DetailStrength,
     float TerrainHeight,
+    const FPlanetProfile& PlanetProfile,
     TArray<FVector>& OutVertices,
     TArray<int32>& OutTriangles,
     TArray<FVector>& OutNormals,
-    TArray<FProcMeshTangent>& OutTangents
+    TArray<FProcMeshTangent>& OutTangents,
+    TArray<FColor>& OutVertexColors
 )
 {
     OutVertices.Reset();
     OutTriangles.Reset();
     OutNormals.Reset();
     OutTangents.Reset();
+    OutVertexColors.Reset();
 
     if (Resolution < 2)
     {
@@ -878,6 +987,11 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
     constexpr int32 TotalFaces = 6;
 
     OutVertices.Reserve(
+        VerticesPerFace *
+        TotalFaces
+    );
+
+    OutVertexColors.Reserve(
         VerticesPerFace *
         TotalFaces
     );
@@ -916,6 +1030,53 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
             FaceVertices)
         {
             OutVertices.Add(Vertex);
+
+            // ====================================================
+            // PBS DATA
+            // ====================================================
+
+            const FVector Direction =
+                Vertex.GetSafeNormal();
+
+            const float RawHeight =
+                Direction.IsNearlyZero()
+                ? 0.0f
+                : (
+                    Vertex.Size() -
+                    PlanetRadius
+                    );
+
+            const float NormalizedHeight =
+                (TerrainHeight > 0.0f)
+                ? FMath::Clamp(
+                    RawHeight /
+                    TerrainHeight,
+                    -1.0f,
+                    1.0f
+                )
+                : 0.0f;
+
+            const FVector SurfaceNormal =
+                UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
+                    Direction,
+                    Seed,
+                    ContinentalScale,
+                    MountainScale,
+                    DetailScale,
+                    MountainStrength,
+                    DetailStrength,
+                    TerrainHeight
+                );
+
+            OutVertexColors.Add(
+                EncodePBSVertexData(
+                    Direction,
+                    NormalizedHeight,
+                    SurfaceNormal,
+                    Seed,
+                    PlanetProfile
+                )
+            );
         }
 
         const int32 RowSize =
@@ -977,13 +1138,23 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
         TriIdx < TriangleIndexCount;
         TriIdx += 3)
     {
-        const int32 I0 = OutTriangles[TriIdx];
-        const int32 I1 = OutTriangles[TriIdx + 1];
-        const int32 I2 = OutTriangles[TriIdx + 2];
+        const int32 I0 =
+            OutTriangles[TriIdx];
 
-        const FVector& V0 = OutVertices[I0];
-        const FVector& V1 = OutVertices[I1];
-        const FVector& V2 = OutVertices[I2];
+        const int32 I1 =
+            OutTriangles[TriIdx + 1];
+
+        const int32 I2 =
+            OutTriangles[TriIdx + 2];
+
+        const FVector& V0 =
+            OutVertices[I0];
+
+        const FVector& V1 =
+            OutVertices[I1];
+
+        const FVector& V2 =
+            OutVertices[I2];
 
         FVector TriNormal =
             FVector::CrossProduct(
@@ -992,9 +1163,13 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
             );
 
         const FVector Centroid =
-            (V0 + V1 + V2) * 0.3333333f;
+            (V0 + V1 + V2) *
+            0.3333333f;
 
-        if (FVector::DotProduct(TriNormal, Centroid) < 0.0f)
+        if (FVector::DotProduct(
+            TriNormal,
+            Centroid
+        ) < 0.0f)
         {
             TriNormal = -TriNormal;
         }
@@ -1012,28 +1187,47 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
         Resolution + 1;
 
     TMap<FIntVector, FVector> BoundaryNormals;
-    BoundaryNormals.Reserve(TotalFaces * Resolution * 4);
+
+    BoundaryNormals.Reserve(
+        TotalFaces *
+        Resolution *
+        4
+    );
 
     for (int32 VertIdx = 0;
         VertIdx < TotalVertexCount;
         ++VertIdx)
     {
         const int32 FaceVertIdx =
-            VertIdx % VerticesPerFace;
-        const int32 X =
-            FaceVertIdx % RowSize;
-        const int32 Y =
-            FaceVertIdx / RowSize;
+            VertIdx %
+            VerticesPerFace;
 
-        if (X == 0 || X == Resolution || Y == 0 || Y == Resolution)
+        const int32 X =
+            FaceVertIdx %
+            RowSize;
+
+        const int32 Y =
+            FaceVertIdx /
+            RowSize;
+
+        if (X == 0 ||
+            X == Resolution ||
+            Y == 0 ||
+            Y == Resolution)
         {
             const FVector& Pos =
                 OutVertices[VertIdx];
 
             const FIntVector Key(
-                FMath::RoundToInt(Pos.X * 0.1f),
-                FMath::RoundToInt(Pos.Y * 0.1f),
-                FMath::RoundToInt(Pos.Z * 0.1f)
+                FMath::RoundToInt(
+                    Pos.X * 0.1f
+                ),
+                FMath::RoundToInt(
+                    Pos.Y * 0.1f
+                ),
+                FMath::RoundToInt(
+                    Pos.Z * 0.1f
+                )
             );
 
             FVector& Sum =
@@ -1042,7 +1236,8 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
                     FVector::ZeroVector
                 );
 
-            Sum += OutNormals[VertIdx];
+            Sum +=
+                OutNormals[VertIdx];
         }
     }
 
@@ -1051,26 +1246,42 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
         ++VertIdx)
     {
         const int32 FaceVertIdx =
-            VertIdx % VerticesPerFace;
-        const int32 X =
-            FaceVertIdx % RowSize;
-        const int32 Y =
-            FaceVertIdx / RowSize;
+            VertIdx %
+            VerticesPerFace;
 
-        if (X == 0 || X == Resolution || Y == 0 || Y == Resolution)
+        const int32 X =
+            FaceVertIdx %
+            RowSize;
+
+        const int32 Y =
+            FaceVertIdx /
+            RowSize;
+
+        if (X == 0 ||
+            X == Resolution ||
+            Y == 0 ||
+            Y == Resolution)
         {
             const FVector& Pos =
                 OutVertices[VertIdx];
 
             const FIntVector Key(
-                FMath::RoundToInt(Pos.X * 0.1f),
-                FMath::RoundToInt(Pos.Y * 0.1f),
-                FMath::RoundToInt(Pos.Z * 0.1f)
+                FMath::RoundToInt(
+                    Pos.X * 0.1f
+                ),
+                FMath::RoundToInt(
+                    Pos.Y * 0.1f
+                ),
+                FMath::RoundToInt(
+                    Pos.Z * 0.1f
+                )
             );
 
-            if (const FVector* SharedNormal = BoundaryNormals.Find(Key))
+            if (const FVector* SharedNormal =
+                BoundaryNormals.Find(Key))
             {
-                OutNormals[VertIdx] = *SharedNormal;
+                OutNormals[VertIdx] =
+                    *SharedNormal;
             }
         }
 
@@ -1085,22 +1296,27 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
 
         if (Normal.IsNearlyZero())
         {
-            Normal = RadialDir;
+            Normal =
+                RadialDir;
         }
         else
         {
             Normal.Normalize();
 
-            if (FVector::DotProduct(Normal, RadialDir) < 0.0f)
+            if (FVector::DotProduct(
+                Normal,
+                RadialDir
+            ) < 0.0f)
             {
                 Normal = -Normal;
             }
         }
 
-        OutNormals[VertIdx] = Normal;
+        OutNormals[VertIdx] =
+            Normal;
 
         // ====================================================================
-        // TANGENTE SFERICA GLOBALE CONTINUA (EST PLANETARIO / INCREASING U)
+        // TANGENTE SFERICA GLOBALE CONTINUA
         // ====================================================================
 
         FVector Tangent =

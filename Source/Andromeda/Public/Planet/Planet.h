@@ -2,25 +2,22 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "Planet/PlanetProfile.h"
 #include "Planet.generated.h"
-
 
 class UProceduralMeshComponent;
 class UPlanetTerrainGenerator;
 class UPlanetAtmosphereComponent;
 class UPlanetaryLightingComponent;
 
-
 UCLASS()
 class ANDROMEDA_API APlanet : public AActor
 {
     GENERATED_BODY()
 
-
 public:
 
     APlanet();
-
 
 protected:
 
@@ -30,12 +27,7 @@ protected:
         const FTransform& Transform
     ) override;
 
-
 public:
-
-    // =========================================================
-    // ROOT
-    // =========================================================
 
     UPROPERTY(
         VisibleAnywhere,
@@ -44,22 +36,12 @@ public:
     )
     TObjectPtr<USceneComponent> Root;
 
-
-    // =========================================================
-    // PLANET SURFACE
-    // =========================================================
-
     UPROPERTY(
         VisibleAnywhere,
         BlueprintReadOnly,
         Category = "Andromeda|Planet"
     )
     TObjectPtr<UProceduralMeshComponent> PlanetProceduralMesh;
-
-
-    // =========================================================
-    // PLANET ATMOSPHERE
-    // =========================================================
 
     UPROPERTY(
         VisibleAnywhere,
@@ -68,22 +50,12 @@ public:
     )
     TObjectPtr<UPlanetAtmosphereComponent> Atmosphere;
 
-
-    // =========================================================
-    // ATMOSPHERE MESH
-    // =========================================================
-
     UPROPERTY(
         VisibleAnywhere,
         BlueprintReadOnly,
         Category = "Andromeda|Planet|Atmosphere"
     )
     TObjectPtr<UProceduralMeshComponent> AtmosphereMesh;
-
-
-    // =========================================================
-    // PLANETARY LIGHTING
-    // =========================================================
 
     UPROPERTY(
         VisibleAnywhere,
@@ -92,10 +64,13 @@ public:
     )
     TObjectPtr<UPlanetaryLightingComponent> PlanetaryLighting;
 
-
-    // =========================================================
-    // PLANET PARAMETERS
-    // =========================================================
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category = "Andromeda|Planet",
+        meta = (ExposeOnSpawn = "true")
+    )
+    int64 PlanetID = 0;
 
     UPROPERTY(
         EditAnywhere,
@@ -105,6 +80,27 @@ public:
     )
     int64 PlanetSeed = 0;
 
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category = "Andromeda|Planet",
+        meta = (ExposeOnSpawn = "true")
+    )
+    float OrbitDistance = 0.0f;
+
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category = "Andromeda|Planet|Profile"
+    )
+    EPlanetArchetype PlanetArchetype = EPlanetArchetype::Terran;
+
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Planet|Profile"
+    )
+    FPlanetProfile PlanetProfile;
 
     UPROPERTY(
         EditAnywhere,
@@ -114,7 +110,6 @@ public:
     )
     float PlanetRadius = 500000.0f;
 
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -123,18 +118,12 @@ public:
     )
     float TerrainHeight = 20000.0f;
 
-
-    // =========================================================
-    // TERRAIN
-    // =========================================================
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Planet|Terrain"
     )
     int32 Resolution = 150;
-
 
     UPROPERTY(
         EditAnywhere,
@@ -143,14 +132,12 @@ public:
     )
     float ContinentalScale = 0.5f;
 
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Planet|Terrain"
     )
     float MountainScale = 3.0f;
-
 
     UPROPERTY(
         EditAnywhere,
@@ -159,14 +146,12 @@ public:
     )
     float DetailScale = 12.0f;
 
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Planet|Terrain"
     )
     float MountainStrength = 1.5f;
-
 
     UPROPERTY(
         EditAnywhere,
@@ -175,11 +160,6 @@ public:
     )
     float DetailStrength = 0.1f;
 
-
-    // =========================================================
-    // TERRAIN GENERATOR
-    // =========================================================
-
     UPROPERTY(
         Transient,
         BlueprintReadOnly,
@@ -187,12 +167,7 @@ public:
     )
     TObjectPtr<UPlanetTerrainGenerator> TerrainGenerator;
 
-
 protected:
-
-    // =========================================================
-    // INITIALIZATION
-    // =========================================================
 
     void InitializePlanet();
 

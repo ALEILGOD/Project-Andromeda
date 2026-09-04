@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "UObject/NoExportTypes.h"
+#include "Planet/PlanetProfile.h"
 #include "StarSystemGenerator.generated.h"
 
 
@@ -97,6 +98,16 @@ struct FPlanetGenerationData
 
     UPROPERTY(BlueprintReadOnly)
     float OrbitalPeriod = 0.0f;
+
+    // =========================================================
+    // ARCHETYPE & PROFILE (PBS v2)
+    // =========================================================
+
+    UPROPERTY(BlueprintReadOnly)
+    EPlanetArchetype PlanetArchetype = EPlanetArchetype::Terran;
+
+    UPROPERTY(BlueprintReadOnly)
+    FPlanetProfile PlanetProfile;
 };
 
 

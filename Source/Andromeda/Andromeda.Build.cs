@@ -6,6 +6,7 @@ public class Andromeda : ModuleRules
     public Andromeda(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+        bUseUnity = false;
 
         PublicDependencyModuleNames.AddRange(
             new string[]

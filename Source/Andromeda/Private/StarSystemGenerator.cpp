@@ -419,6 +419,20 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
 
 
         // =====================================================
+        // PLANET ARCHETYPE & PROFILE (PBS v2)
+        // =====================================================
+
+        PlanetData.PlanetProfile =
+            UPlanetProfileGenerator::GenerateProfile(
+                PlanetData.PlanetSeed,
+                PlanetData.PlanetID,
+                PlanetData.OrbitDistance
+            );
+
+        PlanetData.PlanetArchetype =
+            PlanetData.PlanetProfile.Archetype;
+
+        // =====================================================
         // ADD PLANET
         // =====================================================
 

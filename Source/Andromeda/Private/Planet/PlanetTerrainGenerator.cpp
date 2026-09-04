@@ -1,6 +1,8 @@
 #include "Planet/PlanetTerrainGenerator.h"
+
 #include "Planet/PlanetBiomeGenerator.h"
 #include "AndromedaNoiseLibrary.h"
+
 
 float UPlanetTerrainGenerator::GetTerrainHeight(
     FVector Direction,
@@ -21,8 +23,10 @@ float UPlanetTerrainGenerator::GetTerrainHeight(
         DetailScale,
         MountainStrength,
         DetailStrength
-    ) * TerrainHeight;
+    ) *
+        TerrainHeight;
 }
+
 
 FVector UPlanetTerrainGenerator::GetTerrainNormal(
     FVector Direction,
@@ -47,6 +51,7 @@ FVector UPlanetTerrainGenerator::GetTerrainNormal(
     );
 }
 
+
 FPlanetSurfaceData UPlanetTerrainGenerator::GetSurfaceData(
     FVector Direction,
     int64 Seed,
@@ -58,32 +63,46 @@ FPlanetSurfaceData UPlanetTerrainGenerator::GetSurfaceData(
     float TerrainHeight
 ) const
 {
-    FPlanetSurfaceData SurfaceData = UAndromedaNoiseLibrary::GetPlanetSurfaceData(
-        Direction,
-        Seed,
-        ContinentalScale,
-        MountainScale,
-        DetailScale,
-        MountainStrength,
-        DetailStrength,
-        TerrainHeight
-    );
+    FPlanetSurfaceData SurfaceData =
+        UAndromedaNoiseLibrary::GetPlanetSurfaceData(
+            Direction,
+            Seed,
+            ContinentalScale,
+            MountainScale,
+            DetailScale,
+            MountainStrength,
+            DetailStrength,
+            TerrainHeight
+        );
 
-    const float NormalizedHeight = (TerrainHeight > 0.0f)
-        ? (SurfaceData.Height / TerrainHeight)
+    const float NormalizedHeight =
+        (TerrainHeight > 0.0f)
+        ? (
+            SurfaceData.Height /
+            TerrainHeight
+            )
         : 0.0f;
 
-    SurfaceData.NormalizedHeight = NormalizedHeight;
-    SurfaceData.Slope = UPlanetBiomeGenerator::CalculateSlope(Direction, SurfaceData.Normal);
-    SurfaceData.BiomeData = UPlanetBiomeGenerator::CalculateBiome(
-        Direction,
-        NormalizedHeight,
-        SurfaceData.Normal,
-        Seed
-    );
+    SurfaceData.NormalizedHeight =
+        NormalizedHeight;
+
+    SurfaceData.Slope =
+        UPlanetBiomeGenerator::CalculateSlope(
+            Direction,
+            SurfaceData.Normal
+        );
+
+    SurfaceData.BiomeData =
+        UPlanetBiomeGenerator::CalculateBiome(
+            Direction,
+            NormalizedHeight,
+            SurfaceData.Normal,
+            Seed
+        );
 
     return SurfaceData;
 }
+
 
 FPlanetBiomeData UPlanetTerrainGenerator::GetBiomeData(
     FVector Direction,
@@ -108,6 +127,7 @@ FPlanetBiomeData UPlanetTerrainGenerator::GetBiomeData(
     ).BiomeData;
 }
 
+
 void UPlanetTerrainGenerator::GenerateTerrainMeshData(
     int32 Resolution,
     float PlanetRadius,
@@ -118,10 +138,12 @@ void UPlanetTerrainGenerator::GenerateTerrainMeshData(
     float MountainStrength,
     float DetailStrength,
     float TerrainHeight,
+    const FPlanetProfile& PlanetProfile,
     TArray<FVector>& OutVertices,
     TArray<int32>& OutTriangles,
     TArray<FVector>& OutNormals,
-    TArray<FProcMeshTangent>& OutTangents
+    TArray<FProcMeshTangent>& OutTangents,
+    TArray<FColor>& OutVertexColors
 ) const
 {
     UAndromedaNoiseLibrary::GeneratePlanetMeshData(
@@ -134,9 +156,11 @@ void UPlanetTerrainGenerator::GenerateTerrainMeshData(
         MountainStrength,
         DetailStrength,
         TerrainHeight,
+        PlanetProfile,
         OutVertices,
         OutTriangles,
         OutNormals,
-        OutTangents
+        OutTangents,
+        OutVertexColors
     );
 }

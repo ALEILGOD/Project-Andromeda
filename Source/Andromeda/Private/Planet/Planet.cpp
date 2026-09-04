@@ -18,22 +18,12 @@ APlanet::APlanet()
 {
     PrimaryActorTick.bCanEverTick = false;
 
-
-    // =========================================================
-    // ROOT
-    // =========================================================
-
     Root =
         CreateDefaultSubobject<USceneComponent>(
             TEXT("Root")
         );
 
     SetRootComponent(Root);
-
-
-    // =========================================================
-    // PLANET PROCEDURAL MESH
-    // =========================================================
 
     PlanetProceduralMesh =
         CreateDefaultSubobject<UProceduralMeshComponent>(
@@ -46,16 +36,10 @@ APlanet::APlanet()
         ECollisionEnabled::QueryAndPhysics
     );
 
-
-    // =========================================================
-    // PLANET MATERIAL
-    // =========================================================
-
     static ConstructorHelpers::FObjectFinder<UMaterialInterface>
         PlanetMaterialFinder(
             TEXT("/Game/Materials/M_Planet")
         );
-
 
     if (PlanetMaterialFinder.Succeeded())
     {
@@ -76,22 +60,12 @@ APlanet::APlanet()
         );
     }
 
-
-    // =========================================================
-    // PLANET ATMOSPHERE COMPONENT
-    // =========================================================
-
     Atmosphere =
         CreateDefaultSubobject<UPlanetAtmosphereComponent>(
             TEXT("Atmosphere")
         );
 
     Atmosphere->SetupAttachment(Root);
-
-
-    // =========================================================
-    // PLANET ATMOSPHERE MESH
-    // =========================================================
 
     AtmosphereMesh =
         CreateDefaultSubobject<UProceduralMeshComponent>(
@@ -112,14 +86,6 @@ APlanet::APlanet()
         false
     );
 
-
-    // ---------------------------------------------------------
-    // UAS OWNS THE ATMOSPHERE VISUALIZATION.
-    //
-    // The old spherical atmosphere mesh is kept alive for
-    // debugging/future use, but is no longer rendered.
-    // ---------------------------------------------------------
-
     AtmosphereMesh->SetVisibility(
         false,
         true
@@ -128,11 +94,6 @@ APlanet::APlanet()
     AtmosphereMesh->SetHiddenInGame(
         true
     );
-
-
-    // =========================================================
-    // PLANETARY LIGHTING COMPONENT
-    // =========================================================
 
     PlanetaryLighting =
         CreateDefaultSubobject<UPlanetaryLightingComponent>(
@@ -153,7 +114,9 @@ void APlanet::OnConstruction(
     const FTransform& Transform
 )
 {
-    Super::OnConstruction(Transform);
+    Super::OnConstruction(
+        Transform
+    );
 
     InitializePlanet();
 }
@@ -161,9 +124,15 @@ void APlanet::OnConstruction(
 
 void APlanet::InitializePlanet()
 {
-    // =========================================================
-    // ATMOSPHERE PARAMETERS
-    // =========================================================
+    PlanetProfile =
+        UPlanetProfileGenerator::GenerateProfile(
+            PlanetSeed,
+            PlanetID,
+            OrbitDistance
+        );
+
+    PlanetArchetype =
+        PlanetProfile.Archetype;
 
     if (Atmosphere)
     {
@@ -174,29 +143,18 @@ void APlanet::InitializePlanet()
         );
     }
 
-
-    // =========================================================
-    // ATMOSPHERE MESH
-    // =========================================================
-
     GenerateAtmosphereMesh();
-
-
-    // =========================================================
-    // TERRAIN
-    // =========================================================
-
     GeneratePlanetMesh();
 }
 
 
 void APlanet::GenerateAtmosphereMesh()
 {
-    if (!AtmosphereMesh || !Atmosphere)
+    if (!AtmosphereMesh ||
+        !Atmosphere)
     {
         return;
     }
-
 
     const int32 LatitudeSegments =
         AtmosphereLatitudeSegments;
@@ -204,11 +162,9 @@ void APlanet::GenerateAtmosphereMesh()
     const int32 LongitudeSegments =
         AtmosphereLongitudeSegments;
 
-
     const int32 VertexCount =
-        (LatitudeSegments + 1)
-        * (LongitudeSegments + 1);
-
+        (LatitudeSegments + 1) *
+        (LongitudeSegments + 1);
 
     TArray<FVector> Vertices;
     TArray<int32> Triangles;
@@ -217,17 +173,11 @@ void APlanet::GenerateAtmosphereMesh()
     TArray<FColor> VertexColors;
     TArray<FProcMeshTangent> Tangents;
 
-
     Vertices.Reserve(VertexCount);
     Normals.Reserve(VertexCount);
     UVs.Reserve(VertexCount);
     VertexColors.Reserve(VertexCount);
     Tangents.Reserve(VertexCount);
-
-
-    // =========================================================
-    // VERTICES
-    // =========================================================
 
     for (int32 Latitude = 0;
         Latitude <= LatitudeSegments;
@@ -240,13 +190,11 @@ void APlanet::GenerateAtmosphereMesh()
         const float Theta =
             V * PI;
 
-
         const float SinTheta =
             FMath::Sin(Theta);
 
         const float CosTheta =
             FMath::Cos(Theta);
-
 
         for (int32 Longitude = 0;
             Longitude <= LongitudeSegments;
@@ -259,13 +207,11 @@ void APlanet::GenerateAtmosphereMesh()
             const float Phi =
                 U * 2.0f * PI;
 
-
             const float SinPhi =
                 FMath::Sin(Phi);
 
             const float CosPhi =
                 FMath::Cos(Phi);
-
 
             const FVector Direction(
                 SinTheta * CosPhi,
@@ -273,27 +219,22 @@ void APlanet::GenerateAtmosphereMesh()
                 CosTheta
             );
 
-
             Vertices.Add(
-                Direction
-                * Atmosphere->Parameters.AtmosphereRadius
+                Direction *
+                Atmosphere->Parameters.AtmosphereRadius
             );
-
 
             Normals.Add(
                 Direction
             );
 
-
             UVs.Add(
                 FVector2D(U, V)
             );
 
-
             VertexColors.Add(
                 FColor::White
             );
-
 
             Tangents.Add(
                 FProcMeshTangent(
@@ -305,14 +246,8 @@ void APlanet::GenerateAtmosphereMesh()
         }
     }
 
-
-    // =========================================================
-    // TRIANGLES
-    // =========================================================
-
     const int32 RowSize =
         LongitudeSegments + 1;
-
 
     for (int32 Latitude = 0;
         Latitude < LatitudeSegments;
@@ -323,22 +258,19 @@ void APlanet::GenerateAtmosphereMesh()
             ++Longitude)
         {
             const int32 A =
-                Latitude * RowSize
-                + Longitude;
+                Latitude *
+                RowSize +
+                Longitude;
 
             const int32 B =
                 A + 1;
 
             const int32 C =
-                A + RowSize;
+                A +
+                RowSize;
 
             const int32 D =
                 C + 1;
-
-
-            // =================================================
-            // OUTWARD WINDING
-            // =================================================
 
             Triangles.Add(A);
             Triangles.Add(C);
@@ -350,13 +282,7 @@ void APlanet::GenerateAtmosphereMesh()
         }
     }
 
-
-    // =========================================================
-    // CREATE MESH
-    // =========================================================
-
     AtmosphereMesh->ClearAllMeshSections();
-
 
     AtmosphereMesh->CreateMeshSection(
         0,
@@ -369,11 +295,6 @@ void APlanet::GenerateAtmosphereMesh()
         false
     );
 
-
-    // =========================================================
-    // APPLY ATMOSPHERE MATERIAL
-    // =========================================================
-
     if (Atmosphere->AtmosphereMaterial)
     {
         AtmosphereMesh->SetMaterial(
@@ -381,13 +302,6 @@ void APlanet::GenerateAtmosphereMesh()
             Atmosphere->AtmosphereMaterial
         );
     }
-
-
-    // ---------------------------------------------------------
-    // KEEP THE LEGACY MESH DISABLED.
-    //
-    // UAS is now responsible for the atmospheric rendering.
-    // ---------------------------------------------------------
 
     AtmosphereMesh->SetVisibility(
         false,
@@ -407,7 +321,6 @@ void APlanet::GeneratePlanetMesh()
         return;
     }
 
-
     if (!TerrainGenerator)
     {
         TerrainGenerator =
@@ -417,26 +330,16 @@ void APlanet::GeneratePlanetMesh()
             );
     }
 
-
     if (!TerrainGenerator)
     {
         return;
     }
 
-
-    // =========================================================
-    // GENERATED DATA
-    // =========================================================
-
     TArray<FVector> Vertices;
     TArray<int32> Triangles;
     TArray<FVector> Normals;
     TArray<FProcMeshTangent> Tangents;
-
-
-    // =========================================================
-    // GENERATE TERRAIN
-    // =========================================================
+    TArray<FColor> VertexColors;
 
     TerrainGenerator->GenerateTerrainMeshData(
         Resolution,
@@ -448,38 +351,54 @@ void APlanet::GeneratePlanetMesh()
         MountainStrength,
         DetailStrength,
         TerrainHeight,
+        PlanetProfile,
         Vertices,
         Triangles,
         Normals,
-        Tangents
+        Tangents,
+        VertexColors
     );
 
-
-    // =========================================================
-    // GENERATE UVs AND VERTEX COLORS
-    // =========================================================
-
     TArray<FVector2D> UVs;
-    TArray<FColor> VertexColors;
-    UVs.Reserve(Vertices.Num());
-    VertexColors.Reserve(Vertices.Num());
 
-    for (const FVector& V : Vertices)
+    UVs.Reserve(
+        Vertices.Num()
+    );
+
+    for (const FVector& Vertex :
+        Vertices)
     {
-        const FVector D = V.GetSafeNormal();
-        const float U = 0.5f + FMath::Atan2(D.Y, D.X) / (2.0f * PI);
-        const float VCoord = 0.5f - FMath::Asin(FMath::Clamp(D.Z, -1.0f, 1.0f)) / PI;
-        UVs.Add(FVector2D(U, VCoord));
-        VertexColors.Add(FColor::White);
+        const FVector Direction =
+            Vertex.GetSafeNormal();
+
+        const float U =
+            0.5f +
+            FMath::Atan2(
+                Direction.Y,
+                Direction.X
+            ) /
+            (2.0f * PI);
+
+        const float VCoord =
+            0.5f -
+            FMath::Asin(
+                FMath::Clamp(
+                    Direction.Z,
+                    -1.0f,
+                    1.0f
+                )
+            ) /
+            PI;
+
+        UVs.Add(
+            FVector2D(
+                U,
+                VCoord
+            )
+        );
     }
 
-
-    // =========================================================
-    // CREATE MESH
-    // =========================================================
-
     PlanetProceduralMesh->ClearAllMeshSections();
-
 
     PlanetProceduralMesh->CreateMeshSection(
         0,
@@ -491,17 +410,4 @@ void APlanet::GeneratePlanetMesh()
         Tangents,
         true
     );
-
-
-    // =========================================================
-    // MATERIAL ALREADY ASSIGNED IN CONSTRUCTOR
-    // =========================================================
-    //
-    // M_Planet is assigned once when the component is created.
-    // No asset lookup is required every time the procedural
-    // terrain is regenerated.
-    //
-    // This is important because GeneratePlanetMesh() can be
-    // called repeatedly during construction/regeneration.
-    // =========================================================
 }

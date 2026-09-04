@@ -985,6 +985,29 @@ bool AStarSystem::SetPlanetGenerationData(
         PlanetData.DetailStrength
     );
 
+    FProperty* PlanetIDProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("PlanetID")
+        );
+    if (PlanetIDProperty)
+    {
+        if (FInt64Property* Int64Prop = CastField<FInt64Property>(PlanetIDProperty))
+        {
+            Int64Prop->SetPropertyValue_InContainer(PlanetActor, PlanetData.PlanetID);
+        }
+    }
+
+    FProperty* OrbitDistanceProperty =
+        PlanetActor->GetClass()->FindPropertyByName(
+            TEXT("OrbitDistance")
+        );
+    if (OrbitDistanceProperty)
+    {
+        if (FFloatProperty* FloatProp = CastField<FFloatProperty>(OrbitDistanceProperty))
+        {
+            FloatProp->SetPropertyValue_InContainer(PlanetActor, PlanetData.OrbitDistance);
+        }
+    }
 
     return true;
 }

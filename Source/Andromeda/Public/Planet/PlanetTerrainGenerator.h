@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "UObject/NoExportTypes.h"
 #include "ProceduralMeshComponent.h"
+#include "Planet/PlanetProfile.h"
 #include "PlanetSurfaceData.h"
 #include "PlanetTerrainGenerator.generated.h"
 
@@ -72,9 +73,11 @@ public:
         float MountainStrength,
         float DetailStrength,
         float TerrainHeight,
+        const FPlanetProfile& PlanetProfile,
         TArray<FVector>& OutVertices,
         TArray<int32>& OutTriangles,
         TArray<FVector>& OutNormals,
-        TArray<FProcMeshTangent>& OutTangents
+        TArray<FProcMeshTangent>& OutTangents,
+        TArray<FColor>& OutVertexColors
     ) const;
 };
