@@ -1,4 +1,4 @@
-#include "PlanetTerrainGenerator.h"
+#include "Planet/PlanetTerrainGenerator.h"
 #include "AndromedaNoiseLibrary.h"
 
 float UPlanetTerrainGenerator::GetTerrainHeight(

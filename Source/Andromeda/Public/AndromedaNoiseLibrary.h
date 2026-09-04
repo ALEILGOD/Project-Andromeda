@@ -3,7 +3,7 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "ProceduralMeshComponent.h"
-#include "PlanetSurfaceData.h"
+#include "Planet/PlanetSurfaceData.h"
 #include "AndromedaNoiseLibrary.generated.h"
 
 UCLASS()

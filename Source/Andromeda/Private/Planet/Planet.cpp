@@ -1,6 +1,6 @@
-#include "Planet.h"
+#include "Planet/Planet.h"
 
-#include "PlanetTerrainGenerator.h"
+#include "Planet/PlanetTerrainGenerator.h"
 #include "PlanetAtmosphereComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "UObject/ConstructorHelpers.h"
