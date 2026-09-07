@@ -438,6 +438,338 @@ void AStarSystem::UpdatePlanetRotations(
 }
 
 
+int32 AStarSystem::GetPlanetCount() const
+{
+    return SpawnedPlanets.Num();
+}
+
+
+const FSpawnedPlanetData* AStarSystem::FindSpawnedPlanet(
+    int64 PlanetID
+) const
+{
+    for (
+        const FSpawnedPlanetData& SpawnedPlanet :
+        SpawnedPlanets
+        )
+    {
+        if (
+            SpawnedPlanet.GenerationData.PlanetID == PlanetID &&
+            SpawnedPlanet.PlanetActor
+            )
+        {
+            return &SpawnedPlanet;
+        }
+    }
+
+    return nullptr;
+}
+
+
+FPlanetRuntimeData AStarSystem::BuildPlanetRuntimeData(
+    const FSpawnedPlanetData& SpawnedPlanet
+) const
+{
+    FPlanetRuntimeData Out;
+
+    if (!SpawnedPlanet.PlanetActor)
+    {
+        return Out;
+    }
+
+    Out.bValid = true;
+
+    Out.PlanetActor = SpawnedPlanet.PlanetActor;
+
+    Out.PlanetID =
+        SpawnedPlanet.GenerationData.PlanetID;
+
+    Out.PlanetSeed =
+        SpawnedPlanet.GenerationData.PlanetSeed;
+
+    Out.PlanetRadius =
+        SpawnedPlanet.GenerationData.PlanetRadius;
+
+    Out.TerrainHeight =
+        SpawnedPlanet.GenerationData.TerrainHeight;
+
+    Out.OrbitDistance =
+        SpawnedPlanet.GenerationData.OrbitDistance;
+
+    Out.OrbitalPeriod =
+        SpawnedPlanet.GenerationData.OrbitalPeriod;
+
+    Out.WorldPosition =
+        SpawnedPlanet.PlanetActor->GetActorLocation();
+
+    Out.OrbitalVelocity =
+        GetPlanetOrbitalVelocity(
+            Out.PlanetID
+        );
+
+    Out.CurrentRotation =
+        GetPlanetRotation(
+            Out.PlanetID
+        );
+
+    Out.RotationRateDegreesPerSecond =
+        GetPlanetRotationRateDegreesPerSecond(
+            Out.PlanetID
+        );
+
+    Out.RotationAxis =
+        GetPlanetRotationAxis(
+            Out.PlanetID
+        );
+
+    return Out;
+}
+
+
+FPlanetRuntimeData AStarSystem::GetPlanetRuntimeData(
+    int64 PlanetID
+) const
+{
+    const FSpawnedPlanetData* SpawnedPlanet =
+        FindSpawnedPlanet(
+            PlanetID
+        );
+
+    if (!SpawnedPlanet)
+    {
+        return FPlanetRuntimeData();
+    }
+
+    return BuildPlanetRuntimeData(
+        *SpawnedPlanet
+    );
+}
+
+
+int32 AStarSystem::GetAllPlanetRuntimeData(
+    TArray<FPlanetRuntimeData>& OutPlanets
+) const
+{
+    OutPlanets.Empty();
+
+    OutPlanets.Reserve(
+        SpawnedPlanets.Num()
+    );
+
+    for (
+        const FSpawnedPlanetData& SpawnedPlanet :
+        SpawnedPlanets
+        )
+    {
+        OutPlanets.Add(
+            BuildPlanetRuntimeData(
+                SpawnedPlanet
+            )
+        );
+    }
+
+    return OutPlanets.Num();
+}
+
+
+FVector AStarSystem::GetPlanetWorldPosition(
+    int64 PlanetID
+) const
+{
+    const FSpawnedPlanetData* SpawnedPlanet =
+        FindSpawnedPlanet(
+            PlanetID
+        );
+
+    if (!SpawnedPlanet)
+    {
+        return FVector::ZeroVector;
+    }
+
+    return SpawnedPlanet->PlanetActor->GetActorLocation();
+}
+
+
+FVector AStarSystem::GetPlanetOrbitalVelocity(
+    int64 PlanetID
+) const
+{
+    const FSpawnedPlanetData* SpawnedPlanet =
+        FindSpawnedPlanet(
+            PlanetID
+        );
+
+    if (!SpawnedPlanet)
+    {
+        return FVector::ZeroVector;
+    }
+
+    const float SafeOrbitTimeScale =
+        FMath::Max(
+            OrbitTimeScale,
+            0.0f
+        );
+
+    if (SafeOrbitTimeScale <= 0.0f)
+    {
+        return FVector::ZeroVector;
+    }
+
+    // Tempo orbitale simulato ESATTAMENTE come in UpdatePlanetOrbits:
+    //     OrbitSimulationTime = SystemSimulationTime * OrbitTimeScale
+    const float OrbitSimulationTime =
+        SystemSimulationTime *
+        SafeOrbitTimeScale;
+
+    // Derivata simmetrica della posizione orbitale rispetto al tempo di
+    // simulazione orbitale, poi scalata da OrbitTimeScale per ottenere la
+    // velocita' nel tempo MONDIALE (cm/s) con cui il pianeta viene davvero
+    // mosso da SetActorLocation. NON e' la velocita' teorica 2*PI*R/T.
+    constexpr float VelocitySampleHalfStep = 0.001f;
+
+    const FVector PastPosition =
+        CalculateOrbitPosition(
+            SpawnedPlanet->GenerationData,
+            OrbitSimulationTime -
+            VelocitySampleHalfStep
+        );
+
+    const FVector FuturePosition =
+        CalculateOrbitPosition(
+            SpawnedPlanet->GenerationData,
+            OrbitSimulationTime +
+            VelocitySampleHalfStep
+        );
+
+    const float HalfSampleSpan =
+        2.0f * VelocitySampleHalfStep;
+
+    const FVector OrbitSimVelocity =
+        (FuturePosition - PastPosition) /
+        HalfSampleSpan;
+
+    return OrbitSimVelocity *
+        SafeOrbitTimeScale;
+}
+
+
+FRotator AStarSystem::GetPlanetRotation(
+    int64 PlanetID
+) const
+{
+    const FSpawnedPlanetData* SpawnedPlanet =
+        FindSpawnedPlanet(
+            PlanetID
+        );
+
+    if (!SpawnedPlanet)
+    {
+        return FRotator::ZeroRotator;
+    }
+
+    // Stesso valore applicato da UpdatePlanetRotations.
+    return CalculatePlanetRotation(
+        SpawnedPlanet->GenerationData,
+        SystemSimulationTime
+    );
+}
+
+
+float AStarSystem::GetPlanetRotationRateDegreesPerSecond(
+    int64 PlanetID
+) const
+{
+    const FSpawnedPlanetData* SpawnedPlanet =
+        FindSpawnedPlanet(
+            PlanetID
+        );
+
+    if (!SpawnedPlanet)
+    {
+        return 0.0f;
+    }
+
+    const float RotationPeriod =
+        CalculateRotationPeriod(
+            SpawnedPlanet->GenerationData
+        );
+
+    if (RotationPeriod <= KINDA_SMALL_NUMBER)
+    {
+        return 0.0f;
+    }
+
+    // La rotazione usa SystemSimulationTime pieno (scalato da
+    // SimulationTimeScale), quindi il rate EFFETTIVO nel tempo
+    // mondiale include SimulationTimeScale.
+    const float SafeTimeScale =
+        FMath::Max(
+            SimulationTimeScale,
+            0.0f
+        );
+
+    return (360.0f / RotationPeriod) *
+        SafeTimeScale;
+}
+
+
+FVector AStarSystem::GetPlanetRotationAxis(
+    int64 PlanetID
+) const
+{
+    const FSpawnedPlanetData* SpawnedPlanet =
+        FindSpawnedPlanet(
+            PlanetID
+        );
+
+    if (!SpawnedPlanet)
+    {
+        return FVector::ZeroVector;
+    }
+
+    // Stesso asse usato da CalculatePlanetRotation: lo spin avviene attorno
+    // all'Up del frame pre-tilt; TiltQuat lo ruota nel mondo.
+    const float AxialTilt =
+        CalculateAxialTilt(
+            SpawnedPlanet->GenerationData
+        );
+
+    const float RotationDirection =
+        CalculateRotationDirection(
+            SpawnedPlanet->GenerationData
+        );
+
+    const FQuat TiltQuat(
+        FVector::ForwardVector,
+        FMath::DegreesToRadians(
+            AxialTilt
+        )
+    );
+
+    return TiltQuat.RotateVector(
+        FVector::UpVector
+    ) * RotationDirection;
+}
+
+
+AActor* AStarSystem::GetPlanetActor(
+    int64 PlanetID
+) const
+{
+    const FSpawnedPlanetData* SpawnedPlanet =
+        FindSpawnedPlanet(
+            PlanetID
+        );
+
+    if (!SpawnedPlanet)
+    {
+        return nullptr;
+    }
+
+    return SpawnedPlanet->PlanetActor.Get();
+}
+
+
 FVector AStarSystem::CalculateOrbitPosition(
     const FPlanetGenerationData& PlanetData,
     float SimulationTime
