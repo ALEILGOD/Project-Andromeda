@@ -41,6 +41,19 @@ struct FPlanetGravityParameters
      */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Gravity")
     bool bUseInverseSquareFalloff = true;
+
+    /**
+     * Fattore moltiplicativo del raggio del volume di influenza gravitazionale:
+     *
+     *     GravityInfluenceRadius = (PlanetRadius + TerrainHeight) * GravityInfluenceMultiplier
+     *
+     * E' il limite dinamico della gravita' del pianeta, derivato dai dati reali
+     * di ogni FPlanetRuntimeData (NON un valore globale fisso). Fuori da questo
+     * volume la gravita' planetaria e' 0. In futuro lo stesso raggio diventera'
+     * il limite dell'atmosfera.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Gravity")
+    float GravityInfluenceMultiplier = 1.3f;
 };
 
 
@@ -88,9 +101,30 @@ struct FPlanetaryInfluenceData
     UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Gravity")
     float GravityAcceleration = 0.0f;
 
-    /** Altezza del corpo sopra la superficie (cm) = max(DistanceToCenter - PlanetRadius, 0). */
+    /** Altezza del corpo sopra la superficie FISICA (cm) = max(DistanceToCenter - (PlanetRadius + TerrainHeight), 0). */
     UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Gravity")
     float HeightAboveSurface = 0.0f;
+
+    /**
+     * Raggio della superficie FISICA del pianeta dominante (cm):
+     *     SurfaceRadius = PlanetRadius + TerrainHeight
+     * E' l'ancoraggio del falloff gravitazionale e il riferimento della
+     * superficie per tutte le fasi successive (locomozione planetaria).
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Gravity")
+    float SurfaceRadius = 0.0f;
+
+    /**
+     * Raggio del volume di influenza gravitazionale del pianeta dominante (cm):
+     *     (PlanetRadius + TerrainHeight) * GravityInfluenceMultiplier.
+     * Volume SOLO matematico (niente atmosfera, mesh, collisioni o particelle).
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Gravity")
+    float GravityInfluenceRadius = 0.0f;
+
+    /** True se il corpo si trova DENTRO il volume di influenza gravitazionale del pianeta dominante. */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Gravity")
+    bool bIsInsideInfluenceRadius = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Gravity")
     float PlanetRadius = 0.0f;
@@ -144,11 +178,14 @@ public:
     /**
      * Determina il PlanetID del pianeta dominante rispetto a WorldPosition.
      *
-     * Criterio (deterministico, estendibile a una futura Sphere of Influence):
-     *   score = (SurfaceGravity * PlanetRadius^2) / distance^2
-     * Il pianeta dominante e' quello con lo score massimo nel punto dato,
-     * cioe' quello che attrae piu' forte. A parita' di score vince il
-     * PlanetID minore.
+     * Il pianeta compete SOLO se WorldPosition e' DENTRO il suo volume di
+     * influenza gravitazionale:
+     *     GravityInfluenceRadius = (PlanetRadius + TerrainHeight) * Multiplier
+     * Fuori da tutti i volumi il risultato e' -1 (spazio libero, gravita' = 0).
+     *
+     * Tra i pianeti che contengono il corpo vince quello che attrae piu' forte:
+     *     score = (SurfaceGravity * PlanetRadius^2) / distance^2.
+     * A parita' di score vince il PlanetID minore.
      */
     UFUNCTION(BlueprintPure, Category = "Andromeda|Gravity")
     static int64 GetDominantPlanetID(
@@ -193,7 +230,16 @@ public:
         float DistanceToCenter,
         float SurfaceGravity,
         float PlanetRadius,
+        float SurfaceRadius,
         float FalloffExponent
+    );
+
+    /** Calcola il raggio del volume di influenza: (PlanetRadius + TerrainHeight) * InfluenceMultiplier. */
+    UFUNCTION(BlueprintPure, Category = "Andromeda|Gravity")
+    static float CalculateInfluenceRadius(
+        float PlanetRadius,
+        float TerrainHeight,
+        float InfluenceMultiplier
     );
 
     UFUNCTION(BlueprintPure, Category = "Andromeda|Gravity")

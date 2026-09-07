@@ -6,7 +6,8 @@
 FPlanetGravityParameters UPlanetaryGravitySystem::GetDefaultParameters()
 {
     // Default della struct: SurfaceGravity=980 cm/s² (circa g terrestre),
-    // FalloffExponent=2, bUseInverseSquareFalloff=true.
+    // FalloffExponent=2, bUseInverseSquareFalloff=true,
+    // GravityInfluenceMultiplier=1.3.
     // Vedi documentazione di FPlanetGravityParameters in PlanetaryGravitySystem.h.
     return FPlanetGravityParameters();
 }
@@ -35,6 +36,18 @@ int64 UPlanetaryGravitySystem::SelectDominantPlanet(
     FVector& OutPlanetCenter
 )
 {
+    if (WorldPosition.ContainsNaN())
+    {
+        OutPlanetCenter = FVector::ZeroVector;
+        return -1;
+    }
+
+    const float SafeInfluenceMultiplier =
+        FMath::Max(
+            Parameters.GravityInfluenceMultiplier,
+            0.0f
+        );
+
     int64 DominantID = -1;
     float BestScore = -1.0f;
     FVector BestCenter = FVector::ZeroVector;
@@ -54,11 +67,32 @@ int64 UPlanetaryGravitySystem::SelectDominantPlanet(
             Planet.WorldPosition -
             WorldPosition;
 
+        if (ToCenter.ContainsNaN())
+        {
+            continue;
+        }
+
         const float Distance =
             FMath::Max(
                 ToCenter.Size(),
                 1.0f
             );
+
+        // Volume di influenza gravitazionale DINAMICO, derivato dai dati
+        // reali del pianeta:
+        //     GravityInfluenceRadius = (PlanetRadius + TerrainHeight) * 1.3
+        // Fuori da questo volume il pianeta NON compete (gravita' = 0).
+        const float InfluenceRadius =
+            CalculateInfluenceRadius(
+                Planet.PlanetRadius,
+                Planet.TerrainHeight,
+                SafeInfluenceMultiplier
+            );
+
+        if (Distance > InfluenceRadius)
+        {
+            continue;
+        }
 
         const float DistanceSquared =
             Distance * Distance;
@@ -72,7 +106,8 @@ int64 UPlanetaryGravitySystem::SelectDominantPlanet(
             Planet.PlanetRadius;
 
         // Score = attrazione effettiva nel punto (inverso del quadrato della
-        // distanza). Il pianeta dominante e' quello che attrae piu' forte.
+        // distanza). Tra i pianeti che contengono il corpo, il dominante e'
+        // quello che attrae piu' forte.
         const float Score =
             EffectiveGM /
             DistanceSquared;
@@ -93,6 +128,33 @@ int64 UPlanetaryGravitySystem::SelectDominantPlanet(
 }
 
 
+float UPlanetaryGravitySystem::CalculateInfluenceRadius(
+    float PlanetRadius,
+    float TerrainHeight,
+    float InfluenceMultiplier
+)
+{
+    if (!FMath::IsFinite(PlanetRadius) ||
+        !FMath::IsFinite(TerrainHeight) ||
+        !FMath::IsFinite(InfluenceMultiplier))
+    {
+        return 0.0f;
+    }
+
+    const float SafeMultiplier =
+        FMath::Max(
+            InfluenceMultiplier,
+            0.0f
+        );
+
+    return FMath::Max(
+        (PlanetRadius + TerrainHeight) *
+            SafeMultiplier,
+        0.0f
+    );
+}
+
+
 FPlanetaryInfluenceData UPlanetaryGravitySystem::CalculatePlanetaryInfluence(
     const TArray<FPlanetRuntimeData>& Planets,
     FVector WorldPosition,
@@ -100,6 +162,11 @@ FPlanetaryInfluenceData UPlanetaryGravitySystem::CalculatePlanetaryInfluence(
 )
 {
     FPlanetaryInfluenceData Result;
+
+    if (WorldPosition.ContainsNaN())
+    {
+        return Result;
+    }
 
     Result.BodyPosition = WorldPosition;
 
@@ -129,6 +196,10 @@ FPlanetaryInfluenceData UPlanetaryGravitySystem::CalculatePlanetaryInfluence(
             continue;
         }
 
+        // =========================================================
+        // IDENTITA' DEL PIANETA DOMINANTE
+        // =========================================================
+
         Result.bValid = true;
 
         Result.PlanetID = Planet.PlanetID;
@@ -146,6 +217,33 @@ FPlanetaryInfluenceData UPlanetaryGravitySystem::CalculatePlanetaryInfluence(
             Planet.RotationRateDegreesPerSecond;
         Result.RotationAxis = Planet.RotationAxis;
 
+        // =========================================================
+        // SUPERFICIE FISICA E VOLUME DI INFLUENZA
+        //
+        // Il limite della superficie non e' PlanetRadius ma
+        // PlanetRadius + TerrainHeight. Il volume di influenza e'
+        // (PlanetRadius + TerrainHeight) * GravityInfluenceMultiplier.
+        // =========================================================
+
+        const float SurfaceRadius =
+            FMath::Max(
+                Planet.PlanetRadius + Planet.TerrainHeight,
+                1.0f
+            );
+
+        Result.GravityInfluenceRadius =
+            CalculateInfluenceRadius(
+                Planet.PlanetRadius,
+                Planet.TerrainHeight,
+                Parameters.GravityInfluenceMultiplier
+            );
+
+        Result.SurfaceRadius = SurfaceRadius;
+
+        // =========================================================
+        // GEOMETRIA CORPO -> PIANETA
+        // =========================================================
+
         const FVector ToCenter =
             DominantCenter -
             WorldPosition;
@@ -154,6 +252,16 @@ FPlanetaryInfluenceData UPlanetaryGravitySystem::CalculatePlanetaryInfluence(
 
         Result.GravityDirection =
             ToCenter.GetSafeNormal();
+
+        // Difensivo: il dominante e' selezionato solo dentro il volume, ma il
+        // flag viene comunque calcolato esplicitamente.
+        Result.bIsInsideInfluenceRadius =
+            Result.DistanceToCenter <=
+            Result.GravityInfluenceRadius;
+
+        // =========================================================
+        // GRAVITA (falloff esistente, clamp alla superficie fisica)
+        // =========================================================
 
         const float EffectiveFalloffExponent =
             Parameters.bUseInverseSquareFalloff
@@ -164,16 +272,21 @@ FPlanetaryInfluenceData UPlanetaryGravitySystem::CalculatePlanetaryInfluence(
             CalculateGravityAcceleration(
                 Result.DistanceToCenter,
                 Parameters.SurfaceGravity,
-                Result.PlanetRadius,
+                Planet.PlanetRadius,
+                SurfaceRadius,
                 EffectiveFalloffExponent
             );
 
         Result.HeightAboveSurface =
             FMath::Max(
                 Result.DistanceToCenter -
-                    Result.PlanetRadius,
+                    SurfaceRadius,
                 0.0f
             );
+
+        // =========================================================
+        // ROTAZIONE DEL PIANETA (futuro reference frame; preparata)
+        // =========================================================
 
         Result.RotationVelocity =
             CalculateRotationVelocity(
@@ -216,10 +329,20 @@ float UPlanetaryGravitySystem::CalculateGravityAcceleration(
     float DistanceToCenter,
     float SurfaceGravity,
     float PlanetRadius,
+    float SurfaceRadius,
     float FalloffExponent
 )
 {
-    if (SurfaceGravity <= 0.0f)
+    if (!FMath::IsFinite(DistanceToCenter) ||
+        !FMath::IsFinite(SurfaceGravity) ||
+        !FMath::IsFinite(PlanetRadius) ||
+        !FMath::IsFinite(SurfaceRadius))
+    {
+        return 0.0f;
+    }
+
+    if (SurfaceGravity <= 0.0f ||
+        PlanetRadius <= 0.0f)
     {
         return 0.0f;
     }
@@ -230,17 +353,25 @@ float UPlanetaryGravitySystem::CalculateGravityAcceleration(
             1.0f
         );
 
+    // Superficie fisica: PlanetRadius + TerrainHeight. Difensivo: il
+    // raggio del falloff non puo' scendere sotto il core del pianeta.
+    const float SafeSurfaceRadius =
+        FMath::Max(
+            SurfaceRadius,
+            PlanetRadius
+        );
+
     // Sotto/alla superficie il valore e' bloccato alla SurfaceGravity
     // (placeholder: non modelliamo l'interno del pianeta).
     // Con FalloffExponent == 0 la gravita' e' costante (test/placeholder).
-    if (EffectiveDistance <= PlanetRadius ||
+    if (EffectiveDistance <= SafeSurfaceRadius ||
         FalloffExponent == 0.0f)
     {
         return SurfaceGravity;
     }
 
     const float Ratio =
-        PlanetRadius /
+        SafeSurfaceRadius /
         EffectiveDistance;
 
     return SurfaceGravity *
@@ -258,7 +389,14 @@ FVector UPlanetaryGravitySystem::CalculateRotationVelocity(
     float RotationRateDegreesPerSecond
 )
 {
-    if (RotationAxis.IsNearlyZero())
+    if (RotationAxis.IsNearlyZero() ||
+        !FMath::IsFinite(RotationRateDegreesPerSecond))
+    {
+        return FVector::ZeroVector;
+    }
+
+    if (WorldPosition.ContainsNaN() ||
+        PlanetCenter.ContainsNaN())
     {
         return FVector::ZeroVector;
     }
