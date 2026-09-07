@@ -10,34 +10,6 @@ namespace
         return Seed ^ (Seed >> 31);
     }
 
-    FVector MakeSeedOffset(uint64 Seed, uint64 Salt)
-    {
-        const uint64 H1 = HashSeed64(Seed, Salt);
-        const uint64 H2 = HashSeed64(H1, 0x517CC1B727220A95ULL);
-        const uint64 H3 = HashSeed64(H2, 0x9E3779B97F4A7C15ULL);
-
-        const float X = (static_cast<float>(H1 & 0xFFFF) / 65535.0f) * 400.0f - 200.0f;
-        const float Y = (static_cast<float>(H2 & 0xFFFF) / 65535.0f) * 400.0f - 200.0f;
-        const float Z = (static_cast<float>(H3 & 0xFFFF) / 65535.0f) * 400.0f - 200.0f;
-
-        return FVector(X, Y, Z);
-    }
-
-    float SampleMultiscaleField(const FVector& Direction, int64 Seed, uint64 Salt)
-    {
-        const FVector OffsetMacro = MakeSeedOffset(static_cast<uint64>(Seed), Salt);
-        const FVector OffsetRegional = MakeSeedOffset(static_cast<uint64>(Seed), Salt + 0x31415926ULL);
-        const FVector OffsetLocal = MakeSeedOffset(static_cast<uint64>(Seed), Salt + 0x27182818ULL);
-
-        // Macro scale: 0.65 (grandi domini biotici e vaste regioni)
-        const float Macro = FMath::PerlinNoise3D(Direction * 0.65f + OffsetMacro);
-        // Regional scale: 2.20 (variazioni all'interno dei domini e transizioni naturali)
-        const float Regional = FMath::PerlinNoise3D(Direction * 2.20f + OffsetRegional);
-        // Local scale: 5.50 (micro-ondulazione organica dei confini, debole, senza speckles)
-        const float Local = FMath::PerlinNoise3D(Direction * 5.50f + OffsetLocal);
-
-        return Macro * 0.62f + Regional * 0.28f + Local * 0.10f;
-    }
     // ========================================================================
     // SUITABILITY AMBIENTALE CORRETTIVA PER I 5 BIOMI REGIONALI
     //
@@ -210,26 +182,6 @@ namespace
     constexpr float TransitionInvTwoSigmaSq = 0.5f / (TransitionSigma * TransitionSigma);
     constexpr float TransitionJitterScale = 0.35f;
 
-    // Copia sincronizzata della FamilySupport matrix (stessi valori esatti).
-    constexpr float TransitionFamilySupport[4][5] =
-    {
-        { 1.00f, 0.75f, 0.55f, 0.15f, 0.15f }, // 0 Temperate/Wet
-        { 0.12f, 0.55f, 0.60f, 1.00f, 0.08f }, // 1 Dry
-        { 0.40f, 0.20f, 0.50f, 0.08f, 1.00f }, // 2 Cold
-        { 0.75f, 0.75f, 0.70f, 0.50f, 0.50f }  // 3 Mixed
-    };
-
-    // Bioma CANDIDATO primario di ciascuna famiglia: argmax della riga
-    // (pareggio -> indice minore). Ordine: 0 Forest, 1 Grassland, 2 Plains,
-    // 3 Desert, 4 Tundra.
-    constexpr int32 TransitionFamilyCandidate[4] =
-    {
-        0, // Temperate/Wet -> Forest (1.00)
-        3, // Dry           -> Desert (1.00)
-        4, // Cold          -> Tundra (1.00)
-        0  // Mixed         -> Forest (0.75, tie con Grassland -> indice minore)
-    };
-
     // Finestra di transizione sul rapporto di peso W2/W1 tra le due province
     // dominanti: sotto lo start una provincia domina nettamente (selezione
     // normale), sopra l'end la posizione e' pienamente in transizione.
@@ -240,11 +192,12 @@ namespace
     struct FProvinceFieldSample
     {
         float Weights[TransitionProvinceCount]; // somma ~1
-        uint8 Families[TransitionProvinceCount]; // 0..3
+        FVector Centers[TransitionProvinceCount]; // centri unitari sulla sfera
     };
 
-    // Replica deterministica del campo province (solo pesi e famiglie).
-    // Geometria IDENTICA a CalculateRegionalAffinities().
+    // PBS v4 - SORGETE UNICA della geometria province (pesi + centri).
+    // Riusata da nomination (ComputeProvinceExpressions) e affinities
+    // (CalculateRegionalAffinities): campo coerente tra i due percorsi.
     void SampleProvinceField(
         const FVector& Direction,
         int64 Seed,
@@ -255,6 +208,70 @@ namespace
 
         const uint64 ProvinceSeedHash =
             HashSeed64(static_cast<uint64>(Seed), 0x50726F76696E6365ULL);
+
+        // ====================================================================
+        // PBS v4.1 - LOW-FREQUENCY DOMAIN WARP (confini organici)
+        //
+        // Deforma SOLO lo spazio di valutazione della vicinanza alle
+        // province: i centri e le famiglie NON cambiano. Due ottave a bassa
+        // frequenza: macro (grandi baie e rientranze) + regionale (curvature
+        // leggere). Perlin 3D e' continuo sulla sfera: nessun seam ai poli
+        // o al punto antipodale. L'ampiezza e' piccola rispetto alla
+        // spaziatura delle province (~1 rad): i confini diventano sinuosi
+        // senza frammentare le province ne' creare blob.
+        // ====================================================================
+        auto WarpOffsetComponent = [ProvinceSeedHash](uint64 Salt)
+        {
+            const uint64 WarpHash = HashSeed64(ProvinceSeedHash, Salt);
+            return (static_cast<float>(WarpHash & 0xFFFF) / 65535.0f) * 200.0f - 100.0f;
+        };
+
+        constexpr float WarpAmplitudeMacro = 0.12f;
+        constexpr float WarpFrequencyMacro = 1.1f;
+        constexpr float WarpAmplitudeRegional = 0.05f;
+        constexpr float WarpFrequencyRegional = 2.4f;
+
+        const FVector MacroOffsetA(
+            WarpOffsetComponent(0x5A11ULL),
+            WarpOffsetComponent(0x5A12ULL),
+            WarpOffsetComponent(0x5A13ULL));
+        const FVector MacroOffsetB(
+            WarpOffsetComponent(0x5A14ULL),
+            WarpOffsetComponent(0x5A15ULL),
+            WarpOffsetComponent(0x5A16ULL));
+        const FVector MacroOffsetC(
+            WarpOffsetComponent(0x5A17ULL),
+            WarpOffsetComponent(0x5A18ULL),
+            WarpOffsetComponent(0x5A19ULL));
+
+        const FVector MacroWarp(
+            FMath::PerlinNoise3D(Dir * WarpFrequencyMacro + MacroOffsetA),
+            FMath::PerlinNoise3D(Dir * WarpFrequencyMacro + MacroOffsetB),
+            FMath::PerlinNoise3D(Dir * WarpFrequencyMacro + MacroOffsetC));
+
+        const FVector RegionalOffsetA(
+            WarpOffsetComponent(0x5B21ULL),
+            WarpOffsetComponent(0x5B22ULL),
+            WarpOffsetComponent(0x5B23ULL));
+        const FVector RegionalOffsetB(
+            WarpOffsetComponent(0x5B24ULL),
+            WarpOffsetComponent(0x5B25ULL),
+            WarpOffsetComponent(0x5B26ULL));
+        const FVector RegionalOffsetC(
+            WarpOffsetComponent(0x5B27ULL),
+            WarpOffsetComponent(0x5B28ULL),
+            WarpOffsetComponent(0x5B29ULL));
+
+        const FVector RegionalWarp(
+            FMath::PerlinNoise3D(Dir * WarpFrequencyRegional + RegionalOffsetA),
+            FMath::PerlinNoise3D(Dir * WarpFrequencyRegional + RegionalOffsetB),
+            FMath::PerlinNoise3D(Dir * WarpFrequencyRegional + RegionalOffsetC));
+
+        // La deflessione totale (~0.17 rad massimo, tipicamente ~0.08) e'
+        // molto più piccola di 1: la rinormalizzazione e' stabile ovunque.
+        const FVector WarpVector =
+            MacroWarp * WarpAmplitudeMacro + RegionalWarp * WarpAmplitudeRegional;
+        const FVector WarpedDir = (Dir + WarpVector).GetSafeNormal();
 
         const uint64 RotHash = HashSeed64(ProvinceSeedHash, 0x5F3759DFULL);
         const float Yaw = (static_cast<float>(RotHash & 0xFFFF) / 65535.0f) * 2.0f * PI;
@@ -310,14 +327,13 @@ namespace
 
             Center = Rotated.GetSafeNormal();
 
-            // Famiglia ecologica deterministica (identica).
-            const uint64 FamilyHash = HashSeed64(
-                ProvinceSeedHash,
-                0xA0761D6478BD642FULL + static_cast<uint64>(i) * 0x517CC1B727220A95ULL);
-            Out.Families[i] = static_cast<uint8>(FamilyHash & 0x3ULL);
+            // Il centro resta disponibile per il Provincial Climate (L4).
+            Out.Centers[i] = Center;
 
-            // Influenza gaussiana sulla sfera (identica, senza acos).
-            const float Dot = FVector::DotProduct(Dir, Center);
+            // Influenza gaussiana sulla sfera (senza acos): valutata nella
+            // DIREZIONE DEFORMATA (domain warp) -> confini organici. I centri
+            // e le famiglie non partecipano al warp.
+            const float Dot = FVector::DotProduct(WarpedDir, Center);
             const float ChordSq = FMath::Max(0.0f, 2.0f - 2.0f * Dot);
             Influences[i] = FMath::Exp(-ChordSq * TransitionInvTwoSigmaSq);
             TotalInfluence += Influences[i];
@@ -341,88 +357,143 @@ namespace
         }
     }
 
-    // Calcola l'allowance di transizione [~0..1] per i 5 core biomes.
+    // ========================================================================
+    // PBS v4 - L0: GLOBAL PLANETARY CLIMATE
     //
-    // Dominant Pair: le due province localmente piu' influenti.
-    // TransitionFactor: SmoothStep sul rapporto W2/W1 dei loro pesi
-    // (0 = dominanza netta -> selezione normale; 1 = confine pieno).
-    // Il supporto primario continuo (peso delle province locali che hanno
-    // quel bioma come candidato) rende la restrizione spazialmente continua
-    // e morbida, senza soglie nette ne' cambiamenti discreti di candidati.
-    void ComputeProvinceTransitionAllowance(
-        const FVector& Direction,
+    // L'orbita influenza direttamente il clima planetario, indipendentemente
+    // dall'archetipo estratto dalla roulette (che resta classificazione).
+    // Nessun fallback PlanetID: orbita assente/non valida -> regime neutro.
+    // ========================================================================
+    void ComputePlanetaryClimate(
         int64 Seed,
-        float (&OutAllowance)[5]
+        const FPlanetProfile& Profile,
+        float& OutThermalIndex,
+        float& OutAridityIndex,
+        float& OutGlobalPlanetTemperature,
+        float& OutGlobalPlanetHumidity
     )
     {
-        FProvinceFieldSample Sample;
-        SampleProvinceField(Direction, Seed, Sample);
+        // Normalizzazione orbitale identica a PlanetProfile.cpp.
+        const float EffectiveOrbit = (Profile.OrbitDistance > 0.0f) ? Profile.OrbitDistance : 6000000.0f;
+        const float NormalizedOrbit = FMath::Clamp((EffectiveOrbit - 3500000.0f) / 12000000.0f, 0.0f, 1.0f);
+        const float ThermalIndex = 1.0f - NormalizedOrbit;
 
-        // Dominant Pair: le due province localmente piu' influenti.
-        int32 TopIndex = 0;
-        int32 SecondIndex = 0;
-        float TopWeight = -1.0f;
-        float SecondWeight = -1.0f;
+        // Variazione planetaria deterministica dal Seed (piccola: il regime
+        // climatico resta dominante, ma "vicino = sempre Dry" e' vietato).
+        const uint64 ClimateJitterHash = HashSeed64(static_cast<uint64>(Seed), 0x504C414E4554ULL);
+        const float ThermalJitter = (static_cast<float>(ClimateJitterHash & 0xFFFF) / 65535.0f - 0.5f) * 0.10f;
 
-        for (int32 i = 0; i < TransitionProvinceCount; ++i)
-        {
-            const float W = Sample.Weights[i];
+        const float EffectiveThermalIndex = FMath::Clamp(ThermalIndex + ThermalJitter, 0.0f, 1.0f);
 
-            if (W > TopWeight)
-            {
-                SecondWeight = TopWeight;
-                SecondIndex = TopIndex;
-                TopWeight = W;
-                TopIndex = i;
-            }
-            else if (W > SecondWeight)
-            {
-                SecondWeight = W;
-                SecondIndex = i;
-            }
-        }
+        OutThermalIndex = EffectiveThermalIndex;
 
-        // TransitionFactor continuo dal rapporto tra il peso della provincia
-        // dominante e quello della seconda.
-        const float DominanceRatio = (TopWeight > 0.000001f)
-            ? FMath::Clamp(SecondWeight / TopWeight, 0.0f, 1.0f)
-            : 1.0f;
-
-        const float TransitionFactor = FMath::SmoothStep(
-            TransitionDominanceStart,
-            TransitionDominanceEnd,
-            DominanceRatio
+        OutAridityIndex = FMath::Clamp(
+            0.5f * EffectiveThermalIndex + 0.5f * (0.5f - Profile.HumidityBias),
+            0.0f,
+            1.0f
         );
 
-        // Supporto primario continuo: peso totale delle province locali che
-        // hanno quel core biome come candidato primario di famiglia.
-        float PrimarySupport[5] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        OutGlobalPlanetTemperature = FMath::Clamp(
+            0.25f + 0.50f * EffectiveThermalIndex + 0.50f * Profile.TemperatureBias,
+            0.0f,
+            1.0f
+        );
+
+        OutGlobalPlanetHumidity = FMath::Clamp(
+            0.50f - 0.30f * EffectiveThermalIndex + 0.50f * Profile.HumidityBias,
+            0.0f,
+            1.0f
+        );
+    }
+
+    // ========================================================================
+    // PBS v4 - L3: CLIMATE-WEIGHTED PROVINCE FAMILY ASSIGNMENT
+    //
+    // Sostituisce l'assegnazione uniforme (& 0x3): la famiglia di ogni
+    // provincia e' scelta via CDF deterministica su u_i, con probabilita'
+    // pesate dal regime climatico planetario (ThermalIndex) e modulate
+    // dall'aridita' globale (AridityIndex). La maggioranza delle province
+    // riflette il regime climatico; la varieta' resta seedata.
+    // ========================================================================
+
+    uint8 AssignProvinceFamily(float U, float ThermalIndex, float AridityIndex)
+    {
+        // Tabelle termiche [Temperate, Dry, Cold, Mixed]:
+        // Theta ~ 0 (torrido) / Theta ~ 0.5 (temperato) / Theta ~ 1 (gelido).
+        static constexpr float HotTable[4]       = { 0.15f, 0.55f, 0.05f, 0.25f };
+        static constexpr float TemperateTable[4] = { 0.35f, 0.15f, 0.20f, 0.30f };
+        static constexpr float ColdTable[4]      = { 0.10f, 0.15f, 0.55f, 0.20f };
+
+        float Weights[4];
+
+        if (ThermalIndex <= 0.5f)
+        {
+            const float T = FMath::Clamp(ThermalIndex / 0.5f, 0.0f, 1.0f);
+
+            for (int32 k = 0; k < 4; ++k)
+            {
+                Weights[k] = FMath::Lerp(HotTable[k], TemperateTable[k], T);
+            }
+        }
+        else
+        {
+            const float T = FMath::Clamp((ThermalIndex - 0.5f) / 0.5f, 0.0f, 1.0f);
+
+            for (int32 k = 0; k < 4; ++k)
+            {
+                Weights[k] = FMath::Lerp(TemperateTable[k], ColdTable[k], T);
+            }
+        }
+
+        // Modulazione aridita' globale: secca -> piu' Dry, meno Temperate;
+        // umida -> leggero rafforzamento di Temperate e Cold.
+        Weights[1] += 0.25f * AridityIndex;
+        Weights[0] = FMath::Max(0.02f, Weights[0] - 0.20f * AridityIndex);
+        Weights[2] += 0.08f * (1.0f - AridityIndex);
+
+        const float Total = Weights[0] + Weights[1] + Weights[2] + Weights[3];
+
+        if (Total <= 0.0001f)
+        {
+            return 3; // fallback deterministico: Mixed
+        }
+
+        const float InvTotal = 1.0f / Total;
+
+        float Cumulative = 0.0f;
+
+        for (int32 k = 0; k < 4; ++k)
+        {
+            Cumulative += Weights[k] * InvTotal;
+
+            if (U <= Cumulative)
+            {
+                return static_cast<uint8>(k);
+            }
+        }
+
+        return 3;
+    }
+
+    void AssignProvinceFamilies(
+        int64 Seed,
+        float ThermalIndex,
+        float AridityIndex,
+        uint8 (&OutFamilies)[TransitionProvinceCount]
+    )
+    {
+        const uint64 ProvinceSeedHash =
+            HashSeed64(static_cast<uint64>(Seed), 0x50726F76696E6365ULL);
 
         for (int32 i = 0; i < TransitionProvinceCount; ++i)
         {
-            const int32 Candidate = TransitionFamilyCandidate[Sample.Families[i]];
-            PrimarySupport[Candidate] += Sample.Weights[i];
-        }
+            const uint64 FamilyHash = HashSeed64(
+                ProvinceSeedHash,
+                0xA0761D6478BD642FULL + static_cast<uint64>(i) * 0x517CC1B727220A95ULL);
 
-        float MaxSupport = 0.0f;
-        for (int32 k = 0; k < 5; ++k)
-        {
-            MaxSupport = FMath::Max(MaxSupport, PrimarySupport[k]);
-        }
+            const float U = static_cast<float>(FamilyHash & 0xFFFFFFULL) / 16777216.0f;
 
-        for (int32 k = 0; k < 5; ++k)
-        {
-            // Normalizzato [0..1]: 1 = bioma candidato della provincia locale
-            // dominante; ~0 = bioma non presente come candidato locale.
-            const float NormalizedSupport = (MaxSupport > 0.000001f)
-                ? FMath::Clamp(PrimarySupport[k] / MaxSupport, 0.0f, 1.0f)
-                : 1.0f;
-
-            // Allowance: 1.0 = selezione normale; < 1.0 = soppressione
-            // progressiva del terzo bioma in zona di transizione. I due
-            // candidati dominanti restano ~1 e il clima continua a decidere
-            // la loro forza relativa tramite i punteggi esistenti.
-            OutAllowance[k] = 1.0f - TransitionFactor * (1.0f - NormalizedSupport);
+            OutFamilies[i] = AssignProvinceFamily(U, ThermalIndex, AridityIndex);
         }
     }
 
@@ -526,14 +597,19 @@ namespace
     }
 
     // Province ranking + nomination delle due espressioni + fattore di
-    // transizione territoriale. La terza provincia non riceve alcun label:
-    // entra solo se supera effettivamente il ranking (p2/p1 dinamici),
-    // mai per suitability climatica.
+    // transizione territoriale. Le espressioni sono valutate sul PROVINCIAL
+    // CLIMATE (campionato al centro della provincia con le funzioni
+    // climatiche esistenti + variazione deterministica bassa), NON sul clima
+    // puntuale del vertice: il PrimaryBiome non cambia dentro il territorio.
+    // La terza provincia non riceve alcun label: entra solo superando
+    // effettivamente il ranking territoriale (p2/p1 dinamici).
     void ComputeProvinceExpressions(
         const FVector& Direction,
         int64 Seed,
-        float Temperature,
-        float Humidity,
+        float GlobalPlanetTemperature,
+        float GlobalPlanetHumidity,
+        float ThermalIndex,
+        float AridityIndex,
         const float (&BiasWeights)[5],
         int32& OutPrimaryBiome,
         int32& OutSecondaryBiome,
@@ -543,6 +619,9 @@ namespace
     {
         FProvinceFieldSample Sample;
         SampleProvinceField(Direction, Seed, Sample);
+
+        uint8 Families[TransitionProvinceCount];
+        AssignProvinceFamilies(Seed, ThermalIndex, AridityIndex, Families);
 
         int32 TopIndex = 0;
         int32 SecondIndex = 0;
@@ -567,21 +646,69 @@ namespace
             }
         }
 
+        // L4: provincial climate del dominante e della seconda. Il centro
+        // provincia fornisce la componente latitudinale/zonale tramite le
+        // funzioni climatiche esistenti; la variazione deterministica resta
+        // bassa ([-0.12, +0.12]) e non introduce alta frequenza: l'espressione
+        // e' stabile dentro il territorio della provincia.
+        const uint64 ProvinceSeedHash =
+            HashSeed64(static_cast<uint64>(Seed), 0x50726F76696E6365ULL);
+
+        auto ProvinceClimateVariation = [ProvinceSeedHash](int32 ProvinceIndex, uint64 Salt)
+        {
+            const uint64 VariationHash = HashSeed64(
+                ProvinceSeedHash,
+                Salt + static_cast<uint64>(ProvinceIndex) * 0x9E3779B97F4A7C15ULL);
+            return (static_cast<float>(VariationHash & 0xFFFF) / 65535.0f - 0.5f) * 0.24f;
+        };
+
+        const float TopLatitudeTemperature = UPlanetBiomeGenerator::CalculateTemperature(
+            Sample.Centers[TopIndex], 0.0f, Seed);
+        const float TopLatitudeHumidity = UPlanetBiomeGenerator::CalculateHumidity(
+            Sample.Centers[TopIndex], 0.0f, Seed);
+
+        const float TopProvincialTemperature = FMath::Clamp(
+            GlobalPlanetTemperature + (TopLatitudeTemperature - 0.5f) * 0.5f + ProvinceClimateVariation(TopIndex, 0x1A2B3C4D5E6F7080ULL),
+            0.0f,
+            1.0f
+        );
+        const float TopProvincialHumidity = FMath::Clamp(
+            GlobalPlanetHumidity + (TopLatitudeHumidity - 0.5f) * 0.5f + ProvinceClimateVariation(TopIndex, 0x0F1E2D3C4B5A6978ULL),
+            0.0f,
+            1.0f
+        );
+
+        const float SecondLatitudeTemperature = UPlanetBiomeGenerator::CalculateTemperature(
+            Sample.Centers[SecondIndex], 0.0f, Seed);
+        const float SecondLatitudeHumidity = UPlanetBiomeGenerator::CalculateHumidity(
+            Sample.Centers[SecondIndex], 0.0f, Seed);
+
+        const float SecondProvincialTemperature = FMath::Clamp(
+            GlobalPlanetTemperature + (SecondLatitudeTemperature - 0.5f) * 0.5f + ProvinceClimateVariation(SecondIndex, 0x1A2B3C4D5E6F7080ULL),
+            0.0f,
+            1.0f
+        );
+        const float SecondProvincialHumidity = FMath::Clamp(
+            GlobalPlanetHumidity + (SecondLatitudeHumidity - 0.5f) * 0.5f + ProvinceClimateVariation(SecondIndex, 0x0F1E2D3C4B5A6978ULL),
+            0.0f,
+            1.0f
+        );
+
         float PrimaryExpressionScore = 0.0f;
         float SecondaryExpressionScore = 0.0f;
 
         OutPrimaryBiome = SelectProvinceExpression(
-            Sample.Families[TopIndex],
-            Temperature,
-            Humidity,
+            Families[TopIndex],
+            TopProvincialTemperature,
+            TopProvincialHumidity,
             BiasWeights,
             PrimaryExpressionScore
         );
 
         OutSecondaryBiome = SelectProvinceExpression(
-            Sample.Families[SecondIndex],
-            Temperature,
-            Humidity,
+            Families[SecondIndex],
+            SecondProvincialTemperature,
+            SecondProvincialHumidity,
             BiasWeights,
             SecondaryExpressionScore
         );
@@ -870,160 +997,60 @@ float UPlanetBiomeGenerator::CalculateHumidity(
 
 FRegionalBiomeAffinities UPlanetBiomeGenerator::CalculateRegionalAffinities(
     FVector Direction,
-    int64 Seed
+    int64 Seed,
+    float ThermalIndex,
+    float AridityIndex
 )
 {
     Direction = Direction.GetSafeNormal();
 
     // ========================================================================
-    // SPHERICAL SEEDED BIOGEOGRAPHIC PROVINCES (PBS v3 - Fase 1)
+    // PBS v4 - AUTHORIZED EXPRESSION AFFINITIES
     //
-    // 8 province sferiche con centri deterministici (base Fibonacci + perturbazione
-    // angolare seedata), rotazione globale per-pianeta, influenza gaussiana continua
-    // sulla sfera (overlap tra province, niente bordi netti) e conversione in
-    // affinita per i 5 core biomes tramite famiglie ecologiche.
-    // NESSUN nuovo noise: solo geometria sferica deterministica.
-    //
-    // Nota determinismo: l'API del PBS passa a questo livello il seed generazione
-    // del pianeta (identita' unica del pianeta a questo livello della pipeline:
-    // stesso pianeta -> stesso Seed; pianeti diversi -> Seed diversi). L'hash
-    // dedicato sotto decorrela lo scheletro province dagli altri sistemi che
-    // consumano lo stesso Seed raw (temperature, humidity, ecc.).
+    // Le affinita' regionali rappresentano la quota di autorizzazione
+    // territoriale locale: quanto peso provinciale autorizza ciascun core
+    // biome tramite i set della propria famiglia (GeoWeight). Campo di
+    // carattere: non determina l'identita' primaria, mai competitivo.
+    // La composizione delle famiglie e' quella climatica (L3), quindi le
+    // affinities riflettono il regime planetario del pianeta.
     // ========================================================================
 
-    constexpr int32 ProvinceCount = 8;
-    constexpr float Sigma = 0.35f; // raggio di influenza (~radianti effettivi)
-    constexpr float InvTwoSigmaSq = 0.5f / (Sigma * Sigma);
+    FProvinceFieldSample Sample;
+    SampleProvinceField(Direction, Seed, Sample);
 
-    // Seed composito dell'ecosistema province (salt dedicato "Province").
-    const uint64 ProvinceSeedHash =
-        HashSeed64(static_cast<uint64>(Seed), 0x50726F76696E6365ULL);
-
-    // Rotazione globale deterministica dello scheletro delle province.
-    const uint64 RotHash = HashSeed64(ProvinceSeedHash, 0x5F3759DFULL);
-    const float Yaw   = (static_cast<float>(RotHash & 0xFFFF) / 65535.0f) * 2.0f * PI;
-    const float Pitch = (static_cast<float>((RotHash >> 16) & 0xFFFF) / 65535.0f) * 2.0f * PI;
-    const float Roll  = (static_cast<float>((RotHash >> 32) & 0xFFFF) / 65535.0f) * 2.0f * PI;
-
-    const float Cy = FMath::Cos(Yaw),   Sy = FMath::Sin(Yaw);
-    const float Cp = FMath::Cos(Pitch), Sp = FMath::Sin(Pitch);
-    const float Cr = FMath::Cos(Roll),  Sr = FMath::Sin(Roll);
-
-    // Matrice R = Yaw * Pitch * Roll (row-major)
-    const float R00 = Cy * Cp;
-    const float R01 = Cy * Sp * Sr - Sy * Cr;
-    const float R02 = Cy * Sp * Cr + Sy * Sr;
-    const float R10 = Sy * Cp;
-    const float R11 = Sy * Sp * Sr + Cy * Cr;
-    const float R12 = Sy * Sp * Cr - Cy * Sr;
-    const float R20 = -Sp;
-    const float R21 = Cp * Sr;
-    const float R22 = Cp * Cr;
-
-    const float GoldenAngle = PI * (3.0f - FMath::Sqrt(5.0f));
-
-    float Influences[ProvinceCount];
-    uint8 Families[ProvinceCount];
-    float TotalInfluence = 0.0f;
-
-    for (int32 i = 0; i < ProvinceCount; ++i)
-    {
-        // ---- Centro base: Fibonacci sphere (copertura uniforme) ----
-        const float Y = 1.0f - (2.0f * static_cast<float>(i) + 1.0f) / static_cast<float>(ProvinceCount);
-        const float R = FMath::Sqrt(FMath::Max(0.0f, 1.0f - Y * Y));
-        const float Theta = GoldenAngle * static_cast<float>(i);
-        FVector Center(R * FMath::Cos(Theta), R * FMath::Sin(Theta), Y);
-
-        // ---- Perturbazione angolare deterministica per-centro ----
-        // Evita che pianeti diversi condividano identica Fibonacci ruotata:
-        // ogni centro e' spostato in modo totalmente deterministico dal seed.
-        const uint64 CenterHash = HashSeed64(
-            ProvinceSeedHash,
-            0xD1B54A32D192ED03ULL + static_cast<uint64>(i) * 0x9E3779B97F4A7C15ULL);
-
-        constexpr float JitterScale = 0.35f; // perturbazione moderata (no cluster patologici)
-        const float JX = ((static_cast<float>(CenterHash & 0xFFFF) / 65535.0f) * 2.0f - 1.0f) * JitterScale;
-        const float JY = ((static_cast<float>((CenterHash >> 16) & 0xFFFF) / 65535.0f) * 2.0f - 1.0f) * JitterScale;
-        const float JZ = ((static_cast<float>((CenterHash >> 32) & 0xFFFF) / 65535.0f) * 2.0f - 1.0f) * JitterScale;
-
-        Center.X += JX;
-        Center.Y += JY;
-        Center.Z += JZ;
-
-        // ---- Rotazione globale (orienta l'intero scheletro per pianeta) ----
-        const FVector Rotated(
-            R00 * Center.X + R01 * Center.Y + R02 * Center.Z,
-            R10 * Center.X + R11 * Center.Y + R12 * Center.Z,
-            R20 * Center.X + R21 * Center.Y + R22 * Center.Z
-        );
-
-        Center = Rotated.GetSafeNormal();
-
-        // ---- Famiglia ecologica deterministica (0..3) ----
-        const uint64 FamilyHash = HashSeed64(
-            ProvinceSeedHash,
-            0xA0761D6478BD642FULL + static_cast<uint64>(i) * 0x517CC1B727220A95ULL);
-        Families[i] = static_cast<uint8>(FamilyHash & 0x3ULL);
-
-        // ---- Influenza sferica continua: exp(-d^2 / 2 sigma^2) ----
-        // d^2 (corda) = 2 - 2*dot: monotona rispetto alla distanza angolare,
-        // evita acos. Le province si sovrappongono dolcemente.
-        const float Dot = FVector::DotProduct(Direction, Center);
-        const float ChordSq = FMath::Max(0.0f, 2.0f - 2.0f * Dot);
-        Influences[i] = FMath::Exp(-ChordSq * InvTwoSigmaSq);
-        TotalInfluence += Influences[i];
-    }
+    uint8 Families[TransitionProvinceCount];
+    AssignProvinceFamilies(Seed, ThermalIndex, AridityIndex, Families);
 
     // ========================================================================
-    // NORMALIZZAZIONE INFLUENCE + CONVERSIONE PROVINCE -> BIOME AFFINITIES
+    // PBS v4 - AUTHORIZED EXPRESSION AFFINITIES
     //
-    // ProvinceWeight[i] = Influence[i] / TotalInfluence (fallback deterministico
-    // se la somma e' circa zero). Poi:
-    // Affinity[k] = Somma_i ProvinceWeight[i] * FamilySupport[Family[i]][k]
-    // con FamilySupport nell'ordine [Forest, Grassland, Plains, Desert, Tundra].
+    // RegionalAffinities come quota di autorizzazione territoriale: quanto
+    // peso provinciale autorizza ciascun core biome (mai competitivo, mai
+    // composito). Campo di carattere: non determina l'identita' primaria.
     // ========================================================================
 
-    float Affinity[5] = { 0.0f };
+    float Raw[5] = { 0.0f };
 
-    if (TotalInfluence > 0.0001f)
+    for (int32 i = 0; i < TransitionProvinceCount; ++i)
     {
-        static constexpr float FamilySupport[4][5] =
-        {
-            { 1.00f, 0.75f, 0.55f, 0.15f, 0.15f }, // 0 Temperate/Wet -> Forest + Grassland + Plains
-            { 0.12f, 0.55f, 0.60f, 1.00f, 0.08f }, // 1 Dry           -> Desert + Plains + Grassland
-            { 0.40f, 0.20f, 0.50f, 0.08f, 1.00f }, // 2 Cold          -> Tundra + Plains + Forest fredda
-            { 0.75f, 0.75f, 0.70f, 0.50f, 0.50f }  // 3 Mixed         -> combinazioni piu ampie
-        };
+        const FFamilyExpressionSet& ExpressionSet = FamilyExpressionSets[Families[i]];
 
-        for (int32 i = 0; i < ProvinceCount; ++i)
+        for (int32 e = 0; e < ExpressionSet.Count; ++e)
         {
-            const float Weight = Influences[i] / TotalInfluence;
-            for (int32 k = 0; k < 5; ++k)
-            {
-                Affinity[k] += Weight * FamilySupport[Families[i]][k];
-            }
-        }
-    }
-    else
-    {
-        // Fallback deterministico sicuro (nessuna divisione per zero).
-        for (int32 k = 0; k < 5; ++k)
-        {
-            Affinity[k] = 0.20f;
+            Raw[ExpressionSet.Expressions[e].Biome] +=
+                Sample.Weights[i] * ExpressionSet.Expressions[e].GeoWeight;
         }
     }
 
-    // Normalizzazione finale a somma 1 (le family weights non sono a somma 1).
-    const float AffinitySum =
-        Affinity[0] + Affinity[1] + Affinity[2] + Affinity[3] + Affinity[4];
-    const float InvAffinitySum = (AffinitySum > 0.0001f) ? (1.0f / AffinitySum) : 1.0f;
+    const float RawTotal = Raw[0] + Raw[1] + Raw[2] + Raw[3] + Raw[4];
+    const float InvRaw = (RawTotal > 0.0001f) ? (1.0f / RawTotal) : 1.0f;
 
     FRegionalBiomeAffinities Result;
-    Result.Forest = Affinity[0] * InvAffinitySum;
-    Result.Grassland = Affinity[1] * InvAffinitySum;
-    Result.Plains = Affinity[2] * InvAffinitySum;
-    Result.Desert = Affinity[3] * InvAffinitySum;
-    Result.Tundra = Affinity[4] * InvAffinitySum;
+    Result.Forest = Raw[0] * InvRaw;
+    Result.Grassland = Raw[1] * InvRaw;
+    Result.Plains = Raw[2] * InvRaw;
+    Result.Desert = Raw[3] * InvRaw;
+    Result.Tundra = Raw[4] * InvRaw;
 
     return Result;
 }
@@ -1069,340 +1096,47 @@ FPlanetBiomeData UPlanetBiomeGenerator::CalculateBiome(
     float SeaLevel
 )
 {
-    FPlanetBiomeData BiomeData;
-
-    Direction =
-        Direction.GetSafeNormal();
-
-    const float Latitude =
-        FMath::Abs(Direction.Z);
-
-    const float Slope =
-        CalculateSlope(
-            Direction,
-            SurfaceNormal
-        );
-
-    const float Temperature =
-        CalculateTemperature(
-            Direction,
-            NormalizedHeight,
-            Seed
-        );
-
-    const float Humidity =
-        CalculateHumidity(
-            Direction,
-            NormalizedHeight,
-            Seed
-        );
-
-    BiomeData.Latitude =
-        Latitude;
-
-    BiomeData.Slope =
-        Slope;
-
-    BiomeData.Temperature =
-        Temperature;
-
-    BiomeData.Humidity =
-        Humidity;
-
     // ========================================================================
-    // REGIONAL BIOME FIELD
+    // PBS v4 - PERCORSO LEGACY UNIFICATO
     //
-    // Campo continuo multiscala deterministico su sfera per macro domini,
-    // transizioni regionali e micro-ondulazione organica dei confini.
+    // Costruisce un profilo neutro (nessun bias climatico, neve non modulata
+    // come nel comportamento storico di questo percorso, clima planetario
+    // neutro) e delega allo stesso motore condiviso del percorso con profilo.
+    // Un'unica fonte di verita' per la biome selection.
     // ========================================================================
 
-    const FRegionalBiomeAffinities Affinities =
-        CalculateRegionalAffinities(
-            Direction,
-            Seed
-        );
+    FPlanetProfile NeutralProfile;
+    NeutralProfile.Archetype = EPlanetArchetype::Terran;
+    NeutralProfile.WaterCoverage = 0.55f;
+    NeutralProfile.TemperatureBias = 0.0f;
+    NeutralProfile.HumidityBias = 0.0f;
+    NeutralProfile.bSnowAllowed = true;
+    NeutralProfile.SnowPotential = 1.0f;  // replica la neve legacy (non modulata)
+    NeutralProfile.OrbitDistance = 0.0f;  // -> orbita neutra (regime temperato)
+    // BiomeBiases: default della struct (tutti 0)
 
-    BiomeData.RegionalAffinities =
-        Affinities;
-
-    // ========================================================================
-    // SEPARAZIONE OCEANO / TERRA
-    //
-    // Il livello del mare è una frontiera netta.
-    // Sotto SeaLevel è sempre Ocean e non compete con i biomi terrestri.
-    // ========================================================================
-
-    const bool IsOcean =
-        NormalizedHeight <= SeaLevel;
-
-    if (IsOcean)
-    {
-        BiomeData.PrimaryBiome =
-            EPlanetBiome::Ocean;
-
-        BiomeData.SecondaryBiome =
-            EPlanetBiome::Ocean;
-
-        BiomeData.BiomeBlend =
-            0.0f;
-
-        return BiomeData;
-    }
-
-    // ========================================================================
-    // TERRA EMERSA
-    // ========================================================================
-
-    const float ElevationAboveSea =
-        NormalizedHeight - SeaLevel;
-
-    const float LandFactor =
-        FMath::SmoothStep(
-            0.0f,
-            0.018f,
-            ElevationAboveSea
-        );
-
-    // ========================================================================
-    // BEACH
-    //
-    // Fascia costiera stretta e morfologicamente differenziata:
-    // le coste piatte favoriscono la spiaggia, mentre scogliere ripide e
-    // coste rocciose ne riducono la probabilità.
-    // ========================================================================
-
-    const float BeachHeightFactor =
-        (1.0f - FMath::SmoothStep(0.008f, 0.022f, ElevationAboveSea));
-
-    const float GentleSlope =
-        1.0f -
-        FMath::SmoothStep(
-            0.10f,
-            0.28f,
-            Slope
-        );
-
-    const float NonFreezing =
-        FMath::SmoothStep(
-            0.15f,
-            0.28f,
-            Temperature
-        );
-
-    const float BeachWeight =
-        BeachHeightFactor *
-        GentleSlope *
-        NonFreezing *
-        0.92f;
-
-    // ========================================================================
-    // AREA INTERNA DELLA TERRA
-    //
-    // Oltre la fascia costiera, la terra emersa è pienamente disponibile
-    // per i biomi regionali e le formazioni montuose.
-    // ========================================================================
-
-    const float BeachSuppression =
-        FMath::SmoothStep(
-            0.002f,
-            0.022f,
-            ElevationAboveSea
-        );
-
-    const float InternalLand =
-        BeachSuppression;
-
-    // ========================================================================
-    // MONTAGNA (TERRAIN-DRIVEN)
-    //
-    // Guidata primariamente da pendenza ed elevazione geomorfologica.
-    // Il campo regionale ha un'influenza debole.
-    // Alle temperature di gelo cede la priorità alla neve perenne.
-    // ========================================================================
-
-    const float SlopeMountain =
-        FMath::SmoothStep(
-            0.22f,
-            0.45f,
-            Slope
-        );
-
-    const float AltMountain =
-        FMath::SmoothStep(
-            0.38f,
-            0.54f,
-            NormalizedHeight
-        );
-
-    const float SnowCoverDampening =
-        FMath::Lerp(
-            0.35f,
-            1.0f,
-            FMath::SmoothStep(
-                0.12f,
-                0.28f,
-                Temperature
-            )
-        );
-
-    const float MountainAltFactor =
-        AltMountain *
-        FMath::Max(
-            SlopeMountain,
-            SnowCoverDampening
-        );
-
-    const float MountainWeight =
-        FMath::Max(
-            SlopeMountain,
-            MountainAltFactor
-        ) *
-        LandFactor *
-        0.88f;
-
-    // ========================================================================
-    // NEVE
-    //
-    // Favorita da alta quota combinata a temperature rigide o da calotte polari.
-    // A bassa quota il freddo produce Tundra o Boreal Forest anziché coprire
-    // il terreno di neve.
-    // ========================================================================
-
-    const float PolarSnow =
-        (1.0f - FMath::SmoothStep(0.06f, 0.18f, Temperature)) *
-        FMath::SmoothStep(
-            0.78f,
-            0.92f,
-            Latitude
-        );
-
-    const float PeakSnow =
-        FMath::SmoothStep(
-            0.35f,
-            0.50f,
-            NormalizedHeight
-        ) *
-        (1.0f - FMath::SmoothStep(0.12f, 0.26f, Temperature));
-
-    const float SnowWeight =
-        FMath::Max(
-            PolarSnow,
-            PeakSnow
-        ) *
-        LandFactor *
-        0.90f;
-
-    // ========================================================================
-    // PBS v3 - PAES v1: PROVINCE-AUTHORIZED EXPRESSION SELECTION (legacy path)
-    //
-    // PrimaryBiome   = espressione della provincia dominante (p1)
-    // SecondaryBiome = espressione della seconda provincia (p2)
-    //
-    // Il clima (suitability esistenti) sceglie SOLO tra le espressioni
-    // autorizzate dalla famiglia di ciascuna provincia. Nessun argmax
-    // globale sui 5 core biomes: un bioma non autorizzato dalle province
-    // dominanti non entra mai nel calcolo.
-    // ========================================================================
-
-    constexpr float ExpressionBiasWeights[5] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
-
-    int32 PrimaryCoreBiome = 0;
-    int32 SecondaryCoreBiome = 0;
-    float PrimaryExpressionScore = 0.0f;
-    float ProvinceTransitionFactor = 0.0f;
-
-    ComputeProvinceExpressions(
+    return CalculateBiomeWithProfile(
         Direction,
+        NormalizedHeight,
+        SurfaceNormal,
         Seed,
-        Temperature,
-        Humidity,
-        ExpressionBiasWeights,
-        PrimaryCoreBiome,
-        SecondaryCoreBiome,
-        PrimaryExpressionScore,
-        ProvinceTransitionFactor
+        NeutralProfile,
+        SeaLevel
     );
-
-    // Il peso del secondary e' legato a quello del primary scalato dal
-    // fattore di transizione: garantisce che l'espressione della provincia
-    // dominante resti il massimo tra i core (il fattore 0.999 mantiene
-    // l'ordine stretto anche a transizione piena).
-    const float CoreBlendFactor = FMath::Min(ProvinceTransitionFactor, 0.999f);
-    const float PrimaryCoreWeight = InternalLand * PrimaryExpressionScore;
-    const float SecondaryCoreWeight = PrimaryCoreWeight * CoreBlendFactor;
-
-    // ========================================================================
-    // ASSEGNAZIONE PESI
-    //
-    // Solo i due core biomes nominati ricevono peso; gli altri core restano
-    // a zero (non competono: nessun argmax globale). Ocean/Beach/Mountain/
-    // Snow mantengono i loro canali invariati.
-    // ========================================================================
-
-    float Weights[9] = { 0.0f };
-
-    Weights[0] = 0.0f; // Ocean è gestito sopra con frontiera netta
-    Weights[1] = BeachWeight;
-    Weights[CoreWeightIndex[PrimaryCoreBiome]] = PrimaryCoreWeight;
-    Weights[CoreWeightIndex[SecondaryCoreBiome]] =
-        (SecondaryCoreBiome == PrimaryCoreBiome) ? 0.0f : SecondaryCoreWeight;
-    Weights[7] = SnowWeight;
-    Weights[8] = MountainWeight;
-
-    // ========================================================================
-    // SELEZIONE BIOMA PRIMARIO E SECONDARIO
-    // ========================================================================
-
-    int32 Best1 = 0;
-    int32 Best2 = 0;
-    float MaxWeight1 = -1.0f;
-    float MaxWeight2 = -1.0f;
-
-    for (int32 i = 0; i < 9; ++i)
-    {
-        const float W = Weights[i];
-
-        if (W > MaxWeight1)
-        {
-            MaxWeight2 = MaxWeight1;
-            Best2 = Best1;
-            MaxWeight1 = W;
-            Best1 = i;
-        }
-        else if (W > MaxWeight2)
-        {
-            MaxWeight2 = W;
-            Best2 = i;
-        }
-    }
-
-    BiomeData.PrimaryBiome = static_cast<EPlanetBiome>(Best1);
-    BiomeData.SecondaryBiome = (MaxWeight2 > 0.001f) ? static_cast<EPlanetBiome>(Best2) : BiomeData.PrimaryBiome;
-
-    // ========================================================================
-    // BLEND FLUIDO
-    // ========================================================================
-
-    const float TotalWeight = MaxWeight1 + MaxWeight2;
-
-    if (TotalWeight > 0.001f && MaxWeight2 > 0.0f)
-    {
-        BiomeData.BiomeBlend = FMath::Clamp(MaxWeight2 / TotalWeight, 0.0f, 0.5f);
-    }
-    else
-    {
-        BiomeData.BiomeBlend = 0.0f;
-    }
-
-    return BiomeData;
 }
+
+
+
+
+
 
 FPlanetBiomeData UPlanetBiomeGenerator::CalculateBiomeWithProfile(
     FVector Direction,
     float NormalizedHeight,
     FVector SurfaceNormal,
     int64 Seed,
-    const FPlanetProfile& Profile
+    const FPlanetProfile& Profile,
+    float SeaLevelOverride
 )
 {
     FPlanetBiomeData BiomeData;
@@ -1410,11 +1144,14 @@ FPlanetBiomeData UPlanetBiomeGenerator::CalculateBiomeWithProfile(
     // ========================================================================
     // LIVELLO DEL MARE
     //
-    // Unica fonte di verita: WaterCoverage -> SeaLevel.
-    // L'oceano resta una classificazione hard sotto questo livello.
+    // Unica fonte di verita: WaterCoverage -> SeaLevel. Il SeaLevelOverride
+    // (>= 0) e' riservato al percorso legacy unificato, che passa esplicita-
+    // mente la propria frontiera.
     // ========================================================================
 
-    const float SeaLevel = CalculateSeaLevelFromWaterCoverage(Profile.WaterCoverage);
+    const float SeaLevel = (SeaLevelOverride >= 0.0f)
+        ? SeaLevelOverride
+        : CalculateSeaLevelFromWaterCoverage(Profile.WaterCoverage);
 
     Direction = Direction.GetSafeNormal();
 
@@ -1443,16 +1180,34 @@ FPlanetBiomeData UPlanetBiomeGenerator::CalculateBiomeWithProfile(
     BiomeData.Humidity = Humidity;
 
     // ========================================================================
-    // REGIONAL BIOME FIELD
+    // PBS v4 - L0: GLOBAL PLANETARY CLIMATE
     //
-    // Rimane il principale driver spaziale della distribuzione dei biomi.
-    // I bias del profilo agiscono solo come modulazione addizionale dei
-    // punteggi finali, senza sostituire le province regionali.
+    // L'orbita e il profilo determinano il regime climatico planetario:
+    // composizione delle famiglie (L3) e climate delle espressioni (L4).
     // ========================================================================
 
-    const FRegionalBiomeAffinities Affinities = CalculateRegionalAffinities(Direction, Seed);
+    float ThermalIndex = 0.5f;
+    float AridityIndex = 0.5f;
+    float GlobalPlanetTemperature = 0.5f;
+    float GlobalPlanetHumidity = 0.5f;
 
-    BiomeData.RegionalAffinities = Affinities;
+    ComputePlanetaryClimate(
+        Seed,
+        Profile,
+        ThermalIndex,
+        AridityIndex,
+        GlobalPlanetTemperature,
+        GlobalPlanetHumidity
+    );
+
+    // RegionalAffinities: quota di autorizzazione territoriale coerente con
+    // la composizione provinciale (campo di carattere, non competitivo).
+    BiomeData.RegionalAffinities = CalculateRegionalAffinities(
+        Direction,
+        Seed,
+        ThermalIndex,
+        AridityIndex
+    );
 
     // ========================================================================
     // SEPARAZIONE OCEANO / TERRA (frontiera netta, invariata)
@@ -1551,16 +1306,15 @@ FPlanetBiomeData UPlanetBiomeGenerator::CalculateBiomeWithProfile(
     }
 
     // ========================================================================
-    // PBS v3 - PAES v1: PROVINCE-AUTHORIZED EXPRESSION SELECTION (profile path)
+    // PBS v4 - PAES: PROVINCE-AUTHORIZED EXPRESSION SELECTION
     //
     // PrimaryBiome   = espressione della provincia dominante (p1)
     // SecondaryBiome = espressione della seconda provincia (p2)
     //
-    // I BiomeBiases del profilo agiscono SOLO come moltiplicatori delle
-    // espressioni gia' autorizzate dalle famiglie: non possono introdurre
-    // biomi esterni al set (es. un DesertBias enorme su provincia Temperate
-    // e' senza effetto: Desert non e' autorizzato da Temperate). Nessun
-    // argmax globale sui 5 core biomes.
+    // Le espressioni sono scelte sul PROVINCIAL CLIMATE (scala provincia,
+    // stabile nel territorio) dentro i set autorizzati dalle famiglie.
+    // I BiomeBiases del profilo modulano solo le espressioni autorizzate.
+    // Nessun argmax globale sui 5 core biomes.
     // ========================================================================
 
     const float ExpressionBiasWeights[5] =
@@ -1580,8 +1334,10 @@ FPlanetBiomeData UPlanetBiomeGenerator::CalculateBiomeWithProfile(
     ComputeProvinceExpressions(
         Direction,
         Seed,
-        Temperature,
-        Humidity,
+        GlobalPlanetTemperature,
+        GlobalPlanetHumidity,
+        ThermalIndex,
+        AridityIndex,
         ExpressionBiasWeights,
         PrimaryCoreBiome,
         SecondaryCoreBiome,
@@ -1589,22 +1345,20 @@ FPlanetBiomeData UPlanetBiomeGenerator::CalculateBiomeWithProfile(
         ProvinceTransitionFactor
     );
 
-    // Il peso del secondary e' legato a quello del primary scalato dal
-    // fattore di transizione territoriale: l'identita' resta stabile anche
-    // a transizione piena (fattore 0.999 mantiene l'ordine stretto).
-    const float CoreBlendFactor = FMath::Min(ProvinceTransitionFactor, 0.999f);
-    const float PrimaryCoreWeight = InternalLand * PrimaryExpressionScore;
-    const float SecondaryCoreWeight = PrimaryCoreWeight * CoreBlendFactor;
-
     // ========================================================================
     // ASSEGNAZIONE PESI
     //
-    // Solo i due core biomes nominati ricevono peso; gli altri core restano
-    // a zero (non competono: nessun argmax globale). Ocean/Beach/Mountain/
-    // Snow mantengono i loro canali invariati.
+    // Solo i due core biomes nominati ricevono peso. Il rapporto
+    // W2 = W1 * t / (2 - t) produce, con la formula esistente
+    // BiomeBlend = W2 / (W1 + W2), esattamente BiomeBlend = 0.5 * t
+    // (0.5 = transizione paritaria come da contratto BiomeBlend).
     // ========================================================================
 
     float Weights[9] = { 0.0f };
+
+    const float CoreBlendRatio = ProvinceTransitionFactor / (2.0f - ProvinceTransitionFactor);
+    const float PrimaryCoreWeight = InternalLand * PrimaryExpressionScore;
+    const float SecondaryCoreWeight = PrimaryCoreWeight * CoreBlendRatio;
 
     Weights[0] = 0.0f; // Ocean e gestito sopra con frontiera netta
     Weights[1] = BeachWeight;

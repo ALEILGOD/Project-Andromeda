@@ -1,7 +1,7 @@
 #include "PlanetAtmosphereComponent.h"
 
 #include "PlanetAtmosphereRenderer.h"
-
+#include "GameFramework/Actor.h"
 
 namespace
 {

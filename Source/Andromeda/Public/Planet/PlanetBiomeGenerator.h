@@ -48,7 +48,9 @@ public:
     )
     static FRegionalBiomeAffinities CalculateRegionalAffinities(
         FVector Direction,
-        int64 Seed
+        int64 Seed,
+        float ThermalIndex = 0.5f,
+        float AridityIndex = 0.5f
     );
 
     UFUNCTION(
@@ -88,6 +90,7 @@ public:
         float NormalizedHeight,
         FVector SurfaceNormal,
         int64 Seed,
-        const FPlanetProfile& Profile
+        const FPlanetProfile& Profile,
+        float SeaLevelOverride = -1.0f
     );
 };

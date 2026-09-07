@@ -1,84 +1,58 @@
+#include "CoreMinimal.h"
 #include "AndromedaNoiseLibrary.h"
-
 #include "Planet/PlanetBiomeGenerator.h"
 #include "Planet/PlanetContinentalGenerator.h"
 #include "Planet/PlanetLandformGenerator.h"
-
+#include <atomic>
 
 namespace
 {
-    // ============================================================
-    // PLANET HEIGHT
-    // ============================================================
-
     float GeneratePlanetHeightInternal(
-        FVector Direction,
+        const FVector& Direction,
         int64 Seed,
         float ContinentalScale,
         float MountainScale,
         float DetailScale,
         float MountainStrength,
-        float DetailStrength
-    )
+        float DetailStrength)
     {
-        Direction =
-            Direction.GetSafeNormal();
-
-        // ========================================================
-        // CONTINENTS
-        // ========================================================
+        const FVector SafeDirection = Direction.GetSafeNormal();
 
         const float ContinentalMask =
             UPlanetContinentalGenerator::GetContinentalMask(
-                Direction,
+                SafeDirection,
                 Seed,
-                ContinentalScale
-            );
-
-        // ========================================================
-        // LANDFORM DISTRIBUTION
-        // ========================================================
+                ContinentalScale);
 
         const float LandformMask =
             UPlanetLandformGenerator::GetLandformMask(
-                Direction,
+                SafeDirection,
                 Seed,
-                MountainScale
-            );
+                MountainScale);
 
         const float HillMask =
             UPlanetLandformGenerator::GetHillMask(
-                Direction,
+                SafeDirection,
                 Seed,
-                MountainScale
-            );
+                MountainScale);
 
         const float MountainMask =
             UPlanetLandformGenerator::GetMountainMask(
-                Direction,
+                SafeDirection,
                 Seed,
-                MountainScale
-            );
+                MountainScale);
 
         const float MountainChainMask =
             UPlanetLandformGenerator::GetMountainChainMask(
-                Direction,
+                SafeDirection,
                 Seed,
-                MountainScale
-            );
-
-        // ========================================================
-        // TERRAIN CLASSIFICATION
-        // ========================================================
+                MountainScale);
 
         const float PlainsMask =
             FMath::Clamp(
-                1.0f -
-                LandformMask *
-                1.15f,
+                1.0f - LandformMask * 1.15f,
                 0.0f,
-                1.0f
-            );
+                1.0f);
 
         const float FinalHillMask =
             HillMask *
@@ -93,108 +67,48 @@ namespace
             MountainChainMask *
             FinalMountainMask;
 
-        // ========================================================
-        // CONTINENTAL BASE
-        // ========================================================
-
-        const float OceanBase =
-            -0.105f;
-
-        const float LandBase =
-            0.055f;
+        constexpr float OceanBase = -0.105f;
+        constexpr float LandBase = 0.055f;
 
         const float ContinentalBase =
             FMath::Lerp(
                 OceanBase,
                 LandBase,
-                ContinentalMask
-            );
-
-        // ========================================================
-        // MACRO LAND VARIATION
-        // ========================================================
+                ContinentalMask);
 
         const float MacroNoise =
             FMath::PerlinNoise3D(
-                Direction *
-                FMath::Max(
-                    ContinentalScale *
-                    0.55f,
-                    0.0001f
-                ) +
-                FVector(
-                    41.7f,
-                    -23.4f,
-                    17.9f
-                )
-            );
+                SafeDirection * (ContinentalScale * 0.55f) +
+                FVector(41.7f, -23.4f, 17.9f));
 
         const float MacroHeight =
             MacroNoise *
             0.045f *
             ContinentalMask;
 
-        // ========================================================
-        // CONTINENTAL UNDULATIONS
-        // ========================================================
-
         const float UndulationNoiseA =
             FMath::PerlinNoise3D(
-                Direction *
-                FMath::Max(
-                    ContinentalScale *
-                    1.65f,
-                    0.0001f
-                ) +
-                FVector(
-                    -28.4f,
-                    63.1f,
-                    -19.7f
-                )
-            );
+                SafeDirection * (ContinentalScale * 1.65f) +
+                FVector(-28.4f, 63.1f, -19.7f));
 
         const float UndulationNoiseB =
             FMath::PerlinNoise3D(
-                Direction *
-                FMath::Max(
-                    ContinentalScale *
-                    3.15f,
-                    0.0001f
-                ) +
-                FVector(
-                    47.2f,
-                    -15.8f,
-                    32.9f
-                )
-            );
+                SafeDirection * (ContinentalScale * 3.15f) +
+                FVector(47.2f, -15.8f, 32.9f));
 
-        const float UndulationField =
+        const float UndulationNoise =
             UndulationNoiseA * 0.68f +
             UndulationNoiseB * 0.32f;
 
         const float UndulationHeight =
-            UndulationField *
+            UndulationNoise *
             0.020f *
             ContinentalMask;
 
-        // ========================================================
-        // PLAINS
-        // ========================================================
-
         const float PlainsNoise =
             FMath::PerlinNoise3D(
-                Direction *
-                FMath::Max(
-                    MountainScale *
-                    0.55f,
-                    0.0001f
-                ) +
-                FVector(
-                    -17.3f,
-                    36.8f,
-                    12.4f
-                )
-            );
+                SafeDirection * (MountainScale * 0.55f) +
+                FVector(-17.3f, 36.8f, 12.4f));
 
         const float PlainsHeight =
             PlainsNoise *
@@ -202,345 +116,221 @@ namespace
             PlainsMask *
             ContinentalMask;
 
-        // ========================================================
-        // HILLS
-        // ========================================================
-
-        const float HillNoise =
+        const float HillsNoise =
             FMath::PerlinNoise3D(
-                Direction *
-                FMath::Max(
-                    MountainScale *
-                    1.05f,
-                    0.0001f
-                ) +
-                FVector(
-                    -51.2f,
-                    18.7f,
-                    43.6f
-                )
-            );
+                SafeDirection * (MountainScale * 1.05f) +
+                FVector(-51.2f, 18.7f, 43.6f));
 
-        const float HillBlend =
-            FMath::SmoothStep(
-                -0.25f,
-                0.65f,
-                HillNoise
-            );
+        const float HillsShape =
+            FMath::Square(
+                FMath::SmoothStep(
+                    -0.25f,
+                    0.65f,
+                    HillsNoise));
 
-        const float HillShape =
-            HillBlend *
-            HillBlend;
-
-        const float HillHeight =
-            HillShape *
+        const float HillsHeight =
+            HillsShape *
             0.045f *
             FinalHillMask *
             ContinentalMask;
 
-        // ========================================================
-        // MOUNTAINS
-        // ========================================================
-
-        const uint64 BaseSeed =
-            static_cast<uint64>(Seed);
-
-        uint64 MountainSeed =
-            BaseSeed +
+        const uint64 MountainSeed =
+            static_cast<uint64>(Seed) ^
             0x9E3779B97F4A7C15ULL;
 
-        MountainSeed =
-            (MountainSeed ^
-                (MountainSeed >> 30)) *
-            0xBF58476D1CE4E5B9ULL;
+        uint64 MountainHash = MountainSeed;
 
-        MountainSeed =
-            (MountainSeed ^
-                (MountainSeed >> 27)) *
-            0x94D049BB133111EBULL;
-
-        MountainSeed ^=
-            MountainSeed >> 31;
-
-        const float MountainOffsetX =
-            static_cast<float>(
-                MountainSeed & 0xFFFF
-                ) /
-            65535.0f *
-            200.0f -
-            100.0f;
-
-        const float MountainOffsetY =
-            static_cast<float>(
-                (MountainSeed >> 16) & 0xFFFF
-                ) /
-            65535.0f *
-            200.0f -
-            100.0f;
-
-        const float MountainOffsetZ =
-            static_cast<float>(
-                (MountainSeed >> 32) & 0xFFFF
-                ) /
-            65535.0f *
-            200.0f -
-            100.0f;
+        MountainHash ^= MountainHash >> 30;
+        MountainHash *= 0xBF58476D1CE4E5B9ULL;
+        MountainHash ^= MountainHash >> 27;
+        MountainHash *= 0x94D049BB133111EBULL;
+        MountainHash ^= MountainHash >> 31;
 
         const FVector MountainOffset(
-            MountainOffsetX,
-            MountainOffsetY,
-            MountainOffsetZ
-        );
+            static_cast<float>(MountainHash & 0xFFFF) / 65535.0f * 200.0f - 100.0f,
+            static_cast<float>((MountainHash >> 16) & 0xFFFF) / 65535.0f * 200.0f - 100.0f,
+            static_cast<float>((MountainHash >> 32) & 0xFFFF) / 65535.0f * 200.0f - 100.0f);
 
         const float MountainNoise =
             FMath::PerlinNoise3D(
-                Direction *
-                FMath::Max(
-                    MountainScale *
-                    1.15f,
-                    0.0001f
-                ) +
-                MountainOffset
-            );
+                SafeDirection * (MountainScale * 1.15f) +
+                MountainOffset);
 
         const float MountainRidge =
             1.0f -
             FMath::Sqrt(
                 MountainNoise * MountainNoise +
-                0.04f
-            );
-
-        const float MountainBlend =
-            FMath::SmoothStep(
-                0.20f,
-                0.85f,
-                MountainRidge
-            );
+                0.04f);
 
         const float MountainShape =
-            MountainBlend *
-            MountainBlend;
+            FMath::Square(
+                FMath::SmoothStep(
+                    0.20f,
+                    0.85f,
+                    MountainRidge));
 
         const float MountainHeight =
             MountainShape *
-            (0.22f * MountainStrength) *
+            0.22f *
+            MountainStrength *
             FinalMountainMask *
             ContinentalMask;
 
-        // ========================================================
-        // MOUNTAIN CHAINS
-        // ========================================================
-
         const float ChainNoise =
             FMath::PerlinNoise3D(
-                Direction *
-                FMath::Max(
-                    MountainScale *
-                    0.82f,
-                    0.0001f
-                ) +
-                MountainOffset *
-                1.61f
-            );
+                SafeDirection * (MountainScale * 0.82f) +
+                MountainOffset * 1.61f);
 
         const float ChainRidge =
             1.0f -
             FMath::Sqrt(
                 ChainNoise * ChainNoise +
-                0.04f
-            );
-
-        const float ChainBlend =
-            FMath::SmoothStep(
-                0.25f,
-                0.80f,
-                ChainRidge
-            );
+                0.04f);
 
         const float ChainShape =
-            ChainBlend *
-            ChainBlend;
+            FMath::Square(
+                FMath::SmoothStep(
+                    0.25f,
+                    0.80f,
+                    ChainRidge));
 
         const float MountainChainHeight =
             ChainShape *
-            (0.16f * MountainStrength) *
+            0.16f *
+            MountainStrength *
             FinalMountainChainMask *
             ContinentalMask;
 
-        // ========================================================
-        // MICRO DETAIL
-        // ========================================================
-
-        uint64 DetailSeed =
-            BaseSeed +
+        const uint64 DetailSeed =
+            static_cast<uint64>(Seed) ^
             0xD1B54A32D192ED03ULL;
 
-        DetailSeed =
-            (DetailSeed ^
-                (DetailSeed >> 30)) *
-            0xBF58476D1CE4E5B9ULL;
+        uint64 DetailHash = DetailSeed;
 
-        DetailSeed =
-            (DetailSeed ^
-                (DetailSeed >> 27)) *
-            0x94D049BB133111EBULL;
-
-        DetailSeed ^=
-            DetailSeed >> 31;
-
-        const float DetailOffsetX =
-            static_cast<float>(
-                DetailSeed & 0xFFFF
-                ) /
-            65535.0f *
-            200.0f -
-            100.0f;
-
-        const float DetailOffsetY =
-            static_cast<float>(
-                (DetailSeed >> 16) & 0xFFFF
-                ) /
-            65535.0f *
-            200.0f -
-            100.0f;
-
-        const float DetailOffsetZ =
-            static_cast<float>(
-                (DetailSeed >> 32) & 0xFFFF
-                ) /
-            65535.0f *
-            200.0f -
-            100.0f;
+        DetailHash ^= DetailHash >> 30;
+        DetailHash *= 0xBF58476D1CE4E5B9ULL;
+        DetailHash ^= DetailHash >> 27;
+        DetailHash *= 0x94D049BB133111EBULL;
+        DetailHash ^= DetailHash >> 31;
 
         const FVector DetailOffset(
-            DetailOffsetX,
-            DetailOffsetY,
-            DetailOffsetZ
-        );
+            static_cast<float>(DetailHash & 0xFFFF) / 65535.0f * 200.0f - 100.0f,
+            static_cast<float>((DetailHash >> 16) & 0xFFFF) / 65535.0f * 200.0f - 100.0f,
+            static_cast<float>((DetailHash >> 32) & 0xFFFF) / 65535.0f * 200.0f - 100.0f);
 
         const float DetailNoise =
             FMath::PerlinNoise3D(
-                Direction *
-                FMath::Max(
-                    DetailScale * 0.75f,
-                    0.0001f
-                ) +
-                DetailOffset
-            );
+                SafeDirection * (DetailScale * 0.75f) +
+                DetailOffset);
 
         const float DetailMask =
             ContinentalMask *
-            (
-                0.015f +
-                FinalMountainMask *
-                0.12f
-                );
+            (0.015f + FinalMountainMask * 0.12f);
 
         const float DetailHeight =
             DetailNoise *
             (DetailStrength * 0.012f) *
             DetailMask;
 
-        // ========================================================
-        // FINAL HEIGHT
-        // ========================================================
-
         return
-            ContinentalBase
-            +
-            MacroHeight
-            +
-            UndulationHeight
-            +
-            PlainsHeight
-            +
-            HillHeight
-            +
-            MountainHeight
-            +
-            MountainChainHeight
-            +
+            ContinentalBase +
+            MacroHeight +
+            UndulationHeight +
+            PlainsHeight +
+            HillsHeight +
+            MountainHeight +
+            MountainChainHeight +
             DetailHeight;
     }
-
-
-    // ============================================================
-    // CUBE FACE DIRECTION
-    // ============================================================
 
     FVector GetCubeFaceDirection(
         int32 FaceIndex,
         float U,
-        float V
-    )
+        float V)
     {
-        const float X =
-            U * 2.0f - 1.0f;
-
-        const float Y =
-            V * 2.0f - 1.0f;
+        const float X = U * 2.0f - 1.0f;
+        const float Y = V * 2.0f - 1.0f;
 
         switch (FaceIndex)
         {
         case 0:
-            return FVector(
-                1.0f,
-                Y,
-                -X
-            );
+            return FVector(1.0f, Y, -X);
 
         case 1:
-            return FVector(
-                -1.0f,
-                Y,
-                X
-            );
+            return FVector(-1.0f, Y, X);
 
         case 2:
-            return FVector(
-                X,
-                1.0f,
-                -Y
-            );
+            return FVector(X, 1.0f, -Y);
 
         case 3:
-            return FVector(
-                X,
-                -1.0f,
-                Y
-            );
+            return FVector(X, -1.0f, Y);
 
         case 4:
-            return FVector(
-                X,
-                Y,
-                1.0f
-            );
+            return FVector(X, Y, 1.0f);
 
         case 5:
-            return FVector(
-                X,
-                -Y,
-                -1.0f
-            );
+            return FVector(X, -Y, -1.0f);
 
         default:
             return FVector::UpVector;
         }
     }
 
+    FVector3f GetBiomeCode(
+        EPlanetBiome Biome)
+    {
+        switch (Biome)
+        {
+        case EPlanetBiome::Ocean:
+            return FVector3f(0.93f, 0.07f, 0.07f);
 
-    // ============================================================
-    // PBS DEBUG DATA
-    // ============================================================
+        case EPlanetBiome::Beach:
+            return FVector3f(0.07f, 0.93f, 0.07f);
 
-    FColor EncodePBSVertexData(
+        case EPlanetBiome::Plains:
+            return FVector3f(0.07f, 0.07f, 0.93f);
+
+        case EPlanetBiome::Grassland:
+            return FVector3f(0.93f, 0.93f, 0.07f);
+
+        case EPlanetBiome::Forest:
+            return FVector3f(0.93f, 0.07f, 0.93f);
+
+        case EPlanetBiome::Desert:
+            return FVector3f(0.07f, 0.93f, 0.93f);
+
+        case EPlanetBiome::Tundra:
+            return FVector3f(0.55f, 0.25f, 0.85f);
+
+        case EPlanetBiome::Snow:
+            return FVector3f(0.25f, 0.85f, 0.55f);
+
+        case EPlanetBiome::Mountain:
+            return FVector3f(0.85f, 0.55f, 0.25f);
+
+        default:
+            return FVector3f(0.93f, 0.07f, 0.07f);
+        }
+    }
+
+    FColor BiomeToVertexColor(
+        EPlanetBiome Biome)
+    {
+        const FVector3f Code = GetBiomeCode(Biome);
+
+        return FColor(
+            static_cast<uint8>(FMath::RoundToInt(Code.X * 255.0f)),
+            static_cast<uint8>(FMath::RoundToInt(Code.Y * 255.0f)),
+            static_cast<uint8>(FMath::RoundToInt(Code.Z * 255.0f)),
+            255);
+    }
+
+    EPlanetBiome CalculateVertexBiome(
         const FVector& Direction,
         float NormalizedHeight,
         const FVector& SurfaceNormal,
         int64 Seed,
-        const FPlanetProfile& PlanetProfile
-    )
+        const FPlanetProfile& PlanetProfile)
     {
         const FPlanetBiomeData BiomeData =
             UPlanetBiomeGenerator::CalculateBiomeWithProfile(
@@ -548,97 +338,68 @@ namespace
                 NormalizedHeight,
                 SurfaceNormal,
                 Seed,
-                PlanetProfile
-            );
+                PlanetProfile);
 
-        // ========================================================
-        // TEMPORARY BIOME ID DEBUG
-        //
-        // R = Biome ID normalizzato
-        //
-        // 0 = Ocean
-        // 1 = Beach
-        // 2 = Plains
-        // 3 = Grassland
-        // 4 = Forest
-        // 5 = Desert
-        // 6 = Tundra
-        // 7 = Snow
-        // 8 = Mountain
-        //
-        // G/B/A = 0
-        // ========================================================
+        return BiomeData.PrimaryBiome;
+    }
 
-        uint8 BiomeID = 0;
+    EPlanetBiome CalculateTriangleBiome(
+        const FVector& PositionA,
+        const FVector& PositionB,
+        const FVector& PositionC,
+        float PlanetRadius,
+        int64 Seed,
+        float ContinentalScale,
+        float MountainScale,
+        float DetailScale,
+        float MountainStrength,
+        float DetailStrength,
+        float TerrainHeight,
+        const FPlanetProfile& PlanetProfile)
+    {
+        // Centro geometrico reale del triangolo sulla mesh effettiva.
+        // (Usando le POSIZIONI dei vertici della mesh, non una ri-evaluazione
+        //  del rumore con scale forzate.) Il bioma segue cosi' esattamente
+        //  la superficie che l'utente vede: niente mismatch con la geometria.
+        const FVector CenterPoint =
+            (PositionA + PositionB + PositionC) / 3.0f;
 
-        switch (BiomeData.PrimaryBiome)
-        {
-        case EPlanetBiome::Ocean:
-            BiomeID = 0;
-            break;
+        const FVector TriangleDirection =
+            CenterPoint.GetSafeNormal();
 
-        case EPlanetBiome::Beach:
-            BiomeID = 1;
-            break;
+        // Altezza normalizzata reale del centro del triangolo, derivata
+        // direttamente dalla geometria della mesh (raggio effettivo).
+        const float NormalizedHeight =
+            TerrainHeight > KINDA_SMALL_NUMBER
+                ? FMath::Clamp(
+                    (CenterPoint.Size() - PlanetRadius) / TerrainHeight,
+                    -1.0f,
+                    1.0f)
+                : 0.0f;
 
-        case EPlanetBiome::Plains:
-            BiomeID = 2;
-            break;
+        // Normale della superficie calcolata con gli STESSI parametri reali
+        // usati dalla mesh (Continental/Mountain/DetailScale/Strength e
+        // TerrainHeight). In questo modo la pendenza (e quindi la classificazione
+        // Mountain) corrisponde al terreno mostrato.
+        const FVector SurfaceNormal =
+            UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
+                TriangleDirection,
+                Seed,
+                ContinentalScale,
+                MountainScale,
+                DetailScale,
+                MountainStrength,
+                DetailStrength,
+                TerrainHeight);
 
-        case EPlanetBiome::Grassland:
-            BiomeID = 3;
-            break;
-
-        case EPlanetBiome::Forest:
-            BiomeID = 4;
-            break;
-
-        case EPlanetBiome::Desert:
-            BiomeID = 5;
-            break;
-
-        case EPlanetBiome::Tundra:
-            BiomeID = 6;
-            break;
-
-        case EPlanetBiome::Snow:
-            BiomeID = 7;
-            break;
-
-        case EPlanetBiome::Mountain:
-            BiomeID = 8;
-            break;
-
-        default:
-            BiomeID = 0;
-            break;
-        }
-
-        const float NormalizedBiomeID =
-            static_cast<float>(BiomeID) /
-            8.0f;
-
-        const uint8 EncodedBiomeID =
-            static_cast<uint8>(
-                FMath::RoundToInt(
-                    NormalizedBiomeID *
-                    255.0f
-                )
-                );
-
-        return FColor(
-            EncodedBiomeID,
-            0,
-            0,
-            255
-        );
+        return CalculateVertexBiome(
+            TriangleDirection,
+            NormalizedHeight,
+            SurfaceNormal,
+            Seed,
+            PlanetProfile);
     }
 }
-
-
-// ============================================================================
-// PLANET HEIGHT
-// ============================================================================
 
 float UAndromedaNoiseLibrary::GeneratePlanetHeight(
     FVector Direction,
@@ -647,8 +408,7 @@ float UAndromedaNoiseLibrary::GeneratePlanetHeight(
     float MountainScale,
     float DetailScale,
     float MountainStrength,
-    float DetailStrength
-)
+    float DetailStrength)
 {
     return GeneratePlanetHeightInternal(
         Direction,
@@ -657,14 +417,8 @@ float UAndromedaNoiseLibrary::GeneratePlanetHeight(
         MountainScale,
         DetailScale,
         MountainStrength,
-        DetailStrength
-    );
+        DetailStrength);
 }
-
-
-// ============================================================================
-// PLANET SURFACE NORMAL
-// ============================================================================
 
 FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
     FVector Direction,
@@ -674,28 +428,23 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
     float DetailScale,
     float MountainStrength,
     float DetailStrength,
-    float TerrainHeight
-)
+    float TerrainHeight)
 {
-    Direction =
-        Direction.GetSafeNormal();
+    Direction = Direction.GetSafeNormal();
 
-    const float SampleDistance =
-        0.005f;
+    const float SampleDistance = 0.005f;
 
     FVector TangentA =
         FVector::CrossProduct(
             Direction,
-            FVector::UpVector
-        );
+            FVector::UpVector);
 
     if (TangentA.IsNearlyZero())
     {
         TangentA =
             FVector::CrossProduct(
                 Direction,
-                FVector::RightVector
-            );
+                FVector::RightVector);
     }
 
     TangentA.Normalize();
@@ -703,24 +452,15 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
     FVector TangentB =
         FVector::CrossProduct(
             Direction,
-            TangentA
-        );
+            TangentA);
 
     TangentB.Normalize();
 
     const FVector DirectionA =
-        (
-            Direction +
-            TangentA *
-            SampleDistance
-            ).GetSafeNormal();
+        (Direction + TangentA * SampleDistance).GetSafeNormal();
 
     const FVector DirectionB =
-        (
-            Direction +
-            TangentB *
-            SampleDistance
-            ).GetSafeNormal();
+        (Direction + TangentB * SampleDistance).GetSafeNormal();
 
     const float HeightCenter =
         GeneratePlanetHeightInternal(
@@ -730,8 +470,7 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
             MountainScale,
             DetailScale,
             MountainStrength,
-            DetailStrength
-        ) *
+            DetailStrength) *
         TerrainHeight;
 
     const float HeightA =
@@ -742,8 +481,7 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
             MountainScale,
             DetailScale,
             MountainStrength,
-            DetailStrength
-        ) *
+            DetailStrength) *
         TerrainHeight;
 
     const float HeightB =
@@ -754,17 +492,15 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
             MountainScale,
             DetailScale,
             MountainStrength,
-            DetailStrength
-        ) *
+            DetailStrength) *
         TerrainHeight;
 
     const float ReferencePlanetRadius =
-        (TerrainHeight > 0.0f)
-        ? FMath::Max(
-            TerrainHeight * 25.0f,
-            250000.0f
-        )
-        : 500000.0f;
+        TerrainHeight > 0.0f
+            ? FMath::Max(
+                TerrainHeight * 25.0f,
+                250000.0f)
+            : 500000.0f;
 
     const FVector PointCenter =
         Direction *
@@ -779,36 +515,25 @@ FVector UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
         (ReferencePlanetRadius + HeightB);
 
     const FVector EdgeA =
-        PointA -
-        PointCenter;
+        PointA - PointCenter;
 
     const FVector EdgeB =
-        PointB -
-        PointCenter;
+        PointB - PointCenter;
 
     FVector Normal =
         FVector::CrossProduct(
             EdgeA,
-            EdgeB
-        );
+            EdgeB);
 
     Normal.Normalize();
 
-    if (FVector::DotProduct(
-        Normal,
-        Direction
-    ) < 0.0f)
+    if (FVector::DotProduct(Normal, Direction) < 0.0f)
     {
         Normal *= -1.0f;
     }
 
     return Normal;
 }
-
-
-// ============================================================================
-// PLANET SURFACE DATA
-// ============================================================================
 
 FPlanetSurfaceData UAndromedaNoiseLibrary::GetPlanetSurfaceData(
     FVector Direction,
@@ -818,13 +543,11 @@ FPlanetSurfaceData UAndromedaNoiseLibrary::GetPlanetSurfaceData(
     float DetailScale,
     float MountainStrength,
     float DetailStrength,
-    float TerrainHeight
-)
+    float TerrainHeight)
 {
-    FPlanetSurfaceData SurfaceData;
+    Direction = Direction.GetSafeNormal();
 
-    Direction =
-        Direction.GetSafeNormal();
+    FPlanetSurfaceData SurfaceData;
 
     SurfaceData.Height =
         GeneratePlanetHeightInternal(
@@ -834,8 +557,7 @@ FPlanetSurfaceData UAndromedaNoiseLibrary::GetPlanetSurfaceData(
             MountainScale,
             DetailScale,
             MountainStrength,
-            DetailStrength
-        ) *
+            DetailStrength) *
         TerrainHeight;
 
     SurfaceData.Normal =
@@ -847,19 +569,12 @@ FPlanetSurfaceData UAndromedaNoiseLibrary::GetPlanetSurfaceData(
             DetailScale,
             MountainStrength,
             DetailStrength,
-            TerrainHeight
-        );
+            TerrainHeight);
 
-    SurfaceData.Direction =
-        Direction;
+    SurfaceData.Direction = Direction;
 
     return SurfaceData;
 }
-
-
-// ============================================================================
-// PLANET VERTICES
-// ============================================================================
 
 void UAndromedaNoiseLibrary::GeneratePlanetVertices(
     int32 Resolution,
@@ -872,8 +587,7 @@ void UAndromedaNoiseLibrary::GeneratePlanetVertices(
     float MountainStrength,
     float DetailStrength,
     float TerrainHeight,
-    TArray<FVector>& OutVertices
-)
+    TArray<FVector>& OutVertices)
 {
     OutVertices.Reset();
 
@@ -882,8 +596,7 @@ void UAndromedaNoiseLibrary::GeneratePlanetVertices(
         return;
     }
 
-    if (FaceIndex < 0 ||
-        FaceIndex > 5)
+    if (FaceIndex < 0 || FaceIndex > 5)
     {
         return;
     }
@@ -892,39 +605,25 @@ void UAndromedaNoiseLibrary::GeneratePlanetVertices(
         (Resolution + 1) *
         (Resolution + 1);
 
-    OutVertices.Reserve(
-        VertexCount
-    );
+    OutVertices.Reserve(VertexCount);
 
-    const float Step =
-        1.0f /
-        static_cast<float>(Resolution);
-
-    for (int32 Y = 0;
-        Y <= Resolution;
-        ++Y)
+    for (int32 Y = 0; Y <= Resolution; ++Y)
     {
         const float V =
-            static_cast<float>(Y) *
-            Step;
+            static_cast<float>(Y) /
+            static_cast<float>(Resolution);
 
-        for (int32 X = 0;
-            X <= Resolution;
-            ++X)
+        for (int32 X = 0; X <= Resolution; ++X)
         {
             const float U =
-                static_cast<float>(X) *
-                Step;
+                static_cast<float>(X) /
+                static_cast<float>(Resolution);
 
-            FVector Direction =
+            const FVector Direction =
                 GetCubeFaceDirection(
                     FaceIndex,
                     U,
-                    V
-                );
-
-            Direction =
-                Direction.GetSafeNormal();
+                    V).GetSafeNormal();
 
             const float Height =
                 GeneratePlanetHeightInternal(
@@ -934,22 +633,15 @@ void UAndromedaNoiseLibrary::GeneratePlanetVertices(
                     MountainScale,
                     DetailScale,
                     MountainStrength,
-                    DetailStrength
-                ) *
+                    DetailStrength) *
                 TerrainHeight;
 
             OutVertices.Add(
                 Direction *
-                (PlanetRadius + Height)
-            );
+                (PlanetRadius + Height));
         }
     }
 }
-
-
-// ============================================================================
-// PLANET MESH DATA
-// ============================================================================
 
 void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
     int32 Resolution,
@@ -966,8 +658,7 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
     TArray<int32>& OutTriangles,
     TArray<FVector>& OutNormals,
     TArray<FProcMeshTangent>& OutTangents,
-    TArray<FColor>& OutVertexColors
-)
+    TArray<FColor>& OutVertexColors)
 {
     OutVertices.Reset();
     OutTriangles.Reset();
@@ -984,31 +675,41 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
         (Resolution + 1) *
         (Resolution + 1);
 
-    constexpr int32 TotalFaces = 6;
+    const int32 TotalFaces = 6;
 
-    OutVertices.Reserve(
+    TArray<FVector> BaseVertices;
+    TArray<int32> BaseTriangles;
+    TArray<FVector> BaseNormals;
+    TArray<EPlanetBiome> BaseBiomes;
+
+    BaseVertices.Reserve(
         VerticesPerFace *
-        TotalFaces
-    );
+        TotalFaces);
 
-    OutVertexColors.Reserve(
-        VerticesPerFace *
-        TotalFaces
-    );
-
-    OutTriangles.Reserve(
+    BaseTriangles.Reserve(
         Resolution *
         Resolution *
-        6 *
-        TotalFaces
-    );
+        TotalFaces *
+        6);
+
+    BaseNormals.SetNumZeroed(
+        VerticesPerFace *
+        TotalFaces);
+
+    BaseBiomes.Reserve(
+        VerticesPerFace *
+        TotalFaces);
+
+    // ============================================================
+    // 1. GENERATE THE ORIGINAL GRID VERTICES
+    // ============================================================
 
     for (int32 FaceIndex = 0;
-        FaceIndex < TotalFaces;
-        ++FaceIndex)
+         FaceIndex < TotalFaces;
+         ++FaceIndex)
     {
         const int32 FaceVertexStart =
-            OutVertices.Num();
+            BaseVertices.Num();
 
         TArray<FVector> FaceVertices;
 
@@ -1023,41 +724,30 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
             MountainStrength,
             DetailStrength,
             TerrainHeight,
-            FaceVertices
-        );
+            FaceVertices);
 
-        for (const FVector& Vertex :
-            FaceVertices)
+        for (const FVector& Vertex : FaceVertices)
         {
-            OutVertices.Add(Vertex);
-
-            // ====================================================
-            // PBS DATA
-            // ====================================================
+            BaseVertices.Add(Vertex);
 
             const FVector Direction =
                 Vertex.GetSafeNormal();
 
             const float RawHeight =
                 Direction.IsNearlyZero()
-                ? 0.0f
-                : (
-                    Vertex.Size() -
-                    PlanetRadius
-                    );
+                    ? 0.0f
+                    : Vertex.Size() - PlanetRadius;
 
             const float NormalizedHeight =
-                (TerrainHeight > 0.0f)
-                ? FMath::Clamp(
-                    RawHeight /
-                    TerrainHeight,
-                    -1.0f,
-                    1.0f
-                )
-                : 0.0f;
+                TerrainHeight > KINDA_SMALL_NUMBER
+                    ? FMath::Clamp(
+                        RawHeight / TerrainHeight,
+                        -1.0f,
+                        1.0f)
+                    : 0.0f;
 
             const FVector SurfaceNormal =
-                UAndromedaNoiseLibrary::CalculatePlanetSurfaceNormal(
+                CalculatePlanetSurfaceNormal(
                     Direction,
                     Seed,
                     ContinentalScale,
@@ -1065,30 +755,29 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
                     DetailScale,
                     MountainStrength,
                     DetailStrength,
-                    TerrainHeight
-                );
+                    TerrainHeight);
 
-            OutVertexColors.Add(
-                EncodePBSVertexData(
+            const EPlanetBiome Biome =
+                CalculateVertexBiome(
                     Direction,
                     NormalizedHeight,
                     SurfaceNormal,
                     Seed,
-                    PlanetProfile
-                )
-            );
+                    PlanetProfile);
+
+            BaseBiomes.Add(Biome);
         }
 
         const int32 RowSize =
             Resolution + 1;
 
         for (int32 Y = 0;
-            Y < Resolution;
-            ++Y)
+             Y < Resolution;
+             ++Y)
         {
             for (int32 X = 0;
-                X < Resolution;
-                ++X)
+                 X < Resolution;
+                 ++X)
             {
                 const int32 A =
                     FaceVertexStart +
@@ -1104,242 +793,328 @@ void UAndromedaNoiseLibrary::GeneratePlanetMeshData(
                 const int32 D =
                     C + 1;
 
-                OutTriangles.Add(A);
-                OutTriangles.Add(C);
-                OutTriangles.Add(B);
+                BaseTriangles.Add(A);
+                BaseTriangles.Add(C);
+                BaseTriangles.Add(B);
 
-                OutTriangles.Add(B);
-                OutTriangles.Add(C);
-                OutTriangles.Add(D);
+                BaseTriangles.Add(B);
+                BaseTriangles.Add(C);
+                BaseTriangles.Add(D);
             }
         }
     }
 
-    // ========================================================================
-    // CALCOLO ACCURATO DEI NORMALI TRAMITE ACCUMULAZIONE SUI TRIANGOLI
-    // ========================================================================
+    // ============================================================
+    // 2. CALCULATE SMOOTH BASE NORMALS
+    // ============================================================
 
-    const int32 TotalVertexCount =
-        OutVertices.Num();
-
-    OutNormals.Init(
-        FVector::ZeroVector,
-        TotalVertexCount
-    );
-
-    OutTangents.SetNumUninitialized(
-        TotalVertexCount
-    );
-
-    const int32 TriangleIndexCount =
-        OutTriangles.Num();
-
-    for (int32 TriIdx = 0;
-        TriIdx < TriangleIndexCount;
-        TriIdx += 3)
+    for (int32 TriangleIndex = 0;
+         TriangleIndex < BaseTriangles.Num();
+         TriangleIndex += 3)
     {
         const int32 I0 =
-            OutTriangles[TriIdx];
+            BaseTriangles[TriangleIndex];
 
         const int32 I1 =
-            OutTriangles[TriIdx + 1];
+            BaseTriangles[TriangleIndex + 1];
 
         const int32 I2 =
-            OutTriangles[TriIdx + 2];
+            BaseTriangles[TriangleIndex + 2];
 
         const FVector& V0 =
-            OutVertices[I0];
+            BaseVertices[I0];
 
         const FVector& V1 =
-            OutVertices[I1];
+            BaseVertices[I1];
 
         const FVector& V2 =
-            OutVertices[I2];
+            BaseVertices[I2];
 
-        FVector TriNormal =
+        FVector TriangleNormal =
             FVector::CrossProduct(
                 V1 - V0,
-                V2 - V0
-            );
+                V2 - V0);
 
         const FVector Centroid =
-            (V0 + V1 + V2) *
-            0.3333333f;
+            (V0 + V1 + V2) / 3.0f;
 
         if (FVector::DotProduct(
-            TriNormal,
-            Centroid
-        ) < 0.0f)
+                TriangleNormal,
+                Centroid) < 0.0f)
         {
-            TriNormal = -TriNormal;
+            TriangleNormal *= -1.0f;
         }
 
-        OutNormals[I0] += TriNormal;
-        OutNormals[I1] += TriNormal;
-        OutNormals[I2] += TriNormal;
+        BaseNormals[I0] += TriangleNormal;
+        BaseNormals[I1] += TriangleNormal;
+        BaseNormals[I2] += TriangleNormal;
     }
 
-    // ========================================================================
-    // SEAM WELDING SUI BORDI CONDIVISI DEL CUBO-SFERA
-    // ========================================================================
+    // ============================================================
+    // 3. WELD BOUNDARY NORMALS
+    // ============================================================
 
     const int32 RowSize =
         Resolution + 1;
 
     TMap<FIntVector, FVector> BoundaryNormals;
 
-    BoundaryNormals.Reserve(
-        TotalFaces *
-        Resolution *
-        4
-    );
+    auto MakeBoundaryKey =
+        [](const FVector& Position)
+        {
+            return FIntVector(
+                FMath::RoundToInt(Position.X * 0.1f),
+                FMath::RoundToInt(Position.Y * 0.1f),
+                FMath::RoundToInt(Position.Z * 0.1f));
+        };
 
-    for (int32 VertIdx = 0;
-        VertIdx < TotalVertexCount;
-        ++VertIdx)
+    for (int32 FaceIndex = 0;
+         FaceIndex < TotalFaces;
+         ++FaceIndex)
     {
-        const int32 FaceVertIdx =
-            VertIdx %
+        const int32 FaceStart =
+            FaceIndex *
             VerticesPerFace;
 
-        const int32 X =
-            FaceVertIdx %
-            RowSize;
-
-        const int32 Y =
-            FaceVertIdx /
-            RowSize;
-
-        if (X == 0 ||
-            X == Resolution ||
-            Y == 0 ||
-            Y == Resolution)
+        for (int32 Y = 0;
+             Y <= Resolution;
+             ++Y)
         {
-            const FVector& Pos =
-                OutVertices[VertIdx];
+            for (int32 X = 0;
+                 X <= Resolution;
+                 ++X)
+            {
+                if (X != 0 &&
+                    X != Resolution &&
+                    Y != 0 &&
+                    Y != Resolution)
+                {
+                    continue;
+                }
 
-            const FIntVector Key(
-                FMath::RoundToInt(
-                    Pos.X * 0.1f
-                ),
-                FMath::RoundToInt(
-                    Pos.Y * 0.1f
-                ),
-                FMath::RoundToInt(
-                    Pos.Z * 0.1f
-                )
-            );
+                const int32 Index =
+                    FaceStart +
+                    Y * RowSize +
+                    X;
 
-            FVector& Sum =
-                BoundaryNormals.FindOrAdd(
-                    Key,
-                    FVector::ZeroVector
-                );
+                const FIntVector Key =
+                    MakeBoundaryKey(
+                        BaseVertices[Index]);
 
-            Sum +=
-                OutNormals[VertIdx];
+                BoundaryNormals.FindOrAdd(Key) +=
+                    BaseNormals[Index];
+            }
         }
     }
 
-    for (int32 VertIdx = 0;
-        VertIdx < TotalVertexCount;
-        ++VertIdx)
+    for (int32 FaceIndex = 0;
+         FaceIndex < TotalFaces;
+         ++FaceIndex)
     {
-        const int32 FaceVertIdx =
-            VertIdx %
+        const int32 FaceStart =
+            FaceIndex *
             VerticesPerFace;
 
-        const int32 X =
-            FaceVertIdx %
-            RowSize;
-
-        const int32 Y =
-            FaceVertIdx /
-            RowSize;
-
-        if (X == 0 ||
-            X == Resolution ||
-            Y == 0 ||
-            Y == Resolution)
+        for (int32 Y = 0;
+             Y <= Resolution;
+             ++Y)
         {
-            const FVector& Pos =
-                OutVertices[VertIdx];
-
-            const FIntVector Key(
-                FMath::RoundToInt(
-                    Pos.X * 0.1f
-                ),
-                FMath::RoundToInt(
-                    Pos.Y * 0.1f
-                ),
-                FMath::RoundToInt(
-                    Pos.Z * 0.1f
-                )
-            );
-
-            if (const FVector* SharedNormal =
-                BoundaryNormals.Find(Key))
+            for (int32 X = 0;
+                 X <= Resolution;
+                 ++X)
             {
-                OutNormals[VertIdx] =
-                    *SharedNormal;
+                if (X != 0 &&
+                    X != Resolution &&
+                    Y != 0 &&
+                    Y != Resolution)
+                {
+                    continue;
+                }
+
+                const int32 Index =
+                    FaceStart +
+                    Y * RowSize +
+                    X;
+
+                const FIntVector Key =
+                    MakeBoundaryKey(
+                        BaseVertices[Index]);
+
+                if (const FVector* SharedNormal =
+                        BoundaryNormals.Find(Key))
+                {
+                    BaseNormals[Index] =
+                        *SharedNormal;
+                }
             }
         }
+    }
 
-        const FVector& Pos =
-            OutVertices[VertIdx];
-
-        const FVector RadialDir =
-            Pos.GetSafeNormal();
-
-        FVector Normal =
-            OutNormals[VertIdx];
+    for (FVector& Normal : BaseNormals)
+    {
+        Normal.Normalize();
 
         if (Normal.IsNearlyZero())
         {
             Normal =
-                RadialDir;
+                BaseVertices[
+                    &Normal -
+                    BaseNormals.GetData()
+                ].GetSafeNormal();
         }
-        else
-        {
-            Normal.Normalize();
 
-            if (FVector::DotProduct(
+        const int32 NormalIndex =
+            static_cast<int32>(
+                &Normal -
+                BaseNormals.GetData());
+
+        const FVector Radial =
+            BaseVertices[NormalIndex]
+                .GetSafeNormal();
+
+        if (FVector::DotProduct(
                 Normal,
-                RadialDir
-            ) < 0.0f)
-            {
-                Normal = -Normal;
-            }
+                Radial) < 0.0f)
+        {
+            Normal *= -1.0f;
         }
+    }
 
-        OutNormals[VertIdx] =
-            Normal;
+    // ============================================================
+    // 4. EXPAND TRIANGLES
+    //
+    // IMPORTANT:
+    // Every triangle gets ONE categorical biome code on all
+    // three of its vertices.
+    //
+    // Therefore Vertex Color interpolation can never generate
+    // fake intermediate biome IDs inside a triangle.
+    // ============================================================
 
-        // ====================================================================
-        // TANGENTE SFERICA GLOBALE CONTINUA
-        // ====================================================================
+    const int32 TriangleCount =
+        BaseTriangles.Num() / 3;
+
+    OutVertices.Reserve(
+        TriangleCount * 3);
+
+    OutTriangles.Reserve(
+        TriangleCount * 3);
+
+    OutNormals.Reserve(
+        TriangleCount * 3);
+
+    OutTangents.Reserve(
+        TriangleCount * 3);
+
+    OutVertexColors.Reserve(
+        TriangleCount * 3);
+
+    for (int32 TriangleIndex = 0;
+         TriangleIndex < BaseTriangles.Num();
+         TriangleIndex += 3)
+    {
+        const int32 I0 =
+            BaseTriangles[TriangleIndex];
+
+        const int32 I1 =
+            BaseTriangles[TriangleIndex + 1];
+
+        const int32 I2 =
+            BaseTriangles[TriangleIndex + 2];
+
+        const FVector& V0 =
+            BaseVertices[I0];
+
+        const FVector& V1 =
+            BaseVertices[I1];
+
+        const FVector& V2 =
+            BaseVertices[I2];
+
+        // Evaluate the biome at the real triangle center (geometry coherent).
+        const EPlanetBiome TriangleBiome =
+            CalculateTriangleBiome(
+                V0,
+                V1,
+                V2,
+                PlanetRadius,
+                Seed,
+                ContinentalScale,
+                MountainScale,
+                DetailScale,
+                MountainStrength,
+                DetailStrength,
+                TerrainHeight,
+                PlanetProfile);
+
+        const FColor TriangleColor =
+            BiomeToVertexColor(
+                TriangleBiome);
+
+        const int32 NewIndex =
+            OutVertices.Num();
+
+        OutVertices.Add(V0);
+        OutVertices.Add(V1);
+        OutVertices.Add(V2);
+
+        OutNormals.Add(
+            BaseNormals[I0]);
+
+        OutNormals.Add(
+            BaseNormals[I1]);
+
+        OutNormals.Add(
+            BaseNormals[I2]);
+
+        OutVertexColors.Add(
+            TriangleColor);
+
+        OutVertexColors.Add(
+            TriangleColor);
+
+        OutVertexColors.Add(
+            TriangleColor);
+
+        OutTriangles.Add(
+            NewIndex);
+
+        OutTriangles.Add(
+            NewIndex + 1);
+
+        OutTriangles.Add(
+            NewIndex + 2);
+    }
+
+    // ============================================================
+    // 5. GENERATE TANGENTS
+    // ============================================================
+
+    for (int32 Index = 0;
+         Index < OutNormals.Num();
+         ++Index)
+    {
+        FVector Normal =
+            OutNormals[Index].GetSafeNormal();
 
         FVector Tangent =
             FVector::CrossProduct(
                 FVector::UpVector,
-                Normal
-            );
+                Normal);
 
-        if (Tangent.SizeSquared() < 0.001f)
+        if (Tangent.IsNearlyZero())
         {
             Tangent =
                 FVector::CrossProduct(
                     FVector::RightVector,
-                    Normal
-                );
+                    Normal);
         }
 
         Tangent.Normalize();
 
-        OutTangents[VertIdx] =
+        OutTangents.Add(
             FProcMeshTangent(
                 Tangent,
-                true
-            );
+                true));
     }
 }
