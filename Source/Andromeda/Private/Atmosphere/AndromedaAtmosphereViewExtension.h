@@ -2,6 +2,10 @@
 
 #include "CoreMinimal.h"
 
+// FScreenPassTexture must be a complete type before SceneViewExtension.h
+// forward-declares and uses it inside the FPostProcessingPassDelegate typedef.
+#include "ScreenPass.h"
+
 
 // =========================================================
 // ANDROMEDA ATMOSPHERE VIEW EXTENSION

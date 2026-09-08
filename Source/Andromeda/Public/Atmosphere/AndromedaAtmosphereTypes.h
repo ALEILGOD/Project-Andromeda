@@ -243,3 +243,22 @@ struct FAndromedaAtmosphereInstance
 
     FVector WorldPosition = FVector::ZeroVector;
 };
+
+
+// =========================================================
+// ATMOSPHERE GPU DATA
+// =========================================================
+
+// Packed GPU representation of one atmosphere volume.
+// Transferred to the GPU as a StructuredBuffer element.
+// Memory layout MUST match FAndromedaAtmosphereGPUData declared in AndromedaAtmosphere.usf.
+struct FAndromedaAtmosphereGPUData
+{
+    // World center (cm) + surface radius (cm)
+    float CenterX, CenterY, SurfaceRadius;
+    float CenterZ;
+
+    // Atmosphere outer radius (cm) + padding
+    float AtmosphereRadius;
+    float Pad0, Pad1, Pad2;
+};

@@ -2,11 +2,12 @@
 
 #include "AndromedaAtmosphereShader.h"
 #include "Atmosphere/AndromedaAtmosphereManager.h"
-#include "Atmosphere/AndromedaAtmosphereViewExtension.h"
+#include "Atmosphere/AndromedaAtmosphereTypes.h"
 #include "GlobalShader.h"
 #include "PixelShaderUtils.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
 #include "RHIFeatureLevel.h"
 #include "RHI.h"
 #include "ScreenPass.h"
@@ -15,6 +16,7 @@
 #include "Misc/CoreDelegates.h"
 #include "Misc/Paths.h"
 #include <atomic>
+#include "Atmosphere/AndromedaAtmosphereViewExtension.h"
 
 
 // =========================================================
@@ -41,6 +43,17 @@ namespace
         TEXT("r.AndromedaAtmos.Enable"),
         1,
         TEXT("Enable the Andromeda atmosphere diagnostic RDG pass (ATMOS-02). 1 = enabled, 0 = disabled."),
+        ECVF_RenderThreadSafe
+    );
+
+
+    // ATMOS-03: enables/disables the atmosphere volume diagnostic overlay.
+    // 0 = scene color only (no atmosphere visualization)
+    // 1 = volume/intersection diagnostic (ATMOS-03)
+    TAutoConsoleVariable<int> CVarAndromedaAtmosDebugVolume(
+        TEXT("r.AndromedaAtmos.DebugVolume"),
+        1,
+        TEXT("ATMOS-03: enable the atmosphere volume/intersection diagnostic overlay. 0 = off, 1 = on (shows atmosphere sphere intersections)."),
         ECVF_RenderThreadSafe
     );
 
@@ -83,4 +96,402 @@ namespace
             }
         })
     );
+}
+// =========================================================
+// LIFECYCLE
+// =========================================================
+
+bool FAndromedaAtmosphereRenderer::bInitialized = false;
+
+FDelegateHandle FAndromedaAtmosphereRenderer::PostEngineInitDelegateHandle;
+
+
+void FAndromedaAtmosphereRenderer::Initialize()
+{
+    if (bInitialized)
+    {
+        return;
+    }
+
+
+    check(IsInGameThread());
+
+    RegisterShaderDirectoryMapping();
+
+    // ATMOS-02: the atmosphere pass is hooked into the post-processing chain
+    // through the public UE 5.8 scene view extension API once GEngine is
+    // available (see HandlePostEngineInit). NewExtension requires a valid
+    // GEngine, so registration cannot happen this early in StartupModule.
+    PostEngineInitDelegateHandle = FCoreDelegates::GetOnPostEngineInit().AddStatic(&FAndromedaAtmosphereRenderer::HandlePostEngineInit);
+
+    bInitialized = true;
+
+
+    UE_LOG(
+        LogAndromedaAtmos,
+        Log,
+        TEXT("[ATMOS-02] FAndromedaAtmosphereRenderer initialized. Virtual shader directory '/Andromeda' mapped.")
+    );
+}
+
+
+void FAndromedaAtmosphereRenderer::Shutdown()
+{
+    if (!bInitialized)
+    {
+        return;
+    }
+
+
+    FCoreDelegates::GetOnPostEngineInit().Remove(PostEngineInitDelegateHandle);
+
+    FAndromedaAtmosphereViewExtension::Unregister();
+
+    FAndromedaAtmosphereManager::Get().Clear();
+
+    bInitialized = false;
+}
+
+
+bool FAndromedaAtmosphereRenderer::IsInitialized()
+{
+    return bInitialized;
+}
+
+
+void FAndromedaAtmosphereRenderer::RegisterShaderDirectoryMapping()
+{
+    const FString VirtualShaderDirectory = TEXT("/Andromeda");
+    const FString RealShaderDirectory = FPaths::Combine(
+        FPaths::ProjectDir(),
+        TEXT("Shaders"),
+        TEXT("Andromeda")
+    );
+
+
+    checkf(
+        FPaths::DirectoryExists(RealShaderDirectory),
+        TEXT("Andromeda atmosphere shader directory is missing: %s"),
+        *RealShaderDirectory
+    );
+
+
+    // Fails with a check if the mapping already exists.
+    AddShaderSourceDirectoryMapping(VirtualShaderDirectory, RealShaderDirectory);
+}
+// =========================================================
+// GPU DATA CONVERSION
+// =========================================================
+
+void FAndromedaAtmosphereRenderer::BuildGPUData(
+    const TArray<FAndromedaAtmosphereInstance>& Snapshot,
+    TArray<FAndromedaAtmosphereGPUData>& OutGPUData)
+{
+    OutGPUData.Reset(Snapshot.Num());
+
+
+    for (const FAndromedaAtmosphereInstance& Instance : Snapshot)
+    {
+        FAndromedaAtmosphereGPUData GPUData;
+
+
+        GPUData.CenterX = Instance.WorldPosition.X;
+        GPUData.CenterY = Instance.WorldPosition.Y;
+        GPUData.CenterZ = Instance.WorldPosition.Z;
+        GPUData.SurfaceRadius = Instance.Parameters.SurfaceRadius;
+
+
+        GPUData.AtmosphereRadius = Instance.Parameters.AtmosphereRadius;
+        GPUData.Pad0 = 0.0f;
+        GPUData.Pad1 = 0.0f;
+        GPUData.Pad2 = 0.0f;
+
+
+        OutGPUData.Add(GPUData);
+    }
+}
+
+
+// =========================================================
+// RENDERING (ATMOS-03)
+// =========================================================
+
+FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
+    FRDGBuilder& GraphBuilder,
+    const FSceneView& View,
+    const FPostProcessMaterialInputs& Inputs)
+{
+    // Gate: the diagnostic pass is enabled by default (r.AndromedaAtmos.Enable).
+    if (!bInitialized || CVarAndromedaAtmosEnable.GetValueOnRenderThread() == 0)
+    {
+        return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
+    }
+
+
+    // --------------------------------------------------------
+    // Step 1: get the atmosphere snapshot from the manager.
+    // --------------------------------------------------------
+    TArray<FAndromedaAtmosphereInstance> AtmosphereSnapshot;
+    FAndromedaAtmosphereManager::Get().GetAtmosphereSnapshot(AtmosphereSnapshot);
+
+
+    const int32 AtmosphereCount = AtmosphereSnapshot.Num();
+
+
+    // --------------------------------------------------------
+    // Step 2: convert CPU snapshot -> packed GPU data.
+    // --------------------------------------------------------
+    TArray<FAndromedaAtmosphereGPUData> GPUData;
+    BuildGPUData(AtmosphereSnapshot, GPUData);
+
+
+    const FScreenPassTextureSlice SceneColorSlice = Inputs.GetInput(EPostProcessMaterialInput::SceneColor);
+
+
+    if (!SceneColorSlice.TextureSRV)
+    {
+        return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
+    }
+
+
+    // Resolve the input slice to a real texture (handles texture-array
+    // slices and the override-output case) -> SceneColor in.
+    FScreenPassTexture SceneColor = FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice, Inputs.OverrideOutput);
+
+
+    if (!SceneColor.Texture)
+    {
+        return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
+    }
+
+
+    // Output: the chain-provided override (back buffer) when this is the
+    // last pass, otherwise a dedicated RDG texture. This keeps the
+    // SceneColor -> Atmosphere pass -> output structure for ATMOS-03+.
+    FScreenPassRenderTarget Output;
+    ERenderTargetLoadAction OutputLoadAction = ERenderTargetLoadAction::ELoad;
+
+
+    if (Inputs.OverrideOutput.IsValid())
+    {
+        Output = Inputs.OverrideOutput;
+        OutputLoadAction = ERenderTargetLoadAction::ELoad;
+    }
+    else
+    {
+        FRDGTextureDesc OutputDesc = SceneColor.Texture->Desc;
+        OutputDesc.Flags |= ETextureCreateFlags::RenderTargetable;
+
+        Output = FScreenPassRenderTarget(
+            GraphBuilder.CreateTexture(OutputDesc, TEXT("AndromedaAtmosphereOutput")),
+            SceneColor.ViewRect,
+            ERenderTargetLoadAction::ENoAction);
+
+        OutputLoadAction = ERenderTargetLoadAction::ENoAction;
+    }
+
+
+    // Global shaders live in the global shader map (no FViewInfo dependency).
+    FGlobalShaderMap* GlobalShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+
+
+    if (!GlobalShaderMap)
+    {
+        return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
+    }
+
+
+    FAndromedaAtmospherePS::FParameters* PassParameters = GraphBuilder.AllocParameters<FAndromedaAtmospherePS::FParameters>();
+    PassParameters->ViewportSize = Output.ViewRect.Size();
+    PassParameters->SceneColorTexture = SceneColor.Texture;
+    PassParameters->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+    PassParameters->RenderTargets[0] = FRenderTargetBinding(Output.Texture, OutputLoadAction);
+
+
+    // --------------------------------------------------------
+    // Step 3: atmosphere data -> RDG StructuredBuffer.
+    // --------------------------------------------------------
+    PassParameters->AtmosphereCount = AtmosphereCount;
+
+
+    if (AtmosphereCount > 0)
+    {
+        const uint32 ElementBytes = sizeof(FAndromedaAtmosphereGPUData);
+        const uint32 NumElements = (uint32)GPUData.Num();
+
+
+        FRDGBufferDesc BufferDesc = FRDGBufferDesc::CreateStructuredDesc(
+            ElementBytes,
+            NumElements
+        );
+
+
+        FRDGBufferRef AtmosphereBuffer = GraphBuilder.CreateBuffer(
+            BufferDesc,
+            TEXT("AndromedaAtmosphereBuffer"),
+            ERDGBufferFlags::None
+        );
+
+
+        GraphBuilder.QueueBufferUpload(
+            AtmosphereBuffer,
+            GPUData.GetData(),
+            (uint64)(GPUData.Num() * sizeof(FAndromedaAtmosphereGPUData)),
+            ERDGInitialDataFlags::None
+        );
+
+
+        PassParameters->AtmosphereBuffer = GraphBuilder.CreateSRV(
+            AtmosphereBuffer,
+            PF_R32_UINT
+        );
+    }
+    else
+    {
+        // No atmospheres: leave the SRV null. The shader checks AtmosphereCount == 0.
+        PassParameters->AtmosphereBuffer = nullptr;
+    }
+
+
+    // --------------------------------------------------------
+    // Step 4: camera data for view-ray reconstruction.
+    // --------------------------------------------------------
+    PassParameters->CameraWorldPosition = FVector3f(
+        View.ViewMatrices.GetViewOrigin()
+    );
+
+
+    PassParameters->InvViewProjection = FMatrix44f(
+        View.ViewMatrices.GetClipToWorld()
+    );
+
+
+    TShaderMapRef<FAndromedaAtmospherePS> PixelShader(GlobalShaderMap);
+
+
+    // Real fullscreen RDG pass: AddFullscreenPass inserts a raster pass on
+    // GraphBuilder (GraphBuilder.AddPass internally) that draws a fullscreen
+    // triangle with FAndromedaAtmospherePS bound to the render target above.
+    FPixelShaderUtils::AddFullscreenPass<FAndromedaAtmospherePS>(
+        GraphBuilder,
+        GlobalShaderMap,
+        RDG_EVENT_NAME("AndromedaAtmosphereDiagnostic"),
+        PixelShader,
+        PassParameters,
+        Output.ViewRect
+    );
+
+
+    // Dispatch bookkeeping (no per-frame logging: first dispatch only).
+    const uint64 DispatchId = GDispatchCounter.fetch_add(1) + 1;
+
+
+    if (DispatchId == 1)
+    {
+        UE_LOG(
+            LogAndromedaAtmos,
+            Log,
+            TEXT("[ATMOS-03] First real RDG dispatch of FAndromedaAtmospherePS: atmosphere volume diagnostic pass is live on the GPU. Atmospheres: %d"),
+            AtmosphereCount
+        );
+    }
+
+
+    return FScreenPassTexture(Output.Texture, Output.ViewRect);
+}
+
+
+uint64 FAndromedaAtmosphereRenderer::GetDispatchCount()
+{
+    return GDispatchCounter.load();
+}
+// =========================================================
+// DIAGNOSTICS
+// =========================================================
+
+bool FAndromedaAtmosphereRenderer::ValidateShaderInfrastructure()
+{
+    if (!bInitialized)
+    {
+        UE_LOG(
+            LogAndromedaAtmos,
+            Warning,
+            TEXT("ValidateShaderInfrastructure: renderer not initialized.")
+        );
+
+        return false;
+    }
+
+
+    if (IsRunningCommandlet())
+    {
+        UE_LOG(
+            LogAndromedaAtmos,
+            Warning,
+            TEXT("ValidateShaderInfrastructure: not available in commandlets.")
+        );
+
+        return false;
+    }
+
+
+    FGlobalShaderMap* GlobalShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+
+
+    if (!GlobalShaderMap)
+    {
+        UE_LOG(
+            LogAndromedaAtmos,
+            Warning,
+            TEXT("ValidateShaderInfrastructure: global shader map unavailable.")
+        );
+
+        return false;
+    }
+
+
+    const bool bPixelShaderCompiled = GlobalShaderMap->HasShader(
+        &FAndromedaAtmospherePS::GetStaticType(),
+        0
+    );
+
+
+    UE_CLOG(
+        !bPixelShaderCompiled,
+        LogAndromedaAtmos,
+        Log,
+        TEXT("ValidateShaderInfrastructure: FAndromedaAtmospherePS not in the global shader map yet.")
+    );
+
+    return bPixelShaderCompiled;
+}
+
+
+void FAndromedaAtmosphereRenderer::HandlePostEngineInit()
+{
+    // GEngine is now available: register the scene view extension that hooks
+    // the atmosphere pass into the post-processing chain (ATMOS-02). This must
+    // happen here (not in Initialize) because NewExtension requires a valid GEngine.
+    FAndromedaAtmosphereViewExtension::Register();
+
+
+    const bool bValid = ValidateShaderInfrastructure();
+
+
+    if (bValid)
+    {
+        UE_LOG(
+            LogAndromedaAtmos,
+            Log,
+            TEXT("[ATMOS-02] Global shader infrastructure VALID (checked after engine init).")
+        );
+    }
+    else
+    {
+        UE_LOG(
+            LogAndromedaAtmos,
+            Log,
+            TEXT("[ATMOS-02] Global shader infrastructure not validated at engine init. Use 'r.AndromedaAtmos.ValidateShader' once the global shader map finished compiling.")
+        );
+    }
 }

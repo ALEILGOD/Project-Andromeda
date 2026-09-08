@@ -2,15 +2,17 @@
 
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
+#include "RenderGraphUtils.h"
+#include "Atmosphere/AndromedaAtmosphereTypes.h"
 
 
 // =========================================================
 // ANDROMEDA ATMOSPHERE GLOBAL SHADER
 // =========================================================
 
-// ATMOS-02: fullscreen diagnostic pixel shader dispatched through a real
-// RDG pass (FPixelShaderUtils::AddFullscreenPass) in the post-processing
-// chain via the public scene view extension hook.
+// ATMOS-03: fullscreen diagnostic pixel shader that reconstructs the view ray,
+// intersects it with each registered atmosphere sphere (ray/sphere intersection),
+// and produces a diagnostic visualization of the intersection result.
 //
 // Source file : /Andromeda/AndromedaAtmosphere.usf
 //               ([Project]/Shaders/Andromeda/AndromedaAtmosphere.usf)
@@ -33,14 +35,23 @@ public:
     // SHADER PARAMETERS
     // =========================================================
 
-    // Legacy name binding: every uniform member must match a global
-    // variable declared in AndromedaAtmosphere.usf.
-    // ATMOS-04+ will extend this struct with atmosphere volumes,
-    // scattering coefficients and optical depth data.
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        // Viewport
         SHADER_PARAMETER(FIntPoint, ViewportSize)
+
+        // Camera
+        SHADER_PARAMETER(FVector3f, CameraWorldPosition)
+        SHADER_PARAMETER(FMatrix44f, InvViewProjection)
+
+        // Atmosphere data
+        SHADER_PARAMETER(int32, AtmosphereCount)
+        FRDGBufferSRVRef AtmosphereBuffer;
+
+        // Scene color
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
         SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
+
+        // Output
         RENDER_TARGET_BINDING_SLOTS()
     END_SHADER_PARAMETER_STRUCT()
 };
