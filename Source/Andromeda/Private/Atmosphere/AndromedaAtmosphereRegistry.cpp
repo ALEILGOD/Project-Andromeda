@@ -1,6 +1,7 @@
 #include "Atmosphere/AndromedaAtmosphereRegistry.h"
 
 #include "Engine/World.h"
+#include "EngineUtils.h"
 
 
 // =========================================================
@@ -17,6 +18,10 @@ void AAndromedaAtmosphereRegistry::BeginPlay()
 {
     Super::BeginPlay();
 
+    // The placed level instance may have tick disabled in its serialized state:
+    // force it on, otherwise the time-window search retry never runs.
+    SetActorTickEnabled(true);
+
 
     // First attempt to find the StarSystem and register atmospheres.
     SyncAtmospheres();
@@ -28,11 +33,12 @@ void AAndromedaAtmosphereRegistry::Tick(float DeltaTime)
     Super::Tick(DeltaTime);
 
 
-    // Keep trying to find the StarSystem for a limited number of frames
-    // (the StarSystem may not exist yet at BeginPlay).
+    // Keep trying to find the StarSystem and its planets from the normal
+    // Tick (non-blocking) until the sync succeeds or the search time
+    // window expires. Once bStarSystemFound is latched, no more retries.
     if (!bStarSystemFound)
     {
-        if (FindRetryCount < MaxFindRetries)
+        if (!bSearchWindowExpired)
         {
             SyncAtmospheres();
         }
@@ -75,11 +81,30 @@ void AAndromedaAtmosphereRegistry::Tick(float DeltaTime)
 void AAndromedaAtmosphereRegistry::SyncAtmospheres()
 {
     // --------------------------------------------------------
+    // Guard: without a World there is nothing to synchronize.
+    // --------------------------------------------------------
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Start the search window on the first attempt (world time).
+    // --------------------------------------------------------
+    if (SearchStartWorldSeconds < 0.0)
+    {
+        SearchStartWorldSeconds = World->GetTimeSeconds();
+    }
+
+
+    // --------------------------------------------------------
     // Step 1: find the StarSystem (if not already cached).
     // --------------------------------------------------------
     if (!StarSystem.IsValid())
     {
-        for (TActorIterator<AStarSystem> It(GetWorld()); It; ++It)
+        for (TActorIterator<AStarSystem> It(World); It; ++It)
         {
             StarSystem = *It;
             break;
@@ -89,12 +114,12 @@ void AAndromedaAtmosphereRegistry::SyncAtmospheres()
 
     if (!StarSystem.IsValid())
     {
-        ++FindRetryCount;
+        CheckSearchWindowExpired(World);
         return;
     }
 
 
-    bStarSystemFound = true;
+    // NOTE: bStarSystemFound is latched only in Step 2, once the planets are available.
 
 
     // --------------------------------------------------------
@@ -106,8 +131,17 @@ void AAndromedaAtmosphereRegistry::SyncAtmospheres()
 
     if (Planets.Num() <= 0)
     {
+        // The StarSystem actor exists but has not generated its planets yet
+        // (its BeginPlay/SpawnPlanets may run AFTER this registry's BeginPlay).
+        // Do NOT latch bStarSystemFound here: keep retrying from Tick until
+        // the search time window expires (no blocking waits).
+        CheckSearchWindowExpired(World);
         return;
     }
+
+
+    // StarSystem found AND planets are available: latch and register.
+    bStarSystemFound = true;
 
 
     // --------------------------------------------------------
@@ -151,5 +185,33 @@ void AAndromedaAtmosphereRegistry::SyncAtmospheres()
             );
             break;
         }
+    }
+}
+
+
+// =========================================================
+// SEARCH WINDOW
+// =========================================================
+
+void AAndromedaAtmosphereRegistry::CheckSearchWindowExpired(UWorld* World)
+{
+    if (bSearchWindowExpired)
+    {
+        return;
+    }
+
+
+    if ((World->GetTimeSeconds() - SearchStartWorldSeconds) >= StarSystemSearchTimeoutSeconds)
+    {
+        bSearchWindowExpired = true;
+
+
+        // Logged once: the registry gave up within the time window.
+        UE_LOG(
+            LogAndromedaAtmos,
+            Warning,
+            TEXT("AAndromedaAtmosphereRegistry: StarSystem sync timed out after %.1f s (no planets available)."),
+            StarSystemSearchTimeoutSeconds
+        );
     }
 }

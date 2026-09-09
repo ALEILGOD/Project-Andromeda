@@ -2,22 +2,20 @@
 // ANDROMEDA ATMOSPHERE SYSTEM
 // =========================================================
 //
-// ATMOS-03 - Planet Atmosphere Volume:
-//     Reconstructs the view ray from the camera, intersects it with each
-//     registered atmosphere sphere (ray/sphere intersection), and produces
-//     a diagnostic visualization of the intersection result.
+// ATMOS-04 - Diagnostic Ray Marching:
+//     Reconstructs the camera ray per pixel, intersects every
+//     atmosphere sphere, marches fixed samples entry->exit and
+//     accumulates a stable normalized diagnostic density.
+
 //
 // Virtual path : /Andromeda/AndromedaAtmosphere.usf
 //                ([Project]/Shaders/Andromeda/AndromedaAtmosphere.usf)
 // Entry point  : AndromedaAtmosphereMainPS
 //                (registered in AndromedaAtmosphereRenderer.cpp)
 //
-// Output: diagnostic split view:
-//     left  half : input scene color (proves SceneColor in -> Pass -> out)
-//     right half : atmosphere volume intersection diagnostic
+// Output: fullscreen composite (scene + marched diagnostic).
 //
-// No scattering, ray marching or optical depth here.
-// Those arrive in ATMOS-04+.
+// No physical scattering here. Density is diagnostic only.
 //
 // The global variables below are bound by name to
 // FAndromedaAtmospherePS::FParameters (AndromedaAtmosphereShader.h).
@@ -57,17 +55,15 @@ int AtmosphereCount;
 StructuredBuffer<FAndromedaAtmosphereGPUData> AtmosphereBuffer;
 
 
+// ATMOS-04 CONSTANTS
+// Fixed diagnostic sample count: constant loop, no dynamic cost.
+#define ATMOS_MARCH_STEPS 16
+
+
 // =========================================================
 // RAY / SPHERE INTERSECTION
 // =========================================================
-// Returns the two hit distances (t0, t1) along the ray.
-// If the discriminant is negative (no hit), both are < 0.
-//
-//     |O + tD - C|^2 = R^2
-//     a t^2 + b t + c = 0
-//     a = dot(D,D)
-//     b = 2 * dot(O-C, D)
-//     c = dot(O-C, O-C) - R^2
+// Returns (t0, t1) with t0 <= t1. Miss (or degenerate ray): both < 0.
 
 float2 RaySphereIntersect(
     float3 RayOrigin,
@@ -98,9 +94,13 @@ float2 RaySphereIntersect(
 }
 
 
-// =========================================================
-// DIAGNOSTIC MAIN PS
-// =========================================================
+// Normalized height h: 0 surface, 1 outer limit. Density: 1 -> 0.
+float DiagnosticDensity(float DistFromCenter, float SurfaceRadius, float AtmosphereRadius)
+{
+    float Shell = max(AtmosphereRadius - SurfaceRadius, 1.0f);
+    float H = saturate((DistFromCenter - SurfaceRadius) / Shell);
+    return 1.0f - H;
+}
 
 void AndromedaAtmosphereMainPS(
     in float4 SvPosition : SV_Position,
@@ -124,7 +124,8 @@ void AndromedaAtmosphereMainPS(
     float4 WorldPos = mul(ClipPos, InvViewProjection);
     WorldPos /= max(WorldPos.w, 1e-6f);
 
-    float3 RayDir = normalize(WorldPos.xyz - CameraWorldPosition);
+    float3 RayVec = WorldPos.xyz - CameraWorldPosition;
+    float3 RayDir = RayVec / max(length(RayVec), 1e-6f);
 
     // --------------------------------------------------------
     // Sample scene color.
@@ -132,11 +133,9 @@ void AndromedaAtmosphereMainPS(
     float3 SceneColor = SceneColorTexture.Sample(SceneColorSampler, UV).rgb;
 
     // --------------------------------------------------------
-    // Iterate atmospheres: find the closest intersection.
+    // Per atmosphere: intersect, clamp [entry, exit], march, accumulate.
     // --------------------------------------------------------
-    float ClosestT = 1e20f;
-    int ClosestAtmosphere = -1;
-    bool bHitSurface = false;
+    float3 AccumulatedDiag = float3(0.0f, 0.0f, 0.0f);
 
     for (int i = 0; i < AtmosphereCount; ++i)
     {
@@ -146,13 +145,7 @@ void AndromedaAtmosphereMainPS(
         float SurfaceRadius = Atm.SurfaceRadius;
         float AtmRadius = Atm.AtmosphereRadius;
 
-        // Intersect the atmosphere sphere.
-        float2 TAtm = RaySphereIntersect(
-            CameraWorldPosition,
-            RayDir,
-            AtmCenter,
-            AtmRadius
-        );
+        float2 TAtm = RaySphereIntersect(CameraWorldPosition, RayDir, AtmCenter, AtmRadius);
 
         if (TAtm.x < 0.0f && TAtm.y < 0.0f)
         {
@@ -164,67 +157,62 @@ void AndromedaAtmosphereMainPS(
         // If the camera is inside the atmosphere, TAtm.x < 0 and TAtm.y > 0:
         // we treat the camera position as the entry point (t = 0).
         float EntryT = (TAtm.x >= 0.0f) ? TAtm.x : 0.0f;
+        float ExitT = TAtm.y;
 
-        if (EntryT < ClosestT)
+        // Clamp march interval at the planet surface (no march behind it).
+        float2 TSurf = RaySphereIntersect(CameraWorldPosition, RayDir, AtmCenter, SurfaceRadius);
+        if (TSurf.x >= 0.0f)
         {
-            ClosestT = EntryT;
-            ClosestAtmosphere = i;
-
-            // Check if the ray also hits the surface sphere.
-            float2 TSurf = RaySphereIntersect(
-                CameraWorldPosition,
-                RayDir,
-                AtmCenter,
-                SurfaceRadius
-            );
-
-            bHitSurface = (TSurf.x >= 0.0f) || (TSurf.y >= 0.0f);
+            ExitT = min(ExitT, TSurf.x);
         }
+        else if (TSurf.y >= 0.0f && TAtm.x < 0.0f)
+        {
+            continue;
+        }
+
+        if (!(ExitT > EntryT))
+        {
+            continue;
+        }
+
+        float MarchLen = ExitT - EntryT;
+        if (!(MarchLen > 0.0f) || !(MarchLen < 1e10f))
+        {
+            continue;
+        }
+
+        // Fixed-step march between entry and exit.
+        float StepLen = MarchLen / (float)ATMOS_MARCH_STEPS;
+        float DensitySum = 0.0f;
+
+        for (int s = 0; s < ATMOS_MARCH_STEPS; ++s)
+        {
+            float T = EntryT + StepLen * ((float)s + 0.5f);
+            float3 SamplePos = CameraWorldPosition + RayDir * T;
+            float DistFromCenter = length(SamplePos - AtmCenter);
+            DensitySum += DiagnosticDensity(DistFromCenter, SurfaceRadius, AtmRadius);
+        }
+
+        // Average density in [0,1] times the normalized chord thickness:
+        // rays through the limb cross less volume than central rays, so the
+        // diagnostic shows a coherent falloff toward the atmosphere edge.
+        float AvgDensity = DensitySum / (float)ATMOS_MARCH_STEPS;
+        float ChordFactor = saturate(MarchLen / max(AtmRadius, 1.0f));
+        float MarchIntensity = saturate(AvgDensity * ChordFactor);
+
+        // Diagnostic ramp: deep blue -> cyan, brightness proportional to
+        // the marched volume. Slight per-atmosphere tint so N atmospheres
+        // remain distinguishable without hardcoding planet 0.
+        float AtmPhase = (float)i * 0.37f;
+        float3 TintA = float3(0.04f, 0.22f, 0.55f);
+        float3 TintB = float3(0.15f, 0.75f, 1.00f);
+        float3 MarchColor = lerp(TintA, TintB, saturate(AvgDensity + AtmPhase * 0.15f));
+
+        AccumulatedDiag += MarchColor * MarchIntensity;
     }
 
-    // --------------------------------------------------------
-    // Diagnostic output.
-    // --------------------------------------------------------
-    float3 Diagnostic;
-
-    if (ClosestAtmosphere >= 0)
-    {
-        if (bHitSurface)
-        {
-            // The ray passes through the atmosphere shell and hits the
-            // planet surface: bright warm color.
-            Diagnostic = float3(0.45f, 0.18f, 0.05f);
-        }
-        else
-        {
-            // The ray enters the atmosphere shell but exits without
-            // hitting the planet surface: faint glow.
-            Diagnostic = float3(0.22f, 0.10f, 0.02f);
-        }
-    }
-    else
-    {
-        // No atmosphere hit: keep the original scene color.
-        Diagnostic = SceneColor;
-    }
-
-    // --------------------------------------------------------
-    // Split view: left = scene color, right = diagnostic.
-    // --------------------------------------------------------
-    float3 Output = (UV.x < 0.5f) ? SceneColor : Diagnostic;
-
-    // Thin white border: confirms full-viewport coverage.
-    float Border = (
-        UV.x < 0.004f || UV.x > 0.996f
-        || UV.y < 0.004f || UV.y > 0.996f
-    ) ? 1.0f : 0.0f;
-
-    Output = lerp(Output, float3(1.0f, 1.0f, 1.0f), Border);
-
-    // Center divider: separates the two halves.
-    float Divider = (abs(UV.x - 0.5f) < 0.002f) ? 1.0f : 0.0f;
-    Output = lerp(Output, float3(1.0f, 1.0f, 1.0f), Divider * 0.5f);
-
-    OutColor = float4(Output, 1.0f);
+    // Fullscreen additive composite over the scene color.
+    // Intensity > 0 proves entry->samples->exit really marched.
+    OutColor = float4(SceneColor + AccumulatedDiag, 1.0f);
 }
 

@@ -213,7 +213,7 @@ void FAndromedaAtmosphereRenderer::BuildGPUData(
 
 
 // =========================================================
-// RENDERING (ATMOS-03)
+// RENDERING (ATMOS-04: camera-relative stable ray march, 16 steps)
 // =========================================================
 
 FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
@@ -267,7 +267,7 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
 
     // Output: the chain-provided override (back buffer) when this is the
     // last pass, otherwise a dedicated RDG texture. This keeps the
-    // SceneColor -> Atmosphere pass -> output structure for ATMOS-03+.
+    // SceneColor -> Atmosphere pass -> output structure for ATMOS-04+.
     FScreenPassRenderTarget Output;
     ERenderTargetLoadAction OutputLoadAction = ERenderTargetLoadAction::ELoad;
 
@@ -313,44 +313,46 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
     // --------------------------------------------------------
     PassParameters->AtmosphereCount = AtmosphereCount;
 
+    // The shader parameter is a required RDG SRV: it must ALWAYS be bound to a
+    // valid buffer, even when no atmospheres are registered (ATMOS-03).
+    // The shader only reads AtmosphereBuffer when AtmosphereCount > 0, so with
+    // 0 atmospheres the SRV is bound to a 1-element dummy buffer (never read).
+    const uint32 NumElements = FMath::Max(1u, (uint32)GPUData.Num());
 
-    if (AtmosphereCount > 0)
-    {
-        const uint32 ElementBytes = sizeof(FAndromedaAtmosphereGPUData);
-        const uint32 NumElements = (uint32)GPUData.Num();
-
-
-        FRDGBufferDesc BufferDesc = FRDGBufferDesc::CreateStructuredDesc(
-            ElementBytes,
-            NumElements
-        );
-
-
-        FRDGBufferRef AtmosphereBuffer = GraphBuilder.CreateBuffer(
-            BufferDesc,
-            TEXT("AndromedaAtmosphereBuffer"),
-            ERDGBufferFlags::None
-        );
+    FRDGBufferDesc BufferDesc = FRDGBufferDesc::CreateStructuredDesc(
+        sizeof(FAndromedaAtmosphereGPUData),
+        NumElements
+    );
 
 
-        GraphBuilder.QueueBufferUpload(
-            AtmosphereBuffer,
-            GPUData.GetData(),
-            (uint64)(GPUData.Num() * sizeof(FAndromedaAtmosphereGPUData)),
-            ERDGInitialDataFlags::None
-        );
+    FRDGBufferRef AtmosphereBuffer = GraphBuilder.CreateBuffer(
+        BufferDesc,
+        TEXT("AndromedaAtmosphereBuffer"),
+        ERDGBufferFlags::None
+    );
 
 
-        PassParameters->AtmosphereBuffer = GraphBuilder.CreateSRV(
-            AtmosphereBuffer,
-            PF_R32_UINT
-        );
-    }
-    else
-    {
-        // No atmospheres: leave the SRV null. The shader checks AtmosphereCount == 0.
-        PassParameters->AtmosphereBuffer = nullptr;
-    }
+    // Zero-initialized dummy element used when no atmospheres are registered.
+    const FAndromedaAtmosphereGPUData DummyAtmosphere = {};
+    const FAndromedaAtmosphereGPUData* UploadData =
+        (GPUData.Num() > 0) ? GPUData.GetData() : &DummyAtmosphere;
+    const uint64 UploadBytes = (GPUData.Num() > 0)
+        ? (uint64)(GPUData.Num() * sizeof(FAndromedaAtmosphereGPUData))
+        : (uint64)sizeof(FAndromedaAtmosphereGPUData);
+
+    GraphBuilder.QueueBufferUpload(
+        AtmosphereBuffer,
+        UploadData,
+        UploadBytes,
+        ERDGInitialDataFlags::None
+    );
+
+
+    // Structured-buffer SRV matching StructuredBuffer<FAndromedaAtmosphereGPUData>
+    // declared in AndromedaAtmosphere.usf (element stride = sizeof(FAndromedaAtmosphereGPUData)).
+    PassParameters->AtmosphereBuffer = GraphBuilder.CreateSRV(
+        FRDGBufferSRVDesc(AtmosphereBuffer)
+    );
 
 
     // --------------------------------------------------------
@@ -391,7 +393,7 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
         UE_LOG(
             LogAndromedaAtmos,
             Log,
-            TEXT("[ATMOS-03] First real RDG dispatch of FAndromedaAtmospherePS: atmosphere volume diagnostic pass is live on the GPU. Atmospheres: %d"),
+            TEXT("[ATMOS-04] First real RDG dispatch of FAndromedaAtmospherePS: atmosphere ray-march diagnostic pass is live on the GPU. Atmospheres: %d"),
             AtmosphereCount
         );
     }

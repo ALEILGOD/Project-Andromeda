@@ -26,4 +26,13 @@ class ANDROMEDA_API AAndromedaGameMode : public AGameModeBase
 public:
 
     AAndromedaGameMode(const FObjectInitializer& ObjectInitializer);
+
+
+protected:
+
+    // Automatically spawns an AAndromedaAtmosphereRegistry if the world does
+    // not contain one yet (ATMOS-03). The registry connects the StarSystem
+    // planets to the atmosphere manager and keeps atmosphere positions in
+    // sync every frame.
+    virtual void BeginPlay() override;
 };

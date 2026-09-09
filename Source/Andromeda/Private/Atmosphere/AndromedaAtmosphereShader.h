@@ -3,6 +3,8 @@
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
 #include "RenderGraphUtils.h"
+#include "RenderGraphResources.h"
+#include "RenderGraphFwd.h"
 #include "Atmosphere/AndromedaAtmosphereTypes.h"
 
 
@@ -10,9 +12,9 @@
 // ANDROMEDA ATMOSPHERE GLOBAL SHADER
 // =========================================================
 
-// ATMOS-03: fullscreen diagnostic pixel shader that reconstructs the view ray,
-// intersects it with each registered atmosphere sphere (ray/sphere intersection),
-// and produces a diagnostic visualization of the intersection result.
+// ATMOS-04: fullscreen diagnostic pixel shader that reconstructs the camera
+// world-space ray per pixel, intersects every atmosphere sphere,
+// marches fixed samples entry->exit and accumulates diagnostic density.
 //
 // Source file : /Andromeda/AndromedaAtmosphere.usf
 //               ([Project]/Shaders/Andromeda/AndromedaAtmosphere.usf)
@@ -45,7 +47,7 @@ public:
 
         // Atmosphere data
         SHADER_PARAMETER(int32, AtmosphereCount)
-        FRDGBufferSRVRef AtmosphereBuffer;
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FAndromedaAtmosphereGPUData>, AtmosphereBuffer)
 
         // Scene color
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
