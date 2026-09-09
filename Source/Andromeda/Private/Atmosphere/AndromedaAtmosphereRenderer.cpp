@@ -239,10 +239,38 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
 
 
     // --------------------------------------------------------
-    // Step 2: convert CPU snapshot -> packed GPU data.
+    // Step 2: convert CPU snapshot -> packed GPU data, camera-relative.
+    // RelCenter = Center - Camera is subtracted in double (FVector) and
+    // only the small relative result is converted to float. In exact
+    // arithmetic identical to uploading the absolute center, since the
+    // shader ray origin is 0 (see .usf): (P - Camera) is translation
+    // invariant. Radii are translation-invariant scalars, unchanged.
     // --------------------------------------------------------
+    const FVector ViewOrigin = View.ViewMatrices.GetViewOrigin();
+
     TArray<FAndromedaAtmosphereGPUData> GPUData;
-    BuildGPUData(AtmosphereSnapshot, GPUData);
+    GPUData.Reset(AtmosphereSnapshot.Num());
+
+    for (const FAndromedaAtmosphereInstance& Instance : AtmosphereSnapshot)
+    {
+        FAndromedaAtmosphereGPUData RelGPUData;
+
+        const FVector RelCenter = Instance.WorldPosition - ViewOrigin;
+
+        RelGPUData.CenterX = (float)RelCenter.X;
+        RelGPUData.CenterY = (float)RelCenter.Y;
+        RelGPUData.CenterZ = (float)RelCenter.Z;
+        RelGPUData.SurfaceRadius = Instance.Parameters.SurfaceRadius;
+
+
+        RelGPUData.AtmosphereRadius = Instance.Parameters.AtmosphereRadius;
+        RelGPUData.Pad0 = 0.0f;
+        RelGPUData.Pad1 = 0.0f;
+        RelGPUData.Pad2 = 0.0f;
+
+
+        GPUData.Add(RelGPUData);
+    }
 
 
     const FScreenPassTextureSlice SceneColorSlice = Inputs.GetInput(EPostProcessMaterialInput::SceneColor);
@@ -356,16 +384,40 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
 
 
     // --------------------------------------------------------
-    // Step 4: camera data for view-ray reconstruction.
+    // Step 4: camera data. Numerator precomputation in double precision.
+    //
+    // Baseline direction: normalize(P - Cam), P = P_h.xyz / W.
+    // Identity: P - Cam = (P_h.xyz - Cam*W) / W = Num / W, with
+    //   P_h.xyz = clip.x*R0 + clip.y*R1 + clip.z*R2 + clip.w*Row3,
+    //   W       = clip.x*W0 + clip.y*W1 + clip.z*W2 + clip.w*W3.
+    // Hence Num = clip.x*(R0 - Cam*W0) + clip.y*(R1 - Cam*W1)
+    //           + clip.z*(R2 - Cam*W2) + clip.w*(Row3 - Cam*W3).
+    //
+    // Each bracket is clip-INDEPENDENT: computed here in double from the
+    // FMatrix (double) and ViewOrigin (double), then uploaded as float.
+    // The GPU combines the small relative rows and divides once by W
+    // (see .usf). Translation is folded in exactly, never zeroed; the
+    // w-column (W0..W3) is passed through untouched so W is identical
+    // to the baseline's P_h.w. CameraWorldPosition stays bound (required
+    // RDG parameter) for compatibility; the math no longer subtracts it.
     // --------------------------------------------------------
+    const FMatrix& ClipToWorldD = View.ViewMatrices.GetClipToWorld();
+    const FVector& ViewOriginD = View.ViewMatrices.GetViewOrigin();
+
+    FMatrix44f RelClipToWorld;
+    for (int32 Row = 0; Row < 4; ++Row)
+    {
+        const double Wd = ClipToWorldD.M[Row][3];
+        RelClipToWorld.M[Row][0] = (float)(ClipToWorldD.M[Row][0] - ViewOriginD.X * Wd);
+        RelClipToWorld.M[Row][1] = (float)(ClipToWorldD.M[Row][1] - ViewOriginD.Y * Wd);
+        RelClipToWorld.M[Row][2] = (float)(ClipToWorldD.M[Row][2] - ViewOriginD.Z * Wd);
+        RelClipToWorld.M[Row][3] = (float)Wd;
+    }
+
     PassParameters->CameraWorldPosition = FVector3f(
         View.ViewMatrices.GetViewOrigin()
     );
-
-
-    PassParameters->InvViewProjection = FMatrix44f(
-        View.ViewMatrices.GetClipToWorld()
-    );
+    PassParameters->InvViewProjection = RelClipToWorld;
 
 
     TShaderMapRef<FAndromedaAtmospherePS> PixelShader(GlobalShaderMap);

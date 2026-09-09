@@ -63,7 +63,10 @@ StructuredBuffer<FAndromedaAtmosphereGPUData> AtmosphereBuffer;
 // =========================================================
 // RAY / SPHERE INTERSECTION
 // =========================================================
-// Returns (t0, t1) with t0 <= t1. Miss (or degenerate ray): both < 0.
+// Same roots as |O + tD - C|^2 = R^2 with V = C - O:
+//   t = dot(V,D) +/- sqrt(dot(V,D)^2 - (|V|^2 - R^2)), t0 <= t1.
+// Miss: both < 0. Bn/Cn divide once by R (unit-sphere form) so the
+// discriminant is O(1) instead of O(d^2). Identical t in exact arithmetic.
 
 float2 RaySphereIntersect(
     float3 RayOrigin,
@@ -72,13 +75,25 @@ float2 RaySphereIntersect(
     float SphereRadius
 )
 {
-    float3 OC = RayOrigin - SphereCenter;
+    // Exact-same-roots stabilization: solve with V = C - O so that
+    //   t = dot(V,D) +/- sqrt(dot(V,D)^2 - (|V|^2 - R^2)),
+    // then normalize ONCE by R (unit-sphere form). The discriminant is
+    // O(1) instead of O(d^2); dropout branch unchanged (t0 <= t1).
+    if (!(SphereRadius > 0.0f))
+    {
+        return float2(-1.0f, -1.0f);
+    }
 
-    float A = dot(RayDir, RayDir);
-    float B = 2.0f * dot(OC, RayDir);
-    float C = dot(OC, OC) - SphereRadius * SphereRadius;
+    float3 V = SphereCenter - RayOrigin;
+    float B = dot(V, RayDir);
+    float C = dot(V, V) - SphereRadius * SphereRadius;
 
-    float Discriminant = B * B - 4.0f * A * C;
+    // Single normalization AFTER the dot products: B/R, C/R^2.
+    float InvR = 1.0f / SphereRadius;
+    float Bn = B * InvR;
+    float Cn = C * (InvR * InvR);
+
+    float Discriminant = Bn * Bn - Cn;
 
     if (Discriminant < 0.0f)
     {
@@ -86,9 +101,8 @@ float2 RaySphereIntersect(
     }
 
     float SqrtD = sqrt(Discriminant);
-    float Inv2A = 1.0f / (2.0f * A);
-    float T0 = (-B - SqrtD) * Inv2A;
-    float T1 = (-B + SqrtD) * Inv2A;
+    float T0 = (Bn - SqrtD) * SphereRadius;
+    float T1 = (Bn + SqrtD) * SphereRadius;
 
     return float2(T0, T1);
 }
@@ -111,8 +125,23 @@ void AndromedaAtmosphereMainPS(
     float2 UV = SvPosition.xy / max(float2(ViewportSize), float2(1.0f, 1.0f));
 
     // --------------------------------------------------------
-    // Reconstruct the view ray for this pixel.
-    // Clip space: x in [-1,1] (left->right), y in [1,-1] (top->bottom, UE flip).
+    // Ray reconstruction: EXACT baseline direction, camera-relative form.
+    //
+    // Baseline (correct visuals, float-unstable at distance):
+    //   P_h = mul(Clip, M);  P = P_h.xyz / P_h.w;
+    //   RayVec = P - Cam;    RayDir = normalize(RayVec).
+    //
+    // Identity (exact arithmetic, W = P_h.w):
+    //   P - Cam = (P_h.xyz - Cam * W) / W = Num / W.
+    // normalize() is invariant to the positive scale 1/W (W > 0 enforced
+    // below), so normalize(P - Cam) == normalize(Num).
+    //
+    // Num is the ONLY large-large subtraction. It arrives here already
+    // distributed per-row from the CPU in double precision (see Renderer
+    // Step 4: each uploaded row stores Ri - Cam*Wi). The GPU only
+    // combines small camera-relative rows and divides once by W.
+    // Translation is folded in exactly, never zeroed. No W == 1
+    // assumption, no dropped perspective divide, no normalize(clip*R).
     // --------------------------------------------------------
     float4 ClipPos = float4(
         UV.x * 2.0f - 1.0f,
@@ -121,11 +150,44 @@ void AndromedaAtmosphereMainPS(
         1.0f
     );
 
-    float4 WorldPos = mul(ClipPos, InvViewProjection);
-    WorldPos /= max(WorldPos.w, 1e-6f);
+    // Full rows of the uploaded matrix: xyz are camera-relative
+    // (Ri - Cam*Wi, precomputed in double on CPU), w-column untouched.
+    float3 Row0 = float3(InvViewProjection[0][0], InvViewProjection[0][1], InvViewProjection[0][2]);
+    float3 Row1 = float3(InvViewProjection[1][0], InvViewProjection[1][1], InvViewProjection[1][2]);
+    float3 Row2 = float3(InvViewProjection[2][0], InvViewProjection[2][1], InvViewProjection[2][2]);
+    float3 Row3 = float3(InvViewProjection[3][0], InvViewProjection[3][1], InvViewProjection[3][2]);
+    float W0 = InvViewProjection[0][3];
+    float W1 = InvViewProjection[1][3];
+    float W2 = InvViewProjection[2][3];
+    float W3 = InvViewProjection[3][3];
 
-    float3 RayVec = WorldPos.xyz - CameraWorldPosition;
-    float3 RayDir = RayVec / max(length(RayVec), 1e-6f);
+    // Homogeneous w of P_h (identical to the baseline's P_h.w).
+    float W = ClipPos.x * W0 + ClipPos.y * W1 + ClipPos.z * W2 + ClipPos.w * W3;
+    if (!(W > 1e-6f) || !isfinite(W))
+    {
+        OutColor = float4(SceneColorTexture.Sample(SceneColorSampler, UV).rgb, 1.0f);
+        return;
+    }
+
+    // Num = P_h.xyz - Cam*W, assembled from small relative rows.
+    // Identical to the baseline numerator in exact arithmetic; the only
+    // large-large subtraction happened in double on the CPU.
+    float3 Num = ClipPos.x * Row0 + ClipPos.y * Row1
+        + ClipPos.z * Row2 + ClipPos.w * Row3;
+    // Same perspective divide as the baseline (W > 0 enforced above).
+    float3 RayVec = Num / W;
+    float RayLen = length(RayVec);
+    if (!(RayLen > 0.0f) || !isfinite(RayLen) || !isfinite(dot(RayVec, float3(1.0f, 1.0f, 1.0f))))
+    {
+        OutColor = float4(SceneColorTexture.Sample(SceneColorSampler, UV).rgb, 1.0f);
+        return;
+    }
+    float3 RayDir = RayVec / RayLen;
+
+    // Camera-relative frame: the CPU uploads RelCenter = Center - Camera
+    // (subtracted in double) into CenterX/Y/Z (see Renderer). The shader
+    // ray origin is therefore exactly 0; no world positions remain.
+    float3 RayOrigin = float3(0.0f, 0.0f, 0.0f);
 
     // --------------------------------------------------------
     // Sample scene color.
@@ -141,11 +203,12 @@ void AndromedaAtmosphereMainPS(
     {
         FAndromedaAtmosphereGPUData Atm = AtmosphereBuffer[i];
 
-        float3 AtmCenter = float3(Atm.CenterX, Atm.CenterY, Atm.CenterZ);
+        // RelCenter (center - camera, CPU double) is uploaded in CenterX/Y/Z.
+        float3 RelCenter = float3(Atm.CenterX, Atm.CenterY, Atm.CenterZ);
         float SurfaceRadius = Atm.SurfaceRadius;
         float AtmRadius = Atm.AtmosphereRadius;
 
-        float2 TAtm = RaySphereIntersect(CameraWorldPosition, RayDir, AtmCenter, AtmRadius);
+        float2 TAtm = RaySphereIntersect(RayOrigin, RayDir, RelCenter, AtmRadius);
 
         if (TAtm.x < 0.0f && TAtm.y < 0.0f)
         {
@@ -160,7 +223,7 @@ void AndromedaAtmosphereMainPS(
         float ExitT = TAtm.y;
 
         // Clamp march interval at the planet surface (no march behind it).
-        float2 TSurf = RaySphereIntersect(CameraWorldPosition, RayDir, AtmCenter, SurfaceRadius);
+        float2 TSurf = RaySphereIntersect(RayOrigin, RayDir, RelCenter, SurfaceRadius);
         if (TSurf.x >= 0.0f)
         {
             ExitT = min(ExitT, TSurf.x);
@@ -188,8 +251,11 @@ void AndromedaAtmosphereMainPS(
         for (int s = 0; s < ATMOS_MARCH_STEPS; ++s)
         {
             float T = EntryT + StepLen * ((float)s + 0.5f);
-            float3 SamplePos = CameraWorldPosition + RayDir * T;
-            float DistFromCenter = length(SamplePos - AtmCenter);
+            // Camera-relative sample: (O + D*T) - C with O = 0 gives
+            // D*T - RelCenter. Same distance as the original
+            // length((Camera + D*T) - Center) in exact arithmetic, with
+            // no large-near-equal subtraction.
+            float DistFromCenter = length(RayDir * T - RelCenter);
             DensitySum += DiagnosticDensity(DistFromCenter, SurfaceRadius, AtmRadius);
         }
 
