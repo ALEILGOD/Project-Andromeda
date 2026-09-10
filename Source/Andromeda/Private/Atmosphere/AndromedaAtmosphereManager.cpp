@@ -228,3 +228,10 @@ int32 FAndromedaAtmosphereManager::Clear()
 
     return RemovedCount;
 }
+
+
+FVector FAndromedaAtmosphereManager::GetStarWorldPosition() const
+{
+    FScopeLock ScopeLock(&RegistryLock);
+    return StarWorldPosition;
+}

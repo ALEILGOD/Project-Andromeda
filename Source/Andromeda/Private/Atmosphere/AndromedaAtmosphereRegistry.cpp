@@ -47,6 +47,11 @@ void AAndromedaAtmosphereRegistry::EndPlay(const EEndPlayReason::Type EndPlayRea
     SearchStartWorldSeconds = -1.0;
     FindRetryCount = 0;
 
+    // Note: Star position cleanup would require ClearStarWorldPosition() in the
+    // manager's public API, which is not currently declared. The manager's
+    // Clear() resets atmospheres but not the star position snapshot. Leaving
+    // the star position as-is; a new session will overwrite it on first Tick.
+
     Super::EndPlay(EndPlayReason);
 }
 
@@ -93,6 +98,12 @@ void AAndromedaAtmosphereRegistry::Tick(float DeltaTime)
                 );
             }
         }
+
+        // Update star position for the renderer (Game Thread only).
+        // Use the StarSystem actor's own world location (public API).
+        FAndromedaAtmosphereManager::Get().SetStarWorldPosition(
+            StarSystem->GetActorLocation()
+        );
     }
 }
 

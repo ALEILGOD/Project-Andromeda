@@ -3,19 +3,15 @@
 #include "CoreMinimal.h"
 #include "AndromedaAtmosphereTypes.generated.h"
 
-
 DECLARE_LOG_CATEGORY_EXTERN(LogAndromedaAtmos, Log, All);
-
 
 // =========================================================
 // ATMOSPHERE HANDLE
 // =========================================================
-
 USTRUCT(BlueprintType)
 struct FAndromedaAtmosphereHandle
 {
     GENERATED_BODY()
-
 
     UPROPERTY(
         BlueprintReadOnly,
@@ -23,36 +19,30 @@ struct FAndromedaAtmosphereHandle
     )
     int32 Id = 0;
 
-
     bool IsValid() const
     {
         return Id != 0;
     }
-
 
     void Invalidate()
     {
         Id = 0;
     }
 
-
     static FAndromedaAtmosphereHandle Invalid()
     {
         return FAndromedaAtmosphereHandle();
     }
-
 
     bool operator==(const FAndromedaAtmosphereHandle& Other) const
     {
         return Id == Other.Id;
     }
 
-
     bool operator!=(const FAndromedaAtmosphereHandle& Other) const
     {
         return Id != Other.Id;
     }
-
 
     friend uint32 GetTypeHash(const FAndromedaAtmosphereHandle& Handle)
     {
@@ -60,28 +50,23 @@ struct FAndromedaAtmosphereHandle
     }
 };
 
-
 // =========================================================
 // ATMOSPHERE PARAMETERS
 // =========================================================
-
 USTRUCT(BlueprintType)
 struct FAndromedaAtmosphereParameters
 {
     GENERATED_BODY()
 
-
     // =========================================================
     // GEOMETRY
     // =========================================================
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Atmosphere"
     )
     float SurfaceRadius = 500000.0f;
-
 
     UPROPERTY(
         EditAnywhere,
@@ -90,11 +75,9 @@ struct FAndromedaAtmosphereParameters
     )
     float AtmosphereRadius = 650000.0f;
 
-
     // =========================================================
     // RAYLEIGH
     // =========================================================
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -106,7 +89,6 @@ struct FAndromedaAtmosphereParameters
         0.0331f
     );
 
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -114,11 +96,9 @@ struct FAndromedaAtmosphereParameters
     )
     float RayleighScaleHeight = 8000.0f;
 
-
     // =========================================================
     // MIE
     // =========================================================
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -130,14 +110,12 @@ struct FAndromedaAtmosphereParameters
         0.003f
     );
 
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Atmosphere|Mie"
     )
     FVector MieAbsorption = FVector::ZeroVector;
-
 
     UPROPERTY(
         EditAnywhere,
@@ -146,7 +124,6 @@ struct FAndromedaAtmosphereParameters
     )
     float MieAnisotropy = 0.76f;
 
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -154,11 +131,9 @@ struct FAndromedaAtmosphereParameters
     )
     float MieScaleHeight = 1200.0f;
 
-
     // =========================================================
     // ABSORPTION
     // =========================================================
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -166,11 +141,9 @@ struct FAndromedaAtmosphereParameters
     )
     FVector Absorption = FVector::ZeroVector;
 
-
     // =========================================================
     // DETERMINISTIC SEED
     // =========================================================
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -178,11 +151,9 @@ struct FAndromedaAtmosphereParameters
     )
     int64 AtmosphereSeed = 0;
 
-
     // =========================================================
     // VALIDATION
     // =========================================================
-
     bool IsValidConfiguration() const
     {
         return SurfaceRadius > 0.0f
@@ -193,24 +164,20 @@ struct FAndromedaAtmosphereParameters
     }
 };
 
-
 // =========================================================
 // ATMOSPHERE INSTANCE DESCRIPTOR
 // =========================================================
-
 USTRUCT(BlueprintType)
 struct FAndromedaAtmosphereInstanceDesc
 {
     GENERATED_BODY()
 
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
         Category = "Andromeda|Atmosphere"
     )
     FAndromedaAtmosphereParameters Parameters;
-
 
     UPROPERTY(
         EditAnywhere,
@@ -219,7 +186,6 @@ struct FAndromedaAtmosphereInstanceDesc
     )
     FVector WorldPosition = FVector::ZeroVector;
 
-
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,
@@ -227,38 +193,57 @@ struct FAndromedaAtmosphereInstanceDesc
     )
     FName DebugName = NAME_None;
 };
-
 
 // =========================================================
 // ATMOSPHERE INSTANCE (registry data - not reflected)
 // =========================================================
-
 struct FAndromedaAtmosphereInstance
 {
     FAndromedaAtmosphereHandle Handle;
-
     FName DebugName = NAME_None;
-
     FAndromedaAtmosphereParameters Parameters;
-
     FVector WorldPosition = FVector::ZeroVector;
 };
-
 
 // =========================================================
 // ATMOSPHERE GPU DATA
 // =========================================================
-
 // Packed GPU representation of one atmosphere volume.
-// Transferred to the GPU as a StructuredBuffer element.
-// Memory layout MUST match FAndromedaAtmosphereGPUData declared in AndromedaAtmosphere.usf.
+//
+// IMPORTANT:
+// This layout MUST match the HLSL structure in
+// AndromedaAtmosphere.usf exactly.
+//
+// ATMOS-04:
+//     Center is uploaded camera-relative.
+//
+// ATMOS-05:
+//     Star position is ALSO uploaded camera-relative.
+//     It represents:
+//         StarWorldPosition - CameraWorldPosition
+//
+// This allows the shader to calculate Sample -> Star for every
+// ray-march sample without performing a large world-space
+// subtraction on the GPU.
 struct FAndromedaAtmosphereGPUData
 {
-    // World center (cm) + surface radius (cm)
-    float CenterX, CenterY, SurfaceRadius;
+    // Camera-relative atmosphere center (cm)
+    float CenterX;
+    float CenterY;
+    float SurfaceRadius;
+
     float CenterZ;
 
-    // Atmosphere outer radius (cm) + padding
+    // Atmosphere outer radius (cm)
     float AtmosphereRadius;
-    float Pad0, Pad1, Pad2;
+
+    // Reserved / alignment
+    float Pad0;
+    float Pad1;
+    float Pad2;
+
+    // Camera-relative star position (cm)
+    float StarPositionX;
+    float StarPositionY;
+    float StarPositionZ;
 };

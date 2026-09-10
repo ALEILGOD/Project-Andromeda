@@ -3,65 +3,48 @@
 #include "CoreMinimal.h"
 #include "Atmosphere/AndromedaAtmosphereTypes.h"
 
-
 class FRDGBuilder;
 class FSceneView;
 class UWorld;
 struct FScreenPassTexture;
 struct FPostProcessMaterialInputs;
 
-
 // =========================================================
 // ANDROMEDA ATMOSPHERE RENDERER
 // =========================================================
-
 class ANDROMEDA_API FAndromedaAtmosphereRenderer
 {
-
-
 public:
 
     // =========================================================
     // LIFECYCLE
     // =========================================================
-
     static void Initialize();
-
     static void Shutdown();
-
     static bool IsInitialized();
 
-
     // =========================================================
-    // RENDERING (ATMOS-03)
+    // RENDERING
     // =========================================================
-
     static FScreenPassTexture RenderAtmospheres(
-        FRDGBuilder& GraphBuilder,
-        const FSceneView& View,
-        const FPostProcessMaterialInputs& Inputs);
-
+    FRDGBuilder& GraphBuilder,
+    const FSceneView& View,
+    const FPostProcessMaterialInputs& Inputs);
 
     static uint64 GetDispatchCount();
-
 
     // =========================================================
     // DIAGNOSTICS
     // =========================================================
-
     static bool ValidateShaderInfrastructure();
-
 
     // =========================================================
     // GPU DATA CONVERSION
     // =========================================================
-
-    // Converts the CPU atmosphere snapshot into the packed GPU
-    // representation used by the StructuredBuffer.
     static void BuildGPUData(
         const TArray<FAndromedaAtmosphereInstance>& Snapshot,
-        TArray<FAndromedaAtmosphereGPUData>& OutGPUData);
-
+        TArray<FAndromedaAtmosphereGPUData>& OutGPUData
+    );
 
 private:
 
@@ -69,13 +52,13 @@ private:
 
     static void HandlePostEngineInit();
 
-    // ATMOS-LIFETIME: world teardown hook (FWorldDelegates::OnWorldCleanup).
-    // Clears the atmosphere manager when a world is cleaned up (PIE stop, ...)
-    // so no atmosphere instance outlives its world session.
+    // ATMOS-LIFETIME:
+    // world teardown hook.
     static void HandleWorldCleanup(
         UWorld* InWorld,
         bool bSessionEnded,
-        bool bCleanupResources);
+        bool bCleanupResources
+    );
 
     static FDelegateHandle PostEngineInitDelegateHandle;
 

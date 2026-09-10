@@ -45,6 +45,19 @@ public:
 
 
     // =========================================================
+    // STAR POSITION SNAPSHOT (Game Thread -> Render Thread)
+    // =========================================================
+
+    bool SetStarWorldPosition(const FVector& WorldPosition)
+    {
+        FScopeLock ScopeLock(&RegistryLock);
+        StarWorldPosition = WorldPosition;
+        return true;
+    }
+    FVector GetStarWorldPosition() const;
+
+
+    // =========================================================
     // QUERIES
     // =========================================================
 
@@ -77,4 +90,7 @@ private:
     TMap<uint32, FAndromedaAtmosphereInstance> Atmospheres;
 
     uint32 NextHandleId = 1;
+
+    // Star position snapshot written on the Game Thread.
+    FVector StarWorldPosition = FVector::ZeroVector;
 };

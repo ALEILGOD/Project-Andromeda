@@ -4,7 +4,6 @@
 #include "Atmosphere/AndromedaAtmosphereTypes.h"
 #include "SceneViewExtension.h"
 
-
 // =========================================================
 // SCENE VIEW EXTENSION
 // =========================================================
@@ -12,20 +11,16 @@
 namespace
 {
     // Public UE 5.8 rendering hook: subscribes the Andromeda atmosphere
-    // pass to the post-processing chain. Runs on the render thread with
-    // the frame FRDGBuilder; no UObject access involved.
+    // pass to the post-processing chain.
     class FAndromedaAtmosphereSceneViewExtension
         : public FSceneViewExtensionBase
     {
-
-
     public:
-
-        FAndromedaAtmosphereSceneViewExtension(const FAutoRegister& AutoRegister)
+        FAndromedaAtmosphereSceneViewExtension(
+            const FAutoRegister& AutoRegister)
             : FSceneViewExtensionBase(AutoRegister)
         {
         }
-
 
         virtual void SubscribeToPostProcessingPass(
             ISceneViewExtension::EPostProcessingPass Pass,
@@ -34,9 +29,16 @@ namespace
             bool bIsPassEnabled) override
         {
             // After the tonemapper the scene color is final: ideal hook point
-            // for the ATMOS-02 diagnostic pass. The delegate signature is
-            // FScreenPassTexture(FRDGBuilder&, const FSceneView&, const FPostProcessMaterialInputs&).
-            if (Pass == ISceneViewExtension::EPostProcessingPass::Tonemap && bIsPassEnabled)
+            // for the Andromeda atmosphere pass.
+            //
+            // UE 5.8 delegate signature:
+            // FScreenPassTexture(
+            //     FRDGBuilder&,
+            //     const FSceneView&,
+            //     const FPostProcessMaterialInputs&
+            // )
+
+            if (Pass == ISceneViewExtension::EPostProcessingPass::Tonemap)
             {
                 InOutPassCallbacks.Add(
                     FPostProcessingPassDelegate::CreateStatic(
@@ -47,10 +49,9 @@ namespace
         }
     };
 
-
-    TSharedPtr<FAndromedaAtmosphereSceneViewExtension, ESPMode::ThreadSafe> GViewExtension;
+    TSharedPtr<FAndromedaAtmosphereSceneViewExtension, ESPMode::ThreadSafe>
+        GViewExtension;
 }
-
 
 // =========================================================
 // REGISTRATION
@@ -63,9 +64,9 @@ void FAndromedaAtmosphereViewExtension::Register()
         return;
     }
 
-
-    GViewExtension = FSceneViewExtensions::NewExtension<FAndromedaAtmosphereSceneViewExtension>();
-
+    GViewExtension =
+        FSceneViewExtensions::NewExtension<
+            FAndromedaAtmosphereSceneViewExtension>();
 
     UE_LOG(
         LogAndromedaAtmos,
@@ -73,7 +74,6 @@ void FAndromedaAtmosphereViewExtension::Register()
         TEXT("[ATMOS-02] Scene view extension registered: atmosphere pass hooked to the post-processing chain (after tonemap).")
     );
 }
-
 
 void FAndromedaAtmosphereViewExtension::Unregister()
 {
