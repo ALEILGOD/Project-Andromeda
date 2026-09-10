@@ -62,7 +62,9 @@ public:
     int32 GetNumAtmospheres() const;
 
 
-    void Clear();
+    // Empties the registry and resets the handle id sequence.
+    // Returns the number of atmosphere instances that were removed.
+    int32 Clear();
 
 
 private:

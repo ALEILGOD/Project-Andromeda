@@ -21,6 +21,8 @@
 // FAndromedaAtmospherePS::FParameters (AndromedaAtmosphereShader.h).
 
 #include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
 
 
 // =========================================================
@@ -53,6 +55,16 @@ float4x4 InvViewProjection;
 
 int AtmosphereCount;
 StructuredBuffer<FAndromedaAtmosphereGPUData> AtmosphereBuffer;
+
+// ATMOS-04 DEPTH OCCLUSION (bound by name to FParameters).
+// SceneTexturesStruct : the current frame's scene textures uniform buffer
+//     from the post-processing pass (contains SceneDepthTexture).
+// View : the view uniform buffer (InvDeviceZToWorldZTransform
+//     is the SAME depth -> linear-distance transform the engine shaders
+//     use in Common.ush ConvertFromDeviceZ()).
+// DepthOcclusionEnabled : 0 keeps the exact ATMOS-04 behavior even when
+//     the scene textures are not available.
+int DepthOcclusionEnabled;
 
 
 // ATMOS-04 CONSTANTS
@@ -195,6 +207,34 @@ void AndromedaAtmosphereMainPS(
     float3 SceneColor = SceneColorTexture.Sample(SceneColorSampler, UV).rgb;
 
     // --------------------------------------------------------
+    // ATMOS-04 DEPTH OCCLUSION: sample the current frame's scene depth and
+    // convert the stored device-Z into linear clip-space W (distance from the
+    // camera along the view Z axis) with the SAME formula as the engine's
+    // ConvertFromDeviceZ() (Common.ush). SceneDepthDeviceZ == 1.0 means "no
+    // solid surface at this pixel" (far plane): the atmosphere stays fully
+    // visible. The conversion is well-conditioned (no large world-space
+    // subtraction), so it does not reintroduce the ATMOS-04 long-distance
+    // precision issue. All values below are O(distance) in camera-relative
+    // space and are never combined with absolute world coordinates.
+    // --------------------------------------------------------
+    float SceneDepthDeviceZ = 1.0f;
+    float SceneDepthW = 0.0f;
+    float DepthToRayScale = 0.0f;
+    if (DepthOcclusionEnabled != 0)
+    {
+        SceneDepthDeviceZ = SceneTexturesStruct.SceneDepthTexture.SampleLevel(SceneTexturesStruct.PointClampSampler, UV, 0).r;
+
+        SceneDepthW = SceneDepthDeviceZ * View.InvDeviceZToWorldZTransform[0]
+            + View.InvDeviceZToWorldZTransform[1]
+            + 1.0f / (SceneDepthDeviceZ * View.InvDeviceZToWorldZTransform[2] - View.InvDeviceZToWorldZTransform[3]);
+
+        // For every point of this pixel's ray W(t) = t * dot(RayDir, ViewZ),
+        // and at the far point (t = RayLen) W == the homogeneous W already
+        // computed above, so the per-ray scale is simply W / RayLen.
+        DepthToRayScale = W / RayLen;
+    }
+
+    // --------------------------------------------------------
     // Per atmosphere: intersect, clamp [entry, exit], march, accumulate.
     // --------------------------------------------------------
     float3 AccumulatedDiag = float3(0.0f, 0.0f, 0.0f);
@@ -214,6 +254,32 @@ void AndromedaAtmosphereMainPS(
         {
             // No intersection with this atmosphere.
             continue;
+        }
+
+        // --------------------------------------------------------
+        // ATMOS-04 DEPTH OCCLUSION gate (per atmosphere).
+        // Suppress this atmosphere where the scene's solid surface at this
+        // pixel lies IN FRONT of the atmosphere's FAR extent along this ray
+        // (both compared in clip-space W, which is monotonic along the ray).
+        // This makes solid geometry win over the diagnostic overlay: no halo
+        // crossing a planet disk (own or another planet's), atmosphere blocked
+        // behind a nearer planet, and intact visible limb/foreground wherever
+        // no geometry covers the pixel. The march below (entry/surface clamp,
+        // 16 midpoints, DiagnosticDensity, AvgDensity, ChordFactor, colour,
+        // compositing) is NOT modified: only its final contribution is gated.
+        // --------------------------------------------------------
+        float OcclusionFactor = 1.0f;
+        if (DepthOcclusionEnabled != 0
+            && SceneDepthDeviceZ > 0.0f && SceneDepthDeviceZ < 1.0f
+            && SceneDepthW > 0.0f)
+        {
+            // Clip-space W of this atmosphere's far side on this ray
+            // (t = TAtm.y, the unclamped atmosphere exit).
+            float ExitW = TAtm.y * DepthToRayScale;
+            if (ExitW > 0.0f && SceneDepthW < ExitW * (1.0f - 1e-4f))
+            {
+                OcclusionFactor = 0.0f;
+            }
         }
 
         // The entry point is the nearest non-negative t.
@@ -274,7 +340,7 @@ void AndromedaAtmosphereMainPS(
         float3 TintB = float3(0.15f, 0.75f, 1.00f);
         float3 MarchColor = lerp(TintA, TintB, saturate(AvgDensity + AtmPhase * 0.15f));
 
-        AccumulatedDiag += MarchColor * MarchIntensity;
+        AccumulatedDiag += MarchColor * MarchIntensity * OcclusionFactor;
     }
 
     // Fullscreen additive composite over the scene color.

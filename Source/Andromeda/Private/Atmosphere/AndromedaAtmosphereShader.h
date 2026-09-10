@@ -5,6 +5,8 @@
 #include "RenderGraphUtils.h"
 #include "RenderGraphResources.h"
 #include "RenderGraphFwd.h"
+#include "SceneView.h"
+#include "SceneTexturesConfig.h"
 #include "Atmosphere/AndromedaAtmosphereTypes.h"
 
 
@@ -52,6 +54,11 @@ public:
         // Scene color
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
         SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
+
+        // Scene textures (ATMOS-04 depth occlusion)
+        SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneTextureUniformParameters, SceneTexturesStruct)
+        SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+        SHADER_PARAMETER(int32, DepthOcclusionEnabled)
 
         // Output
         RENDER_TARGET_BINDING_SLOTS()

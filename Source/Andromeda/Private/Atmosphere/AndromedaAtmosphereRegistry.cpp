@@ -28,6 +28,29 @@ void AAndromedaAtmosphereRegistry::BeginPlay()
 }
 
 
+void AAndromedaAtmosphereRegistry::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    // ATMOS-LIFETIME: on world teardown (PIE stop, map unload, ...) unregister
+    // every atmosphere this registry registered, so no handle/instance outlives
+    // its world session. The renderer additionally clears the whole manager on
+    // FWorldDelegates::OnWorldCleanup as a world-wide safety net; both paths
+    // are idempotent (unregistering a missing handle is a no-op).
+    for (const FAndromedaAtmosphereHandle& Handle : AtmosphereHandles)
+    {
+        FAndromedaAtmosphereManager::Get().UnregisterAtmosphere(Handle);
+    }
+
+    AtmosphereHandles.Empty();
+    StarSystem.Reset();
+    bStarSystemFound = false;
+    bSearchWindowExpired = false;
+    SearchStartWorldSeconds = -1.0;
+    FindRetryCount = 0;
+
+    Super::EndPlay(EndPlayReason);
+}
+
+
 void AAndromedaAtmosphereRegistry::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);

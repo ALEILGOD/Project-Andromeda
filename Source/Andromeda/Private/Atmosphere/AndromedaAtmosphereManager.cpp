@@ -217,10 +217,14 @@ int32 FAndromedaAtmosphereManager::GetNumAtmospheres() const
 }
 
 
-void FAndromedaAtmosphereManager::Clear()
+int32 FAndromedaAtmosphereManager::Clear()
 {
     FScopeLock ScopeLock(&RegistryLock);
 
+    const int32 RemovedCount = Atmospheres.Num();
+
     Atmospheres.Empty();
     NextHandleId = 1;
+
+    return RemovedCount;
 }

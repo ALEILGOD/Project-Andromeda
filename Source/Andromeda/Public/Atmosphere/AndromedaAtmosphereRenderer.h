@@ -6,6 +6,7 @@
 
 class FRDGBuilder;
 class FSceneView;
+class UWorld;
 struct FScreenPassTexture;
 struct FPostProcessMaterialInputs;
 
@@ -68,7 +69,17 @@ private:
 
     static void HandlePostEngineInit();
 
+    // ATMOS-LIFETIME: world teardown hook (FWorldDelegates::OnWorldCleanup).
+    // Clears the atmosphere manager when a world is cleaned up (PIE stop, ...)
+    // so no atmosphere instance outlives its world session.
+    static void HandleWorldCleanup(
+        UWorld* InWorld,
+        bool bSessionEnded,
+        bool bCleanupResources);
+
     static FDelegateHandle PostEngineInitDelegateHandle;
+
+    static FDelegateHandle WorldCleanupDelegateHandle;
 
     static bool bInitialized;
 };
