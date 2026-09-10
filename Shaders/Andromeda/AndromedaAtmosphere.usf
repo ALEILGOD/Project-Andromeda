@@ -116,6 +116,8 @@ int DepthOcclusionEnabled;
 
 #define ATMOS_MARCH_STEPS 16
 
+#define ATMOS_LIGHT_MARCH_STEPS 8
+
 
 // =========================================================
 // RAY / SPHERE INTERSECTION
@@ -252,6 +254,119 @@ float RayleighPhase(
     float CosTheta = dot(ViewDir, LightDir);
     float CosThetaSq = CosTheta * CosTheta;
     return 1.0f + CosThetaSq;
+}
+
+
+// =========================================================
+// ATMOS-08 STAR TRANSMITTANCE
+// =========================================================
+//
+// Computes the transmittance of stellar light along the path
+// from the scattering sample to the star, through the atmosphere.
+//
+// The light ray is parameterized from the sample toward the star:
+//
+//     LightRayOrigin = SamplePos
+//     LightRayDir = SampleToStarDirection
+//
+// The ray is integrated from the sample (inside atmosphere) outward
+// to the atmosphere boundary, with planet-surface occlusion.
+//
+// All distances are in camera-relative centimeters.
+// RayleighScattering is on a km^-1 scale, so step length is
+// converted to km before multiplication.
+//
+// Returns RGB transmittance (wavelength-dependent).
+// =========================================================
+
+float3 ComputeStarTransmittance(
+    float3 SamplePos,
+    float3 SampleToStarDirection,
+    float3 RelCenter,
+    float SurfaceRadius,
+    float AtmosphereRadius,
+    float RayleighScaleHeight,
+    float3 RayleighScattering
+)
+{
+    // Light ray: STAR -> SAMPLE (sample is inside atmosphere)
+    float3 LightRayOrigin = SamplePos;
+    float3 LightRayDir = SampleToStarDirection;
+
+    // Intersect light ray with atmosphere outer boundary
+    float2 TLightAtm = RaySphereIntersect(
+        LightRayOrigin,
+        LightRayDir,
+        RelCenter,
+        AtmosphereRadius
+    );
+
+    // No atmosphere intersection on light path
+    if (TLightAtm.x < 0.0f && TLightAtm.y < 0.0f)
+    {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+
+    // Sample is inside atmosphere: entry is at 0, exit is at TLightAtm.y
+    float LightEntryT = max(TLightAtm.x, 0.0f);
+    float LightExitT = TLightAtm.y;
+
+    // Check planet surface occlusion on light path
+    float2 TLightSurf = RaySphereIntersect(
+        LightRayOrigin,
+        LightRayDir,
+        RelCenter,
+        SurfaceRadius
+    );
+
+    // Only clamp if ray genuinely penetrates planetary surface
+    // (two distinct intersections with positive interval)
+    if (TLightSurf.x >= 0.0f && TLightSurf.y > TLightSurf.x + 1e-4f)
+    {
+        LightExitT = min(LightExitT, TLightSurf.x);
+    }
+
+    // Invalid or zero-length light path
+    if (!(LightExitT > LightEntryT))
+    {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+
+    // Fixed-step integration over light path
+    const float CentimetersToKilometers = 0.00001f;
+    float LightStepLen = (LightExitT - LightEntryT) / (float)ATMOS_LIGHT_MARCH_STEPS;
+    float LightStepLenKm = LightStepLen * CentimetersToKilometers;
+
+    float3 OpticalDepth = float3(0.0f, 0.0f, 0.0f);
+
+    for (int ls = 0; ls < ATMOS_LIGHT_MARCH_STEPS; ++ls)
+    {
+        float t = LightEntryT + LightStepLen * ((float)ls + 0.5f);
+        float3 LightSamplePos = LightRayOrigin + LightRayDir * t;
+
+        float DistFromCenter = length(LightSamplePos - RelCenter);
+
+        float Density = RayleighDensity(
+            DistFromCenter,
+            SurfaceRadius,
+            AtmosphereRadius,
+            RayleighScaleHeight
+        );
+
+        // Extinction = Density * ScatteringCoefficient (per km)
+        OpticalDepth += Density * RayleighScattering * LightStepLenKm;
+    }
+
+    // Transmittance = exp(-OpticalDepth), RGB
+    float3 Transmittance = exp(-OpticalDepth);
+
+    // Numerical safety
+    if (!isfinite(Transmittance.x) || !isfinite(Transmittance.y) || !isfinite(Transmittance.z))
+    {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+
+    return Transmittance;
 }
 
 
@@ -815,6 +930,38 @@ void AndromedaAtmosphereMainPS(
                 );
 
             // =================================================
+            // ATMOS-08 STAR TRANSMITTANCE
+            // =================================================
+            //
+            // Computes the transmittance of stellar light from the
+            // star through the atmosphere to the current scattering
+            // sample. This attenuates the stellar light reaching the
+            // sample based on Rayleigh optical depth along the
+            // STAR -> SAMPLE path.
+            //
+            // Only computed if we have a valid star direction.
+            // =================================================
+
+            float3 Transmittance = float3(1.0f, 1.0f, 1.0f);
+
+            if (StarDistanceSq > 1e-8f)
+            {
+                Transmittance = ComputeStarTransmittance(
+                    SamplePos,
+                    SampleToStarDirection,
+                    RelCenter,
+                    SurfaceRadius,
+                    AtmRadius,
+                    Atm.RayleighScaleHeight,
+                    float3(
+                        Atm.RayleighScatteringX,
+                        Atm.RayleighScatteringY,
+                        Atm.RayleighScatteringZ
+                    )
+                );
+            }
+
+            // =================================================
             // ATMOS-06 RAYLEIGH SCATTERING
             // =================================================
             //
@@ -843,12 +990,13 @@ void AndromedaAtmosphereMainPS(
                 );
 
             // Local scattering contribution:
-            //   density * phase * scattering_coefficient * star_illumination
+            //   density * phase * scattering_coefficient * star_illumination * transmittance
             float3 LocalScattering =
                 BaseDensity *
                 Phase *
                 RayleighColor *
-                StarLightContribution;
+                StarLightContribution *
+                Transmittance;
 
             ScatteringSum +=
                 LocalScattering;
@@ -873,7 +1021,7 @@ void AndromedaAtmosphereMainPS(
         const float CentimetersToKilometers = 0.00001f;
         float PathLengthKm = MarchLen * CentimetersToKilometers;
 
-        const float RayleighIntensityScale = 0.35f;
+        const float RayleighIntensityScale = 0.75f;
 
         float3 MarchScattering =
             AvgScattering *
