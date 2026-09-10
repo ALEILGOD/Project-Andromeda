@@ -48,7 +48,7 @@ public:
         BlueprintReadWrite,
         Category = "Andromeda|Atmosphere"
     )
-    float AtmosphereRadiusMultiplier = 1.3f;
+    float AtmosphereRadiusMultiplier = 1.1f;
 
 
 private:

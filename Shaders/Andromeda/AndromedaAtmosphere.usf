@@ -587,13 +587,11 @@ void AndromedaAtmosphereMainPS(
                 SurfaceRadius
             );
 
-        if (TSurf.x >= 0.0f)
+        // Only clamp ExitT when the ray actually penetrates the planetary surface
+        // (two distinct surface intersections with a positive interval).
+        if (TSurf.x >= 0.0f && TSurf.y > TSurf.x + 1e-4f)
         {
-            ExitT =
-                min(
-                    ExitT,
-                    TSurf.x
-                );
+            ExitT = min(ExitT, TSurf.x);
         }
         else if (
             TSurf.y >= 0.0f &&
