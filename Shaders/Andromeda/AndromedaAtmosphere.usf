@@ -18,7 +18,14 @@
 //
 //         Day / Terminator / Night
 //
-// No physical scattering, optical depth, transmittance or
+// ATMOS-06 - Rayleigh Scattering:
+//     First-order Rayleigh scattering with exponential density profile
+//     and standard (1 + cos^2) phase function. Uses wavelength-dependent
+//     RayleighScattering coefficient and RayleighScaleHeight from
+//     atmosphere parameters. Preserves ATMOS-05 finite point-star
+//     transport and ATMOS-04 numerical stabilization.
+//
+// No Mie scattering, absorption, optical depth, transmittance or
 // inverse-square luminosity model is implemented here.
 // Those belong to later atmosphere milestones.
 //
@@ -71,6 +78,17 @@ struct FAndromedaAtmosphereGPUData
     float StarPositionX;
     float StarPositionY;
     float StarPositionZ;
+
+    // ATMOS-06: Rayleigh scattering parameters
+    float RayleighScatteringX;
+    float RayleighScatteringY;
+    float RayleighScatteringZ;
+    float RayleighScaleHeight;
+
+    // Padding for 16-float (64-byte) structured buffer alignment
+    float Pad3;
+    float Pad4;
+    float Pad5;
 };
 
 // =========================================================
@@ -176,38 +194,64 @@ float2 RaySphereIntersect(
 
 
 // =========================================================
-// DIAGNOSTIC ATMOSPHERIC DENSITY
+// ATMOS-06 RAYLEIGH DENSITY
 // =========================================================
 //
-// Normalized height:
-//     0 = surface
-//     1 = outer atmosphere
+// Exponential density profile based on altitude above surface:
+//     density = exp(-altitude / RayleighScaleHeight)
 //
-// Diagnostic density:
-//     1 -> 0
-//
+// Altitude is derived from distance to atmosphere center minus surface radius.
+// Clamped to valid range [0, AtmosphereRadius - SurfaceRadius].
+// Normalized to 1 at surface for consistent scaling with RayleighScattering coefficient.
 
-float DiagnosticDensity(
+float RayleighDensity(
     float DistFromCenter,
     float SurfaceRadius,
-    float AtmosphereRadius
+    float AtmosphereRadius,
+    float RayleighScaleHeight
 )
 {
-    float Shell =
+    float Altitude =
+        DistFromCenter - SurfaceRadius;
+
+    float ShellThickness =
         max(
-            AtmosphereRadius -
-            SurfaceRadius,
+            AtmosphereRadius - SurfaceRadius,
             1.0f
         );
 
-    float H =
-        saturate(
-            (DistFromCenter -
-             SurfaceRadius) /
-            Shell
-        );
+    // Clamp altitude to valid atmospheric shell
+    Altitude = clamp(Altitude, 0.0f, ShellThickness);
 
-    return 1.0f - H;
+    // Exponential density falloff
+    // At surface (altitude=0): density = 1.0
+    // At top of atmosphere: density = exp(-ShellThickness / RayleighScaleHeight)
+    return exp(-Altitude / max(RayleighScaleHeight, 1.0f));
+}
+
+
+// =========================================================
+// ATMOS-06 RAYLEIGH PHASE FUNCTION
+// =========================================================
+//
+// Standard Rayleigh phase function:
+//     P_R(theta) = 3 / (16*pi) * (1 + cos^2(theta))
+//
+// where cos(theta) = dot(ViewDir, LightDir)
+// ViewDir points from sample to camera (normalized, opposite of RayDir)
+// LightDir points from sample to star (normalized)
+//
+// The 3/(16*pi) normalization constant is folded into the RayleighScattering
+// coefficient, so we return just (1 + cos^2(theta)).
+
+float RayleighPhase(
+    float3 ViewDir,
+    float3 LightDir
+)
+{
+    float CosTheta = dot(ViewDir, LightDir);
+    float CosThetaSq = CosTheta * CosTheta;
+    return 1.0f + CosThetaSq;
 }
 
 
@@ -443,7 +487,7 @@ void AndromedaAtmosphereMainPS(
     // ATMOSPHERE ACCUMULATION
     // =====================================================
 
-    float3 AccumulatedDiag =
+    float3 AccumulatedScattering =
         float3(
             0.0f,
             0.0f,
@@ -628,8 +672,8 @@ void AndromedaAtmosphereMainPS(
             MarchLen /
             (float)ATMOS_MARCH_STEPS;
 
-        float DensitySum =
-            0.0f;
+        float3 ScatteringSum =
+            float3(0.0f, 0.0f, 0.0f);
 
         for (
             int s = 0;
@@ -656,11 +700,13 @@ void AndromedaAtmosphereMainPS(
                     RelCenter
                 );
 
+            // ATMOS-06: Rayleigh density using exponential profile
             float BaseDensity =
-                DiagnosticDensity(
+                RayleighDensity(
                     DistFromCenter,
                     SurfaceRadius,
-                    AtmRadius
+                    AtmRadius,
+                    Atm.RayleighScaleHeight
                 );
 
             // =================================================
@@ -729,7 +775,7 @@ void AndromedaAtmosphereMainPS(
             }
 
             // =================================================
-            // DAY / TERMINATOR / NIGHT
+            // DAY / TERMINATOR / NIGHT (ATMOS-05 preserved)
             // =================================================
             //
             // +1:
@@ -753,18 +799,13 @@ void AndromedaAtmosphereMainPS(
 
             float DayFactor =
                 smoothstep(
-                    -0.10f,
-                    0.10f,
+                    -0.35f,
+                    0.35f,
                     StarFacing
                 );
 
-            // ATMOS-05 diagnostic lighting.
-            //
-            // A small night contribution is intentionally
-            // retained so the atmosphere does not completely
-            // disappear on the night side. Full physical
-            // scattering/night illumination belongs to later
-            // milestones.
+            // ATMOS-05 night floor preserved for terminator transition.
+            // Full multiple-scattering night illumination belongs to later milestones.
             float NightFloor =
                 0.08f;
 
@@ -775,74 +816,75 @@ void AndromedaAtmosphereMainPS(
                     DayFactor
                 );
 
-            float LocalDensity =
+            // =================================================
+            // ATMOS-06 RAYLEIGH SCATTERING
+            // =================================================
+            //
+            // View direction is from sample to camera.
+            // Since RayOrigin = 0 and RayDir points from camera to sample,
+            // the view direction (sample -> camera) is -RayDir.
+            //
+            // Light direction is from sample to star (SampleToStarDirection).
+            //
+            // Rayleigh phase function: (1 + cos^2(theta))
+            // where cos(theta) = dot(ViewDir, LightDir)
+            //
+            // Scattering coefficient is wavelength-dependent (RayleighScattering).
+            // The 3/(16*pi) normalization is folded into the coefficient.
+            // =================================================
+
+            float3 ViewDir = -RayDir;  // sample -> camera
+            float Phase = RayleighPhase(ViewDir, SampleToStarDirection);
+
+            // Rayleigh scattering color (wavelength dependent)
+            float3 RayleighColor =
+                float3(
+                    Atm.RayleighScatteringX,
+                    Atm.RayleighScatteringY,
+                    Atm.RayleighScatteringZ
+                );
+
+            // Local scattering contribution:
+            //   density * phase * scattering_coefficient * star_illumination
+            float3 LocalScattering =
                 BaseDensity *
+                Phase *
+                RayleighColor *
                 StarLightContribution;
 
-            DensitySum +=
-                LocalDensity;
+            ScatteringSum +=
+                LocalScattering;
         }
 
         // =================================================
-        // ATMOS-04 DIAGNOSTIC VOLUME
+        // ATMOS-06: ACCUMULATE RAYLEIGH SCATTERING
+        // =================================================
+        //
+        // Average scattering over march steps, scaled by chord length.
+        // The chord factor accounts for the path length through the atmosphere.
+        //
+        // No diagnostic tint - use the physically computed Rayleigh color.
         // =================================================
 
-        float AvgDensity =
-            DensitySum /
+        float3 AvgScattering =
+            ScatteringSum /
             (float)ATMOS_MARCH_STEPS;
 
-        float ChordFactor =
-            saturate(
-                MarchLen /
-                max(
-                    AtmRadius,
-                    1.0f
-                )
-            );
+        // MarchLen is in Unreal centimeters.
+        // RayleighScattering parameters are expressed on a km^-1 scale.
+        const float CentimetersToKilometers = 0.00001f;
+        float PathLengthKm = MarchLen * CentimetersToKilometers;
 
-        float MarchIntensity =
-            saturate(
-                AvgDensity *
-                ChordFactor
-            );
+        const float RayleighIntensityScale = 0.35f;
 
-        // =================================================
-        // DIAGNOSTIC COLOR
-        // =================================================
+        float3 MarchScattering =
+            AvgScattering *
+            PathLengthKm *
+            OcclusionFactor *
+            RayleighIntensityScale;
 
-        float AtmPhase =
-            (float)i *
-            0.37f;
-
-        float3 TintA =
-            float3(
-                0.04f,
-                0.22f,
-                0.55f
-            );
-
-        float3 TintB =
-            float3(
-                0.15f,
-                0.75f,
-                1.00f
-            );
-
-        float3 MarchColor =
-            lerp(
-                TintA,
-                TintB,
-                saturate(
-                    AvgDensity +
-                    AtmPhase *
-                    0.15f
-                )
-            );
-
-        AccumulatedDiag +=
-            MarchColor *
-            MarchIntensity *
-            OcclusionFactor;
+        AccumulatedScattering +=
+            MarchScattering;
     }
 
     // =====================================================
@@ -852,7 +894,7 @@ void AndromedaAtmosphereMainPS(
     OutColor =
         float4(
             SceneColor +
-            AccumulatedDiag,
+            AccumulatedScattering,
             1.0f
         );
 }

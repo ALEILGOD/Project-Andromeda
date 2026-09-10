@@ -94,7 +94,7 @@ struct FAndromedaAtmosphereParameters
         BlueprintReadWrite,
         Category = "Andromeda|Atmosphere|Rayleigh"
     )
-    float RayleighScaleHeight = 8000.0f;
+    float RayleighScaleHeight = 800000.0f;
 
     // =========================================================
     // MIE
@@ -246,4 +246,15 @@ struct FAndromedaAtmosphereGPUData
     float StarPositionX;
     float StarPositionY;
     float StarPositionZ;
+
+    // ATMOS-06: Rayleigh scattering parameters
+    float RayleighScatteringX;
+    float RayleighScatteringY;
+    float RayleighScatteringZ;
+    float RayleighScaleHeight;
+
+    // Padding for 16-float (64-byte) structured buffer alignment
+    float Pad3;
+    float Pad4;
+    float Pad5;
 };

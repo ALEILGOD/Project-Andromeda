@@ -217,6 +217,20 @@ void FAndromedaAtmosphereRenderer::BuildGPUData(
         GPUData.Pad0 = 0.0f;
         GPUData.Pad1 = 0.0f;
         GPUData.Pad2 = 0.0f;
+
+        // ATMOS-06: Rayleigh scattering parameters
+        GPUData.RayleighScatteringX =
+            Instance.Parameters.RayleighScattering.X;
+        GPUData.RayleighScatteringY =
+            Instance.Parameters.RayleighScattering.Y;
+        GPUData.RayleighScatteringZ =
+            Instance.Parameters.RayleighScattering.Z;
+        GPUData.RayleighScaleHeight =
+            Instance.Parameters.RayleighScaleHeight;
+
+        GPUData.Pad3 = 0.0f;
+        GPUData.Pad4 = 0.0f;
+        GPUData.Pad5 = 0.0f;
     }
 }
 
@@ -224,6 +238,7 @@ void FAndromedaAtmosphereRenderer::BuildGPUData(
 // RENDERING
 // ATMOS-04: camera-relative stable ray march, 16 steps
 // ATMOS-05: finite-position point-star transport
+// ATMOS-06: Rayleigh scattering with exponential density and phase function
 // =========================================================
 
 FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
@@ -353,6 +368,20 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
 
         RelGPUData.StarPositionZ =
             static_cast<float>(StarRelativeToCamera.Z);
+
+        // ATMOS-06: Rayleigh scattering parameters
+        RelGPUData.RayleighScatteringX =
+            Instance.Parameters.RayleighScattering.X;
+        RelGPUData.RayleighScatteringY =
+            Instance.Parameters.RayleighScattering.Y;
+        RelGPUData.RayleighScatteringZ =
+            Instance.Parameters.RayleighScattering.Z;
+        RelGPUData.RayleighScaleHeight =
+            Instance.Parameters.RayleighScaleHeight;
+
+        RelGPUData.Pad3 = 0.0f;
+        RelGPUData.Pad4 = 0.0f;
+        RelGPUData.Pad5 = 0.0f;
 
         GPUData.Add(RelGPUData);
     }

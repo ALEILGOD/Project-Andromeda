@@ -23,6 +23,12 @@
 //     camera-relative coordinate frame. The USF calculates
 //     Sample -> Star for every march sample.
 //
+// ATMOS-06:
+//     Implements first-order Rayleigh scattering with exponential
+//     density profile and standard (1 + cos^2) phase function.
+//     Uses RayleighScattering coefficient and RayleighScaleHeight
+//     from atmosphere parameters.
+//
 // Source:
 //     /Andromeda/AndromedaAtmosphere.usf
 //
