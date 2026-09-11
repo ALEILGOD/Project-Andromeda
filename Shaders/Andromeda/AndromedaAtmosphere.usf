@@ -118,6 +118,16 @@ int DepthOcclusionEnabled;
 
 #define ATMOS_LIGHT_MARCH_STEPS 8
 
+// =========================================================
+// LOOK-DEV: OPTICAL DEPTH SCALE
+// =========================================================
+// The default Rayleigh coefficients produce an optically thick atmosphere
+// (limb optical depth ~150 for blue). This scale factor reduces the
+// effective extinction in transmittance calculations so the atmosphere
+// becomes transparent enough to show a visible limb while preserving
+// the existing RayleighIntensityScale for final scattering brightness.
+#define ATMOS_OPTICAL_DEPTH_SCALE 0.008f
+
 
 // =========================================================
 // RAY / SPHERE INTERSECTION
@@ -225,10 +235,20 @@ float RayleighDensity(
     // Clamp altitude to valid atmospheric shell
     Altitude = clamp(Altitude, 0.0f, ShellThickness);
 
-    // Exponential density falloff
+    // Effective scale height: honor RayleighScaleHeight while the shell can
+    // resolve it; when the scale dwarfs the shell (e.g. 8 km scale over a
+    // 0.5 km shell) the profile would be flat, so bind the effective scale
+    // to the shell. Top-of-atmosphere density is then exp(-2) ~= 0.135,
+    // giving a defined thin bright core fading with altitude on ANY planet
+    // size. True Earth-like configurations (scale < shell) are unaffected.
+    float EffectiveScaleHeight = min(
+        max(RayleighScaleHeight, 1.0f),
+        ShellThickness * 0.5f
+    );
+
     // At surface (altitude=0): density = 1.0
-    // At top of atmosphere: density = exp(-ShellThickness / RayleighScaleHeight)
-    return exp(-Altitude / max(RayleighScaleHeight, 1.0f));
+    // At top of atmosphere: density = exp(-ShellThickness / EffectiveScaleHeight)
+    return exp(-Altitude / EffectiveScaleHeight);
 }
 
 
@@ -355,7 +375,9 @@ float3 ComputeStarTransmittance(
         );
 
         // Extinction = Density * ScatteringCoefficient (per km)
-        OpticalDepth += Density * RayleighScattering * LightStepLenKm;
+        // ATMOS_OPTICAL_DEPTH_SCALE reduces effective extinction so the atmosphere
+        // becomes transparent enough to show a visible illuminated limb.
+        OpticalDepth += Density * RayleighScattering * LightStepLenKm * ATMOS_OPTICAL_DEPTH_SCALE;
     }
 
     // Transmittance = exp(-OpticalDepth), RGB
@@ -470,7 +492,10 @@ float3 ComputeCameraTransmittance(
         );
 
         // Extinction = Density * ScatteringCoefficient (per km)
-        OpticalDepth += Density * RayleighScattering * CamStepLenKm;
+        // ATMOS_OPTICAL_DEPTH_SCALE reduces effective extinction so the atmosphere
+        // becomes transparent enough to show a visible limb while preserving
+        // the existing RayleighIntensityScale for final scattering brightness.
+        OpticalDepth += Density * RayleighScattering * CamStepLenKm * ATMOS_OPTICAL_DEPTH_SCALE;
     }
 
     // Transmittance = exp(-OpticalDepth), RGB
@@ -982,11 +1007,14 @@ void AndromedaAtmosphereMainPS(
                     SurfaceNormal = float3(0.0f, 0.0f, 1.0f);
                 }
 
-                // Star illumination
+                // Solar illumination (look-dev): soft terminator gate times
+                // angular response ~cos(incidence)^0.5, widening the bright
+                // arc around the subsolar region. Night side stays zero.
                 float StarFacing = dot(SurfaceNormal, SampleToStarDir);
-                float DayFactor = smoothstep(-0.35f, 0.35f, StarFacing);
-                float NightFloor = 0.08f;
-                float StarLightContribution = lerp(NightFloor, 1.0f, DayFactor);
+                float DayGate = smoothstep(-0.35f, 0.35f, StarFacing);
+                const float SolarFalloffPower = 0.5f;
+                float StarLightContribution =
+                    DayGate * pow(saturate(StarFacing), SolarFalloffPower);
 
                 // Transmittance from star to this sample
                 float3 StarTransmittance = float3(1.0f, 1.0f, 1.0f);
@@ -1193,23 +1221,23 @@ void AndromedaAtmosphereMainPS(
                     SampleToStarDirection
                 );
 
-            float DayFactor =
+            // Solar illumination (look-dev): soft terminator gate times
+            // angular response ~cos(incidence)^0.5, widening the bright arc
+            // around the subsolar region. Night side stays zero.
+            float DayGate =
                 smoothstep(
                     -0.35f,
                     0.35f,
                     StarFacing
                 );
 
-            // ATMOS-05 night floor preserved for terminator transition.
-            // Full multiple-scattering night illumination belongs to later milestones.
-            float NightFloor =
-                0.08f;
+            const float SolarFalloffPower = 0.5f;
 
             float StarLightContribution =
-                lerp(
-                    NightFloor,
-                    1.0f,
-                    DayFactor
+                DayGate *
+                pow(
+                    saturate(StarFacing),
+                    SolarFalloffPower
                 );
 
             // =================================================
@@ -1304,7 +1332,11 @@ void AndromedaAtmosphereMainPS(
         const float CentimetersToKilometers = 0.00001f;
         float PathLengthKm = MarchLen * CentimetersToKilometers;
 
-        const float RayleighIntensityScale = 0.75f;
+        // Look-dev exposure calibration for display-referred output on
+        // centimeter-scale planets. All relative behavior (gradients,
+        // ratios, falloffs) comes from the physics above; this only sets
+        // absolute display brightness of the volume term.
+        const float RayleighIntensityScale = 4.0f;
 
         float3 MarchScattering =
             AvgScattering *
