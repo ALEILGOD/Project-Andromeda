@@ -106,6 +106,11 @@
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/SceneTexturesCommon.ush"
 
+// ZEPHYR-01: planetary-sky domain authority (domain math only;
+// transport stays in this file). Resolves via the '/Andromeda'
+// virtual shader directory mapping to Shaders/Andromeda.
+#include "/Andromeda/Zephyr/AndromedaZephyrSky.ush"
+
 // =========================================================
 // GPU ATMOSPHERE DATA STRUCT
 // =========================================================
@@ -1266,10 +1271,16 @@ void AndromedaAtmosphereMainPS(
         // sky ray satisfied that condition and the entire ground sky was
         // discarded. The robust buried-observer test uses the real camera
         // distance instead: |RelCenter| in the camera-relative frame.
+        // ZEPHYR-01: buried-observer test owned by the Zephyr
+        // sky-domain library (mathematically identical to the
+        // previous inline test: |RelCenter| vs SurfaceRadius).
         float CameraDistFromCenter = length(RelCenter);
 
         bool bCameraInsidePlanet =
-            CameraDistFromCenter < SurfaceRadius * (1.0f - 1e-4f);
+            ZephyrIsBuriedObserver(
+                CameraDistFromCenter,
+                SurfaceRadius
+            );
 
         if (bCameraInsidePlanet)
         {
