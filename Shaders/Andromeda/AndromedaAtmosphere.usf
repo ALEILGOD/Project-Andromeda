@@ -319,9 +319,10 @@ float3 ComputeStarTransmittance(
         SurfaceRadius
     );
 
-    // Only clamp if ray genuinely penetrates planetary surface
-    // (two distinct intersections with positive interval)
-    if (TLightSurf.x >= 0.0f && TLightSurf.y > TLightSurf.x + 1e-4f)
+    // Only clamp on genuine surface penetration. The separation test is
+    // radius-relative: float32 discriminant noise at planetary radii
+    // produces phantom root separations far above 1e-4 cm.
+    if (TLightSurf.x >= 0.0f && TLightSurf.y > TLightSurf.x + SurfaceRadius * 2e-3f)
     {
         LightExitT = min(LightExitT, TLightSurf.x);
     }
@@ -355,6 +356,121 @@ float3 ComputeStarTransmittance(
 
         // Extinction = Density * ScatteringCoefficient (per km)
         OpticalDepth += Density * RayleighScattering * LightStepLenKm;
+    }
+
+    // Transmittance = exp(-OpticalDepth), RGB
+    float3 Transmittance = exp(-OpticalDepth);
+
+    // Numerical safety
+    if (!isfinite(Transmittance.x) || !isfinite(Transmittance.y) || !isfinite(Transmittance.z))
+    {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+
+    return Transmittance;
+}
+
+
+// =========================================================
+// ATMOS-09 CAMERA TRANSMITTANCE (AERIAL PERSPECTIVE)
+// =========================================================
+//
+// Computes the transmittance of the scene color along the
+// camera ray path through the atmosphere to the geometry.
+//
+// The camera ray is parameterized from camera toward geometry:
+//
+//     CameraRayOrigin = 0 (camera-relative)
+//     CameraRayDir = RayDir (normalized)
+//
+// The ray is integrated from the camera (t=0) to the geometry
+// intersection point, clamped by the atmosphere boundaries.
+//
+// All distances are in camera-relative centimeters.
+// RayleighScattering is on a km^-1 scale, so step length is
+// converted to km before multiplication.
+//
+// Returns RGB transmittance (wavelength-dependent).
+// =========================================================
+
+float3 ComputeCameraTransmittance(
+    float3 RayDir,
+    float3 RelCenter,
+    float SurfaceRadius,
+    float AtmosphereRadius,
+    float RayleighScaleHeight,
+    float3 RayleighScattering,
+    float GeometryT
+)
+{
+    // Camera ray origin is at 0 (camera-relative)
+    float3 CameraRayOrigin = float3(0.0f, 0.0f, 0.0f);
+
+    // Intersect camera ray with atmosphere outer boundary
+    float2 TCamAtm = RaySphereIntersect(
+        CameraRayOrigin,
+        RayDir,
+        RelCenter,
+        AtmosphereRadius
+    );
+
+    // No atmosphere intersection on camera path
+    if (TCamAtm.x < 0.0f && TCamAtm.y < 0.0f)
+    {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+
+    // Determine entry and exit points along camera ray
+    float CamEntryT = max(TCamAtm.x, 0.0f);
+    float CamExitT = TCamAtm.y;
+
+    // Check planet surface occlusion on camera path
+    float2 TCamSurf = RaySphereIntersect(
+        CameraRayOrigin,
+        RayDir,
+        RelCenter,
+        SurfaceRadius
+    );
+
+    // Only clamp on genuine surface penetration (radius-relative
+    // tangent test; see main loop).
+    if (TCamSurf.x >= 0.0f && TCamSurf.y > TCamSurf.x + SurfaceRadius * 2e-3f)
+    {
+        CamExitT = min(CamExitT, TCamSurf.x);
+    }
+
+    // Clamp to geometry distance (the scene depth)
+    CamExitT = min(CamExitT, GeometryT);
+
+    // Invalid or zero-length path
+    if (!(CamExitT > CamEntryT))
+    {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+
+    // Fixed-step integration over camera path to geometry
+    const float CentimetersToKilometers = 0.00001f;
+    float CamStepLen = (CamExitT - CamEntryT) / (float)ATMOS_MARCH_STEPS;
+    float CamStepLenKm = CamStepLen * CentimetersToKilometers;
+
+    float3 OpticalDepth = float3(0.0f, 0.0f, 0.0f);
+
+    for (int cs = 0; cs < ATMOS_MARCH_STEPS; ++cs)
+    {
+        float t = CamEntryT + CamStepLen * ((float)cs + 0.5f);
+        float3 CamSamplePos = CameraRayOrigin + RayDir * t;
+
+        float DistFromCenter = length(CamSamplePos - RelCenter);
+
+        float Density = RayleighDensity(
+            DistFromCenter,
+            SurfaceRadius,
+            AtmosphereRadius,
+            RayleighScaleHeight
+        );
+
+        // Extinction = Density * ScatteringCoefficient (per km)
+        OpticalDepth += Density * RayleighScattering * CamStepLenKm;
     }
 
     // Transmittance = exp(-OpticalDepth), RGB
@@ -599,7 +715,27 @@ void AndromedaAtmosphereMainPS(
     }
 
     // =====================================================
-    // ATMOSPHERE ACCUMULATION
+    // ATMOS-09 AERIAL PERSPECTIVE: GEOMETRY DISTANCE
+    // =====================================================
+    //
+    // Convert scene depth W to camera-ray distance.
+    // W = t * dot(RayDir, ViewZ), so t = W / dot(RayDir, ViewZ)
+    // The DepthToRayScale = W / RayLen gives us the conversion.
+    // GeometryT is the distance along the ray to the scene geometry.
+    // =====================================================
+
+    float GeometryT = 1e10f;
+    if (DepthOcclusionEnabled != 0 && SceneDepthW > 0.0f && DepthToRayScale > 0.0f)
+    {
+        GeometryT = SceneDepthW / DepthToRayScale;
+        if (!(GeometryT > 0.0f) || !isfinite(GeometryT))
+        {
+            GeometryT = 1e10f;
+        }
+    }
+
+    // =====================================================
+    // ATMOSPHERE ACCUMULATION (ATMOS-06 + ATMOS-08 + ATMOS-09)
     // =====================================================
 
     float3 AccumulatedScattering =
@@ -608,6 +744,11 @@ void AndromedaAtmosphereMainPS(
             0.0f,
             0.0f
         );
+
+    // Aerial perspective: accumulate transmittance and inscattered light
+    // per atmosphere, then apply to SceneColor at the end.
+    float3 SceneColorTransmittance = float3(1.0f, 1.0f, 1.0f);
+    float3 AerialPerspectiveColor = float3(0.0f, 0.0f, 0.0f);
 
     for (
         int i = 0;
@@ -652,37 +793,16 @@ void AndromedaAtmosphereMainPS(
         }
 
         // =================================================
-        // ATMOS-04 DEPTH OCCLUSION GATE
-        // =================================================
-
-        float OcclusionFactor =
-            1.0f;
-
-        if (
-            DepthOcclusionEnabled != 0 &&
-            SceneDepthDeviceZ > 0.0f &&
-            SceneDepthDeviceZ < 1.0f &&
-            SceneDepthW > 0.0f
-        )
-        {
-            float ExitW =
-                TAtm.y *
-                DepthToRayScale;
-
-            if (
-                ExitW > 0.0f &&
-                SceneDepthW <
-                    ExitW *
-                    (1.0f - 1e-4f)
-            )
-            {
-                OcclusionFactor =
-                    0.0f;
-            }
-        }
-
-        // =================================================
         // ENTRY / EXIT
+        //
+        // PROMPT 1 (depth/occlusion consolidation):
+        // The old binary OcclusionFactor gate compared scene depth
+        // against the ATMOSPHERE EXIT and zeroed the whole contribution.
+        // That killed correctly-visible foreground atmosphere and never
+        // shortened the march, so background atmosphere still leaked
+        // through opaque geometry in the additive composite.
+        // Occlusion is now enforced geometrically by clamping ExitT to
+        // GeometryT below (same ray parameterization, same units).
         // =================================================
 
         float EntryT =
@@ -702,19 +822,32 @@ void AndromedaAtmosphereMainPS(
                 SurfaceRadius
             );
 
-        // Only clamp ExitT when the ray actually penetrates the planetary surface
-        // (two distinct surface intersections with a positive interval).
-        if (TSurf.x >= 0.0f && TSurf.y > TSurf.x + 1e-4f)
+        // Clamp ExitT only on genuine surface penetration. The separation
+        // test must be radius-relative: float32 discriminant noise at
+        // planetary radii produces phantom root separations far above
+        // 1e-4 cm, which would truncate limb chords. Truly visible
+        // surfaces still terminate the march via the GeometryT clamp
+        // below, so the residual sub-epsilon interior error is invisible.
+        if (TSurf.x >= 0.0f && TSurf.y > TSurf.x + SurfaceRadius * 2e-3f)
         {
             ExitT = min(ExitT, TSurf.x);
         }
         else if (
+            TSurf.x < 0.0f &&
             TSurf.y >= 0.0f &&
             TAtm.x < 0.0f
         )
         {
             continue;
         }
+
+        // PROMPT 1: clamp the visible atmosphere interval to the first
+        // visible scene geometry. GeometryT is the radial distance along
+        // the SAME normalized camera ray (SceneDepthW / DepthToRayScale),
+        // directly comparable to EntryT/ExitT. Defaults to 1e10 when depth
+        // is disabled/invalid/sky, so this is a no-op in those cases.
+        // Geometry in front of the atmosphere -> ExitT < EntryT -> skip.
+        ExitT = min(ExitT, GeometryT);
 
         if (!(ExitT > EntryT))
         {
@@ -731,6 +864,163 @@ void AndromedaAtmosphereMainPS(
         {
             continue;
         }
+
+        // =================================================
+        // ATMOS-09 CAMERA TRANSMITTANCE (AERIAL PERSPECTIVE)
+        // =====================================================
+        //
+        // Compute transmittance of scene color along camera ray
+        // from camera to geometry, through this atmosphere.
+        // =====================================================
+
+        float3 CameraTransmittance = ComputeCameraTransmittance(
+            RayDir,
+            RelCenter,
+            SurfaceRadius,
+            AtmRadius,
+            Atm.RayleighScaleHeight,
+            float3(
+                Atm.RayleighScatteringX,
+                Atm.RayleighScatteringY,
+                Atm.RayleighScatteringZ
+            ),
+            GeometryT
+        );
+
+        // Accumulate transmittance for SceneColor
+        SceneColorTransmittance *= CameraTransmittance;
+
+        // =================================================
+        // ATMOS-09 AERIAL PERSPECTIVE COLOR
+        // =====================================================
+        //
+        // Compute inscattered light along camera -> geometry path.
+        // This is the atmospheric haze color added to distant geometry.
+        // Uses the same integration as scattering but for camera path.
+        // =====================================================
+
+        // PROMPT 2 (inter-planet occlusion): reuse the main path's
+        // already-clamped visible interval for the aerial integration.
+        // TCamAtm/TCamSurf would be IDENTICAL to TAtm/TSurf above (same
+        // origin, direction, center and radii), and CamExitT would again
+        // be min(..., GeometryT). A single source of truth guarantees the
+        // aerial contribution of a background atmosphere uses EXACTLY the
+        // same visible segment as its volume march, so it can never
+        // integrate past foreground opaque geometry through a divergent
+        // interval. EntryT/ExitT are already validated non-empty here.
+        float CamEntryT = EntryT;
+        float CamExitT = ExitT;
+
+        // Star position for this atmosphere (needed for aerial perspective;
+        // also consumed by the ATMOS-05 scattering loop below).
+        float3 StarPosition =
+            float3(
+                Atm.StarPositionX,
+                Atm.StarPositionY,
+                Atm.StarPositionZ
+            );
+
+        // =================================================
+        // ATMOS-09 AERIAL PERSPECTIVE COLOR
+        // =====================================================
+        //
+        // Compute inscattered light along camera -> geometry path.
+        // This is the atmospheric haze color added to distant geometry.
+        // =====================================================
+
+        float3 AerialPerspectiveScattering = float3(0.0f, 0.0f, 0.0f);
+        float3 RayleighColor =
+            float3(
+                Atm.RayleighScatteringX,
+                Atm.RayleighScatteringY,
+                Atm.RayleighScatteringZ
+            );
+
+        if (CamExitT > CamEntryT)
+        {
+            // Integration constants
+            const float CentimetersToKilometers = 0.00001f;
+            float CamStepLen = (CamExitT - CamEntryT) / (float)ATMOS_MARCH_STEPS;
+            float CamStepLenKm = CamStepLen * CentimetersToKilometers;
+
+            for (int cs = 0; cs < ATMOS_MARCH_STEPS; ++cs)
+            {
+                float t = CamEntryT + CamStepLen * ((float)cs + 0.5f);
+                float3 CamSamplePos = RayOrigin + RayDir * t;
+
+                float DistFromCenter = length(CamSamplePos - RelCenter);
+
+                float Density = RayleighDensity(
+                    DistFromCenter,
+                    SurfaceRadius,
+                    AtmRadius,
+                    Atm.RayleighScaleHeight
+                );
+
+                // Star direction for this camera sample
+                float3 ToStar = StarPosition - CamSamplePos;
+                float StarDistanceSq = dot(ToStar, ToStar);
+                float3 SampleToStarDir = float3(0.0f, 0.0f, 0.0f);
+                if (StarDistanceSq > 1e-8f)
+                {
+                    SampleToStarDir = ToStar * rsqrt(StarDistanceSq);
+                }
+
+                // Phase function
+                float3 ViewDir = -RayDir;  // camera -> sample
+                float Phase = RayleighPhase(ViewDir, SampleToStarDir);
+
+                // Surface normal for star illumination
+                float3 SurfaceNormal = CamSamplePos - RelCenter;
+                float SurfaceNormalSq = dot(SurfaceNormal, SurfaceNormal);
+                if (SurfaceNormalSq > 1e-8f)
+                {
+                    SurfaceNormal *= rsqrt(SurfaceNormalSq);
+                }
+                else
+                {
+                    SurfaceNormal = float3(0.0f, 0.0f, 1.0f);
+                }
+
+                // Star illumination
+                float StarFacing = dot(SurfaceNormal, SampleToStarDir);
+                float DayFactor = smoothstep(-0.35f, 0.35f, StarFacing);
+                float NightFloor = 0.08f;
+                float StarLightContribution = lerp(NightFloor, 1.0f, DayFactor);
+
+                // Transmittance from star to this sample
+                float3 StarTransmittance = float3(1.0f, 1.0f, 1.0f);
+                if (StarDistanceSq > 1e-8f)
+                {
+                    StarTransmittance = ComputeStarTransmittance(
+                        CamSamplePos,
+                        SampleToStarDir,
+                        RelCenter,
+                        SurfaceRadius,
+                        AtmRadius,
+                        Atm.RayleighScaleHeight,
+                        RayleighColor
+                    );
+                }
+
+                // Local scattering
+                float3 LocalScattering =
+                    Density *
+                    Phase *
+                    RayleighColor *
+                    StarLightContribution *
+                    StarTransmittance;
+
+                AerialPerspectiveScattering += LocalScattering;
+            }
+
+            AerialPerspectiveScattering /= (float)ATMOS_MARCH_STEPS;
+
+            AerialPerspectiveScattering *= CamStepLenKm;
+        }
+
+        // Accumulate aerial perspective color
+        AerialPerspectiveColor += AerialPerspectiveScattering;
 
         // =================================================
         // ATMOS-05 FINITE POINT STAR
@@ -769,13 +1059,6 @@ void AndromedaAtmosphereMainPS(
         //
         // in exact arithmetic.
         // =================================================
-
-        float3 StarPosition =
-            float3(
-                Atm.StarPositionX,
-                Atm.StarPositionY,
-                Atm.StarPositionZ
-            );
 
         // =================================================
         // FIXED-STEP MARCH
@@ -1026,7 +1309,6 @@ void AndromedaAtmosphereMainPS(
         float3 MarchScattering =
             AvgScattering *
             PathLengthKm *
-            OcclusionFactor *
             RayleighIntensityScale;
 
         AccumulatedScattering +=
@@ -1034,12 +1316,17 @@ void AndromedaAtmosphereMainPS(
     }
 
     // =====================================================
-    // FULLSCREEN ADDITIVE COMPOSITE
+    // FULLSCREEN ADDITIVE COMPOSITE (ATMOS-06 + ATMOS-09)
+    // =====================================================
+    //
+    // Apply aerial perspective transmittance to SceneColor,
+    // then add aerial perspective inscattered color and atmosphere scattering.
     // =====================================================
 
     OutColor =
         float4(
-            SceneColor +
+            SceneColor * SceneColorTransmittance +
+            AerialPerspectiveColor +
             AccumulatedScattering,
             1.0f
         );
