@@ -29,6 +29,12 @@
 //     Uses RayleighScattering coefficient and RayleighScaleHeight
 //     from atmosphere parameters.
 //
+// ATMOS-10:
+//     Adds real second-order Rayleigh multiple scattering: the
+//     diffuse already-scattered field is gathered per view sample
+//     (tetrahedral quadrature + segment transmittance) and scattered
+//     once more toward the camera. Tuned by MultipleScatteringScale.
+//
 // Source:
 //     /Andromeda/AndromedaAtmosphere.usf
 //
@@ -92,6 +98,24 @@ public:
         SHADER_PARAMETER(
             int32,
             DepthOcclusionEnabled
+        )
+
+        // ATMOS-10: global exposure of the second-order (multiple
+        // scattering) term. 0 disables L2. Must match the USF.
+        SHADER_PARAMETER(
+            float,
+            MultipleScatteringScale
+        )
+
+        // ATMOS-11: star validity flag. 1 when the Game Thread has
+        // provided a real star position, 0 when StarPosition is still
+        // the zero vector ("star not available"). The shader must skip
+        // atmosphere integration when 0: a zero vector is the camera
+        // position, not a star, and would generate nonphysical glow.
+        // Must match the USF.
+        SHADER_PARAMETER(
+            int32,
+            StarValid
         )
 
         // Output

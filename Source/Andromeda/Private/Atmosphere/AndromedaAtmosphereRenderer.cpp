@@ -53,6 +53,13 @@ namespace
         ECVF_RenderThreadSafe
     );
 
+    TAutoConsoleVariable<float> CVarAndromedaAtmosMS(
+        TEXT("r.AndromedaAtmos.MultipleScatteringScale"),
+        1.0f,
+        TEXT("ATMOS-10: global exposure of the second-order Rayleigh multiple scattering term. 0 = L2 disabled (single scattering only)."),
+        ECVF_RenderThreadSafe
+    );
+
 
     std::atomic<uint64> GDispatchCounter{ 0 };
 }
@@ -499,6 +506,19 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
 
     PassParameters->DepthOcclusionEnabled =
         Inputs.SceneTextures.SceneTextures
+            ? 1
+            : 0;
+
+    // ATMOS-10: second-order multiple scattering exposure.
+    PassParameters->MultipleScatteringScale =
+        CVarAndromedaAtmosMS.GetValueOnRenderThread();
+
+    // ATMOS-11: star validity. When the Game Thread has not provided a
+    // star position yet, the GPU buffer holds (0,0,0) which is the
+    // camera position, not a star. The shader skips integration in
+    // that case instead of generating nonphysical camera-centered glow.
+    PassParameters->StarValid =
+        bHasStarPosition
             ? 1
             : 0;
 

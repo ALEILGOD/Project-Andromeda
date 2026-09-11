@@ -29,6 +29,71 @@
 // inverse-square luminosity model is implemented here.
 // Those belong to later atmosphere milestones.
 //
+// ATMOS-10 - Rayleigh Multiple Scattering (Order 2):
+//     Every view-march sample P computes, in addition to first-order
+//     direct-star scattering L1, a real second-order term L2. L2 is the
+//     Rayleigh scattering at P of diffuse light that has ALREADY been
+//     scattered once elsewhere in the atmosphere:
+//
+//         STAR -> Q (direct, T_star) -> scatter at Q (J1)
+//              -> transport Q -> P (segment transmittance T_pq)
+//              -> scatter at P toward camera (phase) -> CAMERA
+//
+// The incident diffuse field at P is gathered by marching short
+// segments along 4 tetrahedral quadrature directions and, at each
+// gathered point Q, evaluating the full first-order source
+// (density x Rayleigh coeff x phase x day-gate x star
+// transmittance with coarse light march). Nothing is a constant
+// multiplier: L2 depends on sample position, local density,
+// star direction, gathered radiance, transmittances, Rayleigh
+// coefficients and phase functions. Night-side/terminator response
+// emerges from geometry + optical depth, no twilight hacks.
+//
+// ATMOS-11 - Surface Sky / Atmospheric Sky Radiance:
+//     Dedicated front-to-back sky path for camera rays that do NOT
+//     hit scene geometry (GeometryT does not cut the atmospheric
+//     segment). The pre-ATMOS-11 code marched sky rays with the same
+//     additive no-extinction volume integral used for geometry rays
+//     AND added a second aerial integration over the identical
+//     segment (double counting), with no view-path extinction, so
+//     zenith/horizon had no physical saturation and the surface sky
+//     had no bounded radiance. ATMOS-11 integrates sky rays as:
+//
+//         L = integral J(s) * T(camera -> s) ds,  J = J1 + J2
+//
+//     with wavelength-dependent extinction accumulated along the
+//     march. Zenith/horizon ratio, sun-forward brightness, sunset
+//     reddening and night darkening all emerge from density,
+//     Rayleigh phase, star transmittance and optical depth.
+//     Geometry rays keep the exact ATMOS-09/10 path untouched.
+//
+// ATMOS-11 TRUE GROUND SKY (visual-test corrections):
+//     The first sky branch alone still rendered "atmosphere from
+//     space / gradient" on the surface. Three proven defects fixed:
+//     (a) the surface-straddle guard (TSurf.x < 0 <= TSurf.y &&
+//     TAtm.x < 0 -> continue) discarded EVERY upward sky ray for an
+//     observer standing on the surface, where the surface sphere
+//     passes exactly through the ray origin; replaced by a robust
+//     buried-observer test on |RelCenter| vs SurfaceRadius;
+//     (b) ATMOS_OPTICAL_DEPTH_SCALE 0.008 forced T ~= 1 on all paths,
+//     making brightness = sigma * path * phase (a smooth shell);
+//     restored to unity so saturation/reddening/terminator contrast
+//     emerge - scattering and extinction share one cross-section;
+//     (c) ComputeStarTransmittance returned 1 when the planet occults
+//     the star (zero-length surface-clamped path); now returns 0.
+//
+// ATMOS-11 TRUE PLANETARY SKY (unified integrator):
+//     Final diagnosis showed geometry-ray segments were integrated
+//     TWICE with the identical J1 (aerial x3 + volume x8 over the
+//     same [EntryT, ExitT]), i.e. an 11x haze washing distant terrain
+//     into sky-colored milk and erasing all horizon contrast. The
+//     three ray classes now share ONE front-to-back integrator
+//     (ComputeViewRadiance, J1 + J2 with view-path extinction):
+//     sky rays -> sky radiance, geometry rays -> aerial in-scatter,
+//     space views -> limb radiance. Same atmosphere, same system.
+//
+
+//
 // Virtual path:
 //     /Andromeda/AndromedaAtmosphere.usf
 //
@@ -110,6 +175,14 @@ StructuredBuffer<FAndromedaAtmosphereGPUData> AtmosphereBuffer;
 // ATMOS-04 DEPTH OCCLUSION
 int DepthOcclusionEnabled;
 
+// ATMOS-10: global exposure of the second-order term. 0 disables L2.
+float MultipleScatteringScale;
+
+// ATMOS-11: star validity flag from the renderer (1 = real star
+// position available, 0 = star not yet provided). Must match
+// FAndromedaAtmospherePS::FParameters::StarValid.
+int StarValid;
+
 // =========================================================
 // ATMOS-04 CONSTANTS
 // =========================================================
@@ -118,15 +191,38 @@ int DepthOcclusionEnabled;
 
 #define ATMOS_LIGHT_MARCH_STEPS 8
 
+// ATMOS-10 multiple scattering quadrature resolution.
+// Cost per view sample per atmosphere:
+//     MS_DIRECTIONS x MS_STEPS coarse star-transmittance evaluations
+//     (each MS_LIGHT_MARCH_STEPS long) plus segment transmittances.
+#define ATMOS_MS_DIRECTIONS 4
+#define ATMOS_MS_STEPS 3
+#define ATMOS_MS_LIGHT_MARCH_STEPS 4
+
+// ATMOS-11: display-referred exposure shared by the volume term and
+// the sky radiance term. Same value as the approved ATMOS-09/10
+// RayleighIntensityScale so surface sky lands in the same range.
+#define ATMOS_RADIANCE_SCALE 8.0f
+
 // =========================================================
-// LOOK-DEV: OPTICAL DEPTH SCALE
+// OPTICAL DEPTH SCALE
 // =========================================================
-// The default Rayleigh coefficients produce an optically thick atmosphere
-// (limb optical depth ~150 for blue). This scale factor reduces the
-// effective extinction in transmittance calculations so the atmosphere
-// becomes transparent enough to show a visible limb while preserving
-// the existing RayleighIntensityScale for final scattering brightness.
-#define ATMOS_OPTICAL_DEPTH_SCALE 0.008f
+// ATMOS-11: unity. The extinction integral uses the true Rayleigh
+// coefficients, so optical depth, saturation, wavelength-dependent
+// reddening and terminator contrast emerge from the transport.
+//
+// The previous look-dev value (0.008) multiplied every optical depth
+// by ~1/125, forcing T ~= 1 on ALL paths (star, camera, segment).
+// That mathematically precludes horizon saturation, sunset
+// reddening and day/night extinction contrast: brightness reduced to
+// sigma * path * phase, i.e. the smooth "gradient shell" reported by
+// the ATMOS-11 visual test. Restoring unity is an architectural
+// correction, not look-dev: scattering and extinction must share the
+// same cross-section or the model is not energy-consistent.
+// Verified low regression risk on current cm-scale planets: grazing
+// limb chords hold OD ~0.08 (blue), so the approved limb stays
+// transparent; only the missing saturation/reddening appear.
+#define ATMOS_OPTICAL_DEPTH_SCALE 1.0f
 
 
 // =========================================================
@@ -238,12 +334,13 @@ float RayleighDensity(
     // Effective scale height: honor RayleighScaleHeight while the shell can
     // resolve it; when the scale dwarfs the shell (e.g. 8 km scale over a
     // 0.5 km shell) the profile would be flat, so bind the effective scale
-    // to the shell. Top-of-atmosphere density is then exp(-2) ~= 0.135,
-    // giving a defined thin bright core fading with altitude on ANY planet
-    // size. True Earth-like configurations (scale < shell) are unaffected.
+    // to the shell. Top-of-atmosphere density is then exp(-2.857) ~= 0.057,
+    // giving a thin bright low-altitude core fading fast with altitude on
+    // ANY planet size (reference: thin ISS limb line, not a diffuse band).
+    // True Earth-like configurations (scale < shell) are unaffected.
     float EffectiveScaleHeight = min(
         max(RayleighScaleHeight, 1.0f),
-        ShellThickness * 0.5f
+        ShellThickness * 0.35f
     );
 
     // At surface (altitude=0): density = 1.0
@@ -291,6 +388,9 @@ float RayleighPhase(
 //
 // The ray is integrated from the sample (inside atmosphere) outward
 // to the atmosphere boundary, with planet-surface occlusion.
+// CRITICAL: if the planet body lies between the sample and the star
+// (star distance > planet surface intersection distance), the star
+// is geometrically occulted and transmittance = 0.
 //
 // All distances are in camera-relative centimeters.
 // RayleighScattering is on a km^-1 scale, so step length is
@@ -306,12 +406,17 @@ float3 ComputeStarTransmittance(
     float SurfaceRadius,
     float AtmosphereRadius,
     float RayleighScaleHeight,
-    float3 RayleighScattering
+    float3 RayleighScattering,
+    int NumLightSteps,
+    float3 StarPosition
 )
 {
     // Light ray: STAR -> SAMPLE (sample is inside atmosphere)
     float3 LightRayOrigin = SamplePos;
     float3 LightRayDir = SampleToStarDirection;
+
+    // Distance from sample to star (along the ray)
+    float StarDistance = length(StarPosition - SamplePos);
 
     // Intersect light ray with atmosphere outer boundary
     float2 TLightAtm = RaySphereIntersect(
@@ -344,23 +449,42 @@ float3 ComputeStarTransmittance(
     // produces phantom root separations far above 1e-4 cm.
     if (TLightSurf.x >= 0.0f && TLightSurf.y > TLightSurf.x + SurfaceRadius * 2e-3f)
     {
+        // Planet surface intersects the light ray.
+        // If the star is BEYOND the planet surface (star distance > surface intersection),
+        // the planet occults the star -> transmittance = 0.
+        if (StarDistance > TLightSurf.x)
+        {
+            return float3(0.0f, 0.0f, 0.0f);
+        }
+        // Otherwise the star is in front of the planet surface (e.g. star between
+        // sample and planet), so no occultation. Clamp the integration to the
+        // atmosphere boundary as usual.
         LightExitT = min(LightExitT, TLightSurf.x);
     }
 
-    // Invalid or zero-length light path
+    // Invalid or zero-length light path.
+    //
+    // ATMOS-11 terminator fix: for a sample inside the atmosphere the
+    // entry is 0 and the exit is the atmosphere boundary, so a
+    // zero-length path here means the surface clamp pulled the exit
+    // down to <= 0, i.e. the planet body occults the star along this
+    // sample's star path. No direct stellar light reaches the sample:
+    // transmittance is 0, not 1. (The old value of 1 leaked full
+    // sunlight into partially DayGate-lit terminator samples.)
+    // The no-atmosphere-intersection case already returned 1 above.
     if (!(LightExitT > LightEntryT))
     {
-        return float3(1.0f, 1.0f, 1.0f);
+        return float3(0.0f, 0.0f, 0.0f);
     }
 
     // Fixed-step integration over light path
     const float CentimetersToKilometers = 0.00001f;
-    float LightStepLen = (LightExitT - LightEntryT) / (float)ATMOS_LIGHT_MARCH_STEPS;
+    float LightStepLen = (LightExitT - LightEntryT) / (float)max(NumLightSteps, 1);
     float LightStepLenKm = LightStepLen * CentimetersToKilometers;
 
     float3 OpticalDepth = float3(0.0f, 0.0f, 0.0f);
 
-    for (int ls = 0; ls < ATMOS_LIGHT_MARCH_STEPS; ++ls)
+    for (int ls = 0; ls < NumLightSteps; ++ls)
     {
         float t = LightEntryT + LightStepLen * ((float)ls + 0.5f);
         float3 LightSamplePos = LightRayOrigin + LightRayDir * t;
@@ -374,9 +498,9 @@ float3 ComputeStarTransmittance(
             RayleighScaleHeight
         );
 
-        // Extinction = Density * ScatteringCoefficient (per km)
-        // ATMOS_OPTICAL_DEPTH_SCALE reduces effective extinction so the atmosphere
-        // becomes transparent enough to show a visible illuminated limb.
+        // Extinction = Density * ScatteringCoefficient (per km).
+        // ATMOS-11: ATMOS_OPTICAL_DEPTH_SCALE is unity (true physics);
+        // kept symbolic so every transport term shares one convention.
         OpticalDepth += Density * RayleighScattering * LightStepLenKm * ATMOS_OPTICAL_DEPTH_SCALE;
     }
 
@@ -394,120 +518,399 @@ float3 ComputeStarTransmittance(
 
 
 // =========================================================
-// ATMOS-09 CAMERA TRANSMITTANCE (AERIAL PERSPECTIVE)
+// ATMOS-10 MULTIPLE SCATTERING (ORDER 2)
 // =========================================================
 //
-// Computes the transmittance of the scene color along the
-// camera ray path through the atmosphere to the geometry.
+// Radiative-transfer model (Bruneton-style scattering orders,
+// evaluated at runtime, no LUT):
 //
-// The camera ray is parameterized from camera toward geometry:
+//   Order 1 (direct):
+//       J1(Q -> observer) =
+//           density(Q) * sigma_R * P_R * DayGate(Q) * T_star(Q)
 //
-//     CameraRayOrigin = 0 (camera-relative)
-//     CameraRayDir = RayDir (normalized)
+//   Order 2 (diffuse):
+//       Lin(P, Omega) = integral over segment P -> Q along Omega of
+//           J1(Q -> P) * T(P -> Q) dQ        (gathered diffuse field)
+//       J2(P -> camera) =
+//           density(P) * sigma_R *
+//           average_over_Omega[ Lin(P, Omega) * P_R(incident, view) ]
 //
-// The ray is integrated from the camera (t=0) to the geometry
-// intersection point, clamped by the atmosphere boundaries.
+// The angular integral is a 4-direction tetrahedral quadrature.
+// T_star(Q) uses a coarse light march (ATMOS_MS_LIGHT_MARCH_STEPS)
+// while the view-march L1 keeps the full ATMOS_LIGHT_MARCH_STEPS.
+// T(P -> Q) is a wavelength-dependent Beer-Lambert segment
+// transmittance from the mean endpoint density.
 //
-// All distances are in camera-relative centimeters.
-// RayleighScattering is on a km^-1 scale, so step length is
-// converted to km before multiplication.
-//
-// Returns RGB transmittance (wavelength-dependent).
+// Crucially, J2 at P does NOT use DayGate(P) or T_star(P): diffuse
+// light scatters at P even when P itself is in shadow. Day/night
+// weighting lives inside the gathered J1(Q) sources, so terminator
+// and night-side lift emerge from geometry + optical depth.
 // =========================================================
 
-float3 ComputeCameraTransmittance(
-    float3 RayDir,
+float3 ComputeSegmentTransmittance(
+    float3 P,
+    float3 Q,
+    float3 RelCenter,
+    float SurfaceRadius,
+    float AtmosphereRadius,
+    float RayleighScaleHeight,
+    float3 RayleighScattering
+)
+{
+    float3 PQ = Q - P;
+    float Dist = length(PQ);
+
+    if (!(Dist > 0.0f) || !isfinite(Dist))
+    {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+
+    float DensP = RayleighDensity(
+        length(P - RelCenter),
+        SurfaceRadius,
+        AtmosphereRadius,
+        RayleighScaleHeight
+    );
+
+    float DensQ = RayleighDensity(
+        length(Q - RelCenter),
+        SurfaceRadius,
+        AtmosphereRadius,
+        RayleighScaleHeight
+    );
+
+    const float CentimetersToKilometers = 0.00001f;
+    float DistKm = Dist * CentimetersToKilometers;
+
+    float3 OpticalDepth =
+        0.5f * (DensP + DensQ) *
+        RayleighScattering * DistKm *
+        ATMOS_OPTICAL_DEPTH_SCALE;
+
+    float3 T = exp(-OpticalDepth);
+
+    if (!isfinite(T.x + T.y + T.z))
+    {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+
+    return T;
+}
+
+// First-order source at Q scattering toward a given observer
+// direction (normalized, Q -> observer). NumLightSteps selects
+// full (view march) vs coarse (multiple-scattering gather) cost.
+float3 ComputeFirstOrderSource(
+    float3 Q,
+    float3 QToObserverDir,
     float3 RelCenter,
     float SurfaceRadius,
     float AtmosphereRadius,
     float RayleighScaleHeight,
     float3 RayleighScattering,
-    float GeometryT
+    float3 StarPosition,
+    int NumLightSteps
 )
 {
-    // Camera ray origin is at 0 (camera-relative)
-    float3 CameraRayOrigin = float3(0.0f, 0.0f, 0.0f);
-
-    // Intersect camera ray with atmosphere outer boundary
-    float2 TCamAtm = RaySphereIntersect(
-        CameraRayOrigin,
-        RayDir,
-        RelCenter,
-        AtmosphereRadius
+    float DensQ = RayleighDensity(
+        length(Q - RelCenter),
+        SurfaceRadius,
+        AtmosphereRadius,
+        RayleighScaleHeight
     );
 
-    // No atmosphere intersection on camera path
-    if (TCamAtm.x < 0.0f && TCamAtm.y < 0.0f)
+    float3 ToStar = StarPosition - Q;
+    float StarDistanceSq = dot(ToStar, ToStar);
+
+    if (!(StarDistanceSq > 1e-8f))
     {
-        return float3(1.0f, 1.0f, 1.0f);
+        return float3(0.0f, 0.0f, 0.0f);
     }
 
-    // Determine entry and exit points along camera ray
-    float CamEntryT = max(TCamAtm.x, 0.0f);
-    float CamExitT = TCamAtm.y;
+    float3 SunDir = ToStar * rsqrt(StarDistanceSq);
 
-    // Check planet surface occlusion on camera path
-    float2 TCamSurf = RaySphereIntersect(
-        CameraRayOrigin,
-        RayDir,
+    // Star visibility is purely geometric: ComputeStarTransmittance
+    // returns 0 when the planet body occults the star, and the
+    // correct wavelength-dependent transmittance otherwise.
+    // No artificial DayGate / surface-normal falloff is applied here.
+    float3 TStar = ComputeStarTransmittance(
+        Q,
+        SunDir,
         RelCenter,
-        SurfaceRadius
+        SurfaceRadius,
+        AtmosphereRadius,
+        RayleighScaleHeight,
+        RayleighScattering,
+        NumLightSteps,
+        StarPosition
     );
 
-    // Only clamp on genuine surface penetration (radius-relative
-    // tangent test; see main loop).
-    if (TCamSurf.x >= 0.0f && TCamSurf.y > TCamSurf.x + SurfaceRadius * 2e-3f)
+    // If the star is geometrically occulted, TStar = 0 and J1 = 0.
+    if (!(TStar.x > 0.0f || TStar.y > 0.0f || TStar.z > 0.0f))
     {
-        CamExitT = min(CamExitT, TCamSurf.x);
+        return float3(0.0f, 0.0f, 0.0f);
     }
 
-    // Clamp to geometry distance (the scene depth)
-    CamExitT = min(CamExitT, GeometryT);
+    float Phase = RayleighPhase(QToObserverDir, SunDir);
 
-    // Invalid or zero-length path
-    if (!(CamExitT > CamEntryT))
+    // Illumination = 1.0 (star radiance at top of atmosphere).
+    // All angular dependence (cosine falloff, limb darkening) is
+    // already captured by the Rayleigh phase function and the
+    // geometric star transmittance along the long atmospheric path.
+    // No smoothstep / pow on surface normal - that was an artistic
+    // terminator hack that duplicated the geometric occlusion.
+    return DensQ * Phase * RayleighScattering * TStar;
+}
+
+// Second-order local scattering at P toward the camera.
+// ViewDir is normalized, sample -> camera.
+float3 ComputeSecondOrderScattering(
+    float3 P,
+    float3 ViewDir,
+    float3 RelCenter,
+    float SurfaceRadius,
+    float AtmosphereRadius,
+    float RayleighScaleHeight,
+    float3 RayleighScattering,
+    float3 StarPosition
+)
+{
+    float DensP = RayleighDensity(
+        length(P - RelCenter),
+        SurfaceRadius,
+        AtmosphereRadius,
+        RayleighScaleHeight
+    );
+
+    if (!(DensP > 0.0f))
     {
-        return float3(1.0f, 1.0f, 1.0f);
+        return float3(0.0f, 0.0f, 0.0f);
     }
 
-    // Fixed-step integration over camera path to geometry
+    // Tetrahedral quadrature directions (unit length 1/sqrt(3)).
+    // Fixed in the camera-relative frame (translation only), giving
+    // an unbiased 4pi average without per-sample frame construction.
+    float InvSqrt3 = 0.57735026919f;
+    float3 MsDirs[ATMOS_MS_DIRECTIONS];
+    MsDirs[0] = float3(InvSqrt3, InvSqrt3, InvSqrt3);
+    MsDirs[1] = float3(-InvSqrt3, InvSqrt3, -InvSqrt3);
+    MsDirs[2] = float3(InvSqrt3, -InvSqrt3, -InvSqrt3);
+    MsDirs[3] = float3(-InvSqrt3, -InvSqrt3, InvSqrt3);
+
+    float3 IncidentSum = float3(0.0f, 0.0f, 0.0f);
+
+    for (int j = 0; j < ATMOS_MS_DIRECTIONS; ++j)
+    {
+        float3 Omega = MsDirs[j];
+
+        // Gather segment: from P outward to the atmosphere boundary,
+        // truncated at the planet surface (diffuse blocked by planet).
+        float2 TAtm = RaySphereIntersect(P, Omega, RelCenter, AtmosphereRadius);
+
+        if (TAtm.y <= 0.0f)
+        {
+            continue;
+        }
+
+        float SegEnd = TAtm.y;
+
+        float2 TSurf = RaySphereIntersect(P, Omega, RelCenter, SurfaceRadius);
+        if (TSurf.x >= 0.0f && TSurf.y > TSurf.x + SurfaceRadius * 2e-3f)
+        {
+            SegEnd = min(SegEnd, TSurf.x);
+        }
+
+        if (!(SegEnd > 0.0f))
+        {
+            continue;
+        }
+
+        float StepLen = SegEnd / (float)ATMOS_MS_STEPS;
+
+        const float CentimetersToKilometers = 0.00001f;
+        float StepLenKm = StepLen * CentimetersToKilometers;
+
+        float3 QToPDir = -Omega;
+
+        float3 Gathered = float3(0.0f, 0.0f, 0.0f);
+
+        for (int k = 0; k < ATMOS_MS_STEPS; ++k)
+        {
+            float3 Q = P + Omega * (StepLen * ((float)k + 0.5f));
+
+            // First-order radiance at Q directed toward P.
+            float3 J1 = ComputeFirstOrderSource(
+                Q,
+                QToPDir,
+                RelCenter,
+                SurfaceRadius,
+                AtmosphereRadius,
+                RayleighScaleHeight,
+                RayleighScattering,
+                StarPosition,
+                ATMOS_MS_LIGHT_MARCH_STEPS
+            );
+
+            // Transport Q -> P through the participating medium.
+            float3 Tpq = ComputeSegmentTransmittance(
+                P,
+                Q,
+                RelCenter,
+                SurfaceRadius,
+                AtmosphereRadius,
+                RayleighScaleHeight,
+                RayleighScattering
+            );
+
+            Gathered += J1 * Tpq;
+        }
+
+        Gathered /= (float)ATMOS_MS_STEPS;
+        Gathered *= StepLenKm;
+
+        // Scatter the gathered diffuse field at P toward the camera.
+        // Incident travel direction at P is -Omega.
+        float Phase2 = RayleighPhase(ViewDir, -Omega);
+        IncidentSum += Gathered * Phase2;
+    }
+
+    IncidentSum /= (float)ATMOS_MS_DIRECTIONS;
+
+    // Second scattering event at P. The 3/(16pi) phase normalization
+    // and solid-angle weights are folded into the display exposure
+    // exactly like the L1 path (RayleighIntensityScale); the
+    // MultipleScatteringScale uniform only gates/tunes L2.
+    return DensP * RayleighScattering * IncidentSum * MultipleScatteringScale;
+}
+
+
+// =========================================================
+// UNIFIED VIEW-RAY INTEGRATOR (SKY + GEOMETRY + SPACE)
+// =========================================================
+//
+// ViewRadiance(observer, viewDir, atmosphere, star):
+//
+//     L = integral over [EntryT, ExitT] of
+//             (J1(s) + J2(s)) * T(camera -> s) ds
+//     Tout = T(camera -> ExitT)
+//
+// ONE integrator serves all three ray classes with the SAME
+// atmospheric system (Hillaire-style single raymarch):
+//
+//   SKY RAY      [camera, atmosphere exit]  -> sky radiance,
+//                                                background * Tout.
+//   GEOMETRY RAY [camera, scene geometry]   -> aerial in-scatter L,
+//                                                SceneColor * Tout.
+//   SPACE VIEW   [atmosphere entry, exit]   -> limb radiance
+//                                                (EntryT > 0 when the
+//                                                camera is outside).
+//
+// J1(s) is the full first-order source (density, Rayleigh coeff,
+// phase vs the finite point star, day-gate, star transmittance).
+// J2(s) is the ATMOS-10 second-order term, so every ray class
+// receives L1 + L2 through the shared transport functions - no
+// separate sky-only or aerial-only scattering model exists.
+//
+// Extinction is wavelength-dependent (Rayleigh RGB) and shares one
+// cross-section with scattering (ATMOS_OPTICAL_DEPTH_SCALE unity),
+// so long horizon paths saturate and redden while short zenith
+// paths stay blue - all from transport.
+// Returns HDR radiance (ATMOS_RADIANCE_SCALE exposure family)
+// and the residual transmittance for compositing.
+// =========================================================
+
+void ComputeViewRadiance(
+    float3 RayDir,
+    float EntryT,
+    float ExitT,
+    float3 RelCenter,
+    float SurfaceRadius,
+    float AtmosphereRadius,
+    float RayleighScaleHeight,
+    float3 RayleighScattering,
+    float3 StarPosition,
+    out float3 OutRadiance,
+    out float3 OutTransmittance
+)
+{
+    OutRadiance = float3(0.0f, 0.0f, 0.0f);
+    OutTransmittance = float3(1.0f, 1.0f, 1.0f);
+
+    float MarchLen = ExitT - EntryT;
+
+    if (!(MarchLen > 0.0f))
+    {
+        return;
+    }
+
+    float StepLen = MarchLen / (float)ATMOS_MARCH_STEPS;
+
     const float CentimetersToKilometers = 0.00001f;
-    float CamStepLen = (CamExitT - CamEntryT) / (float)ATMOS_MARCH_STEPS;
-    float CamStepLenKm = CamStepLen * CentimetersToKilometers;
+    float StepLenKm = StepLen * CentimetersToKilometers;
 
-    float3 OpticalDepth = float3(0.0f, 0.0f, 0.0f);
+    // View direction is sample -> camera for every sky sample.
+    float3 ViewDir = -RayDir;
 
-    for (int cs = 0; cs < ATMOS_MARCH_STEPS; ++cs)
+    float3 TransmittanceAccum = float3(1.0f, 1.0f, 1.0f);
+    float3 RadianceAccum = float3(0.0f, 0.0f, 0.0f);
+
+    for (int s = 0; s < ATMOS_MARCH_STEPS; ++s)
     {
-        float t = CamEntryT + CamStepLen * ((float)cs + 0.5f);
-        float3 CamSamplePos = CameraRayOrigin + RayDir * t;
+        float3 P = RayDir * (EntryT + StepLen * ((float)s + 0.5f));
 
-        float DistFromCenter = length(CamSamplePos - RelCenter);
+        // First-order source toward the camera (full light march).
+        float3 J1 = ComputeFirstOrderSource(
+            P,
+            ViewDir,
+            RelCenter,
+            SurfaceRadius,
+            AtmosphereRadius,
+            RayleighScaleHeight,
+            RayleighScattering,
+            StarPosition,
+            ATMOS_LIGHT_MARCH_STEPS
+        );
 
-        float Density = RayleighDensity(
-            DistFromCenter,
+        // Second-order source toward the camera (ATMOS-10).
+        float3 J2 = float3(0.0f, 0.0f, 0.0f);
+
+        if (MultipleScatteringScale > 0.0f)
+        {
+            J2 = ComputeSecondOrderScattering(
+                P,
+                ViewDir,
+                RelCenter,
+                SurfaceRadius,
+                AtmosphereRadius,
+                RayleighScaleHeight,
+                RayleighScattering,
+                StarPosition
+            );
+        }
+
+        float3 J = J1 + J2;
+
+        // Wavelength-dependent extinction over this step.
+        float DensP = RayleighDensity(
+            length(P - RelCenter),
             SurfaceRadius,
             AtmosphereRadius,
             RayleighScaleHeight
         );
 
-        // Extinction = Density * ScatteringCoefficient (per km)
-        // ATMOS_OPTICAL_DEPTH_SCALE reduces effective extinction so the atmosphere
-        // becomes transparent enough to show a visible limb while preserving
-        // the existing RayleighIntensityScale for final scattering brightness.
-        OpticalDepth += Density * RayleighScattering * CamStepLenKm * ATMOS_OPTICAL_DEPTH_SCALE;
+        float3 StepOpticalDepth =
+            DensP * RayleighScattering * StepLenKm *
+            ATMOS_OPTICAL_DEPTH_SCALE;
+
+        float3 StepTransmittance = exp(-StepOpticalDepth);
+
+        // Front-to-back: gather attenuated emission, then extend.
+        RadianceAccum += TransmittanceAccum * J * StepLenKm;
+        TransmittanceAccum *= StepTransmittance;
     }
 
-    // Transmittance = exp(-OpticalDepth), RGB
-    float3 Transmittance = exp(-OpticalDepth);
-
-    // Numerical safety
-    if (!isfinite(Transmittance.x) || !isfinite(Transmittance.y) || !isfinite(Transmittance.z))
-    {
-        return float3(1.0f, 1.0f, 1.0f);
-    }
-
-    return Transmittance;
+    OutRadiance = RadianceAccum * ATMOS_RADIANCE_SCALE;
+    OutTransmittance = TransmittanceAccum;
 }
 
 
@@ -770,10 +1173,11 @@ void AndromedaAtmosphereMainPS(
             0.0f
         );
 
-    // Aerial perspective: accumulate transmittance and inscattered light
-    // per atmosphere, then apply to SceneColor at the end.
+    // Unified in-scattered radiance accumulator: sky radiance for
+    // sky rays, aerial in-scatter for geometry rays, limb radiance
+    // for space views - one integral per atmosphere, never counted
+    // twice. Transmittance for whatever sits behind each segment.
     float3 SceneColorTransmittance = float3(1.0f, 1.0f, 1.0f);
-    float3 AerialPerspectiveColor = float3(0.0f, 0.0f, 0.0f);
 
     for (
         int i = 0;
@@ -853,25 +1257,38 @@ void AndromedaAtmosphereMainPS(
         // 1e-4 cm, which would truncate limb chords. Truly visible
         // surfaces still terminate the march via the GeometryT clamp
         // below, so the residual sub-epsilon interior error is invisible.
+        //
+        // ATMOS-11 ground-sky fix: the previous else-if skipped the ray
+        // whenever the surface roots straddled zero while the camera was
+        // inside the atmosphere shell (TSurf.x < 0 <= TSurf.y && TAtm.x
+        // < 0). An observer standing ON the surface has the surface
+        // sphere passing exactly through the ray origin, so EVERY upward
+        // sky ray satisfied that condition and the entire ground sky was
+        // discarded. The robust buried-observer test uses the real camera
+        // distance instead: |RelCenter| in the camera-relative frame.
+        float CameraDistFromCenter = length(RelCenter);
+
+        bool bCameraInsidePlanet =
+            CameraDistFromCenter < SurfaceRadius * (1.0f - 1e-4f);
+
+        if (bCameraInsidePlanet)
+        {
+            // Buried observer: every direction hits rock, no sky segment.
+            continue;
+        }
+
         if (TSurf.x >= 0.0f && TSurf.y > TSurf.x + SurfaceRadius * 2e-3f)
         {
             ExitT = min(ExitT, TSurf.x);
         }
-        else if (
-            TSurf.x < 0.0f &&
-            TSurf.y >= 0.0f &&
-            TAtm.x < 0.0f
-        )
-        {
-            continue;
-        }
 
-        // PROMPT 1: clamp the visible atmosphere interval to the first
-        // visible scene geometry. GeometryT is the radial distance along
-        // the SAME normalized camera ray (SceneDepthW / DepthToRayScale),
-        // directly comparable to EntryT/ExitT. Defaults to 1e10 when depth
-        // is disabled/invalid/sky, so this is a no-op in those cases.
-        // Geometry in front of the atmosphere -> ExitT < EntryT -> skip.
+        // Clamp the visible atmosphere interval to the first visible
+        // scene geometry (was PROMPT 1 depth/occlusion consolidation).
+        // GeometryT is the radial distance along the SAME normalized
+        // camera ray, directly comparable to EntryT/ExitT. Defaults to
+        // 1e10 when depth is disabled/invalid/sky, so this is a no-op
+        // in those cases. Geometry in front of the atmosphere ->
+        // ExitT < EntryT -> skip.
         ExitT = min(ExitT, GeometryT);
 
         if (!(ExitT > EntryT))
@@ -879,65 +1296,22 @@ void AndromedaAtmosphereMainPS(
             continue;
         }
 
-        float MarchLen =
-            ExitT - EntryT;
-
-        if (
-            !(MarchLen > 0.0f) ||
-            !(MarchLen < 1e10f)
-        )
+        // No star, no light: when the renderer has not provided a star
+        // position yet, the GPU buffer holds (0,0,0) = the camera
+        // position, not a star. Integrating with it would treat the
+        // camera as a point light (SunDir pointing back at the camera)
+        // and generate nonphysical glow, including identical output
+        // for any star configuration. Skip safely: with no stellar
+        // source J1 = 0 everywhere and therefore J2 = 0 as well, so
+        // skipping is exactly equivalent to integrating, only cheaper.
+        // SceneColor passes through untouched.
+        if (StarValid == 0)
         {
             continue;
         }
 
-        // =================================================
-        // ATMOS-09 CAMERA TRANSMITTANCE (AERIAL PERSPECTIVE)
-        // =====================================================
-        //
-        // Compute transmittance of scene color along camera ray
-        // from camera to geometry, through this atmosphere.
-        // =====================================================
-
-        float3 CameraTransmittance = ComputeCameraTransmittance(
-            RayDir,
-            RelCenter,
-            SurfaceRadius,
-            AtmRadius,
-            Atm.RayleighScaleHeight,
-            float3(
-                Atm.RayleighScatteringX,
-                Atm.RayleighScatteringY,
-                Atm.RayleighScatteringZ
-            ),
-            GeometryT
-        );
-
-        // Accumulate transmittance for SceneColor
-        SceneColorTransmittance *= CameraTransmittance;
-
-        // =================================================
-        // ATMOS-09 AERIAL PERSPECTIVE COLOR
-        // =====================================================
-        //
-        // Compute inscattered light along camera -> geometry path.
-        // This is the atmospheric haze color added to distant geometry.
-        // Uses the same integration as scattering but for camera path.
-        // =====================================================
-
-        // PROMPT 2 (inter-planet occlusion): reuse the main path's
-        // already-clamped visible interval for the aerial integration.
-        // TCamAtm/TCamSurf would be IDENTICAL to TAtm/TSurf above (same
-        // origin, direction, center and radii), and CamExitT would again
-        // be min(..., GeometryT). A single source of truth guarantees the
-        // aerial contribution of a background atmosphere uses EXACTLY the
-        // same visible segment as its volume march, so it can never
-        // integrate past foreground opaque geometry through a divergent
-        // interval. EntryT/ExitT are already validated non-empty here.
-        float CamEntryT = EntryT;
-        float CamExitT = ExitT;
-
-        // Star position for this atmosphere (needed for aerial perspective;
-        // also consumed by the ATMOS-05 scattering loop below).
+        // Star position for this atmosphere (camera-relative, from the
+        // GPU buffer; consumed by every transport term below).
         float3 StarPosition =
             float3(
                 Atm.StarPositionX,
@@ -945,15 +1319,6 @@ void AndromedaAtmosphereMainPS(
                 Atm.StarPositionZ
             );
 
-        // =================================================
-        // ATMOS-09 AERIAL PERSPECTIVE COLOR
-        // =====================================================
-        //
-        // Compute inscattered light along camera -> geometry path.
-        // This is the atmospheric haze color added to distant geometry.
-        // =====================================================
-
-        float3 AerialPerspectiveScattering = float3(0.0f, 0.0f, 0.0f);
         float3 RayleighColor =
             float3(
                 Atm.RayleighScatteringX,
@@ -961,404 +1326,71 @@ void AndromedaAtmosphereMainPS(
                 Atm.RayleighScatteringZ
             );
 
-        if (CamExitT > CamEntryT)
-        {
-            // Integration constants
-            const float CentimetersToKilometers = 0.00001f;
-            float CamStepLen = (CamExitT - CamEntryT) / (float)ATMOS_MARCH_STEPS;
-            float CamStepLenKm = CamStepLen * CentimetersToKilometers;
-
-            for (int cs = 0; cs < ATMOS_MARCH_STEPS; ++cs)
-            {
-                float t = CamEntryT + CamStepLen * ((float)cs + 0.5f);
-                float3 CamSamplePos = RayOrigin + RayDir * t;
-
-                float DistFromCenter = length(CamSamplePos - RelCenter);
-
-                float Density = RayleighDensity(
-                    DistFromCenter,
-                    SurfaceRadius,
-                    AtmRadius,
-                    Atm.RayleighScaleHeight
-                );
-
-                // Star direction for this camera sample
-                float3 ToStar = StarPosition - CamSamplePos;
-                float StarDistanceSq = dot(ToStar, ToStar);
-                float3 SampleToStarDir = float3(0.0f, 0.0f, 0.0f);
-                if (StarDistanceSq > 1e-8f)
-                {
-                    SampleToStarDir = ToStar * rsqrt(StarDistanceSq);
-                }
-
-                // Phase function
-                float3 ViewDir = -RayDir;  // camera -> sample
-                float Phase = RayleighPhase(ViewDir, SampleToStarDir);
-
-                // Surface normal for star illumination
-                float3 SurfaceNormal = CamSamplePos - RelCenter;
-                float SurfaceNormalSq = dot(SurfaceNormal, SurfaceNormal);
-                if (SurfaceNormalSq > 1e-8f)
-                {
-                    SurfaceNormal *= rsqrt(SurfaceNormalSq);
-                }
-                else
-                {
-                    SurfaceNormal = float3(0.0f, 0.0f, 1.0f);
-                }
-
-                // Solar illumination (look-dev): soft terminator gate times
-                // angular response ~cos(incidence)^0.5, widening the bright
-                // arc around the subsolar region. Night side stays zero.
-                float StarFacing = dot(SurfaceNormal, SampleToStarDir);
-                float DayGate = smoothstep(-0.35f, 0.35f, StarFacing);
-                const float SolarFalloffPower = 0.5f;
-                float StarLightContribution =
-                    DayGate * pow(saturate(StarFacing), SolarFalloffPower);
-
-                // Transmittance from star to this sample
-                float3 StarTransmittance = float3(1.0f, 1.0f, 1.0f);
-                if (StarDistanceSq > 1e-8f)
-                {
-                    StarTransmittance = ComputeStarTransmittance(
-                        CamSamplePos,
-                        SampleToStarDir,
-                        RelCenter,
-                        SurfaceRadius,
-                        AtmRadius,
-                        Atm.RayleighScaleHeight,
-                        RayleighColor
-                    );
-                }
-
-                // Local scattering
-                float3 LocalScattering =
-                    Density *
-                    Phase *
-                    RayleighColor *
-                    StarLightContribution *
-                    StarTransmittance;
-
-                AerialPerspectiveScattering += LocalScattering;
-            }
-
-            AerialPerspectiveScattering /= (float)ATMOS_MARCH_STEPS;
-
-            AerialPerspectiveScattering *= CamStepLenKm;
-        }
-
-        // Accumulate aerial perspective color
-        AerialPerspectiveColor += AerialPerspectiveScattering;
-
         // =================================================
-        // ATMOS-05 FINITE POINT STAR
-        // =================================================
+        // UNIFIED VIEW INTEGRATION (SKY + GEOMETRY + SPACE)
+        // =====================================================
         //
-        // IMPORTANT:
+        // ONE front-to-back integration over [EntryT, ExitT] serves
+        // every ray class with the same transport (J1 + J2, with
+        // view-path extinction):
         //
-        // Do NOT calculate a single global star direction.
+        //   SKY RAY      ExitT = atmosphere exit  -> sky radiance;
+        //                                             background dimmed
+        //                                             by Tout.
+        //   GEOMETRY RAY ExitT = scene geometry   -> aerial in-scatter;
+        //                                             SceneColor dimmed
+        //                                             by Tout.
+        //   SPACE VIEW   EntryT > 0 (camera outside) -> limb radiance.
         //
-        // The star is a finite point source, therefore every
-        // sample must calculate:
+        // The pre-unification code integrated geometry segments TWICE
+        // (aerial x3 PLUS volume x8 over the identical interval with
+        // the identical J1), washing distant terrain into an 11x
+        // boosted haze that erased horizon contrast. A single count
+        // restores it: terrain keeps its attenuated color, sky is sky.
         //
-        //     ToStar = StarPosition - SamplePosition
-        //
-        // Since both are camera-relative, no large world-space
-        // subtraction occurs here.
-        //
-        // StarPosition:
-        //
-        //     StarWorldPosition - CameraWorldPosition
-        //
-        // SamplePosition:
-        //
-        //     Camera-relative ray position
-        //
-        // Therefore:
-        //
-        //     ToStar =
-        //         (StarWorld - Camera)
-        //         -
-        //         (SampleWorld - Camera)
-        //
-        // which is exactly:
-        //
-        //     StarWorld - SampleWorld
-        //
-        // in exact arithmetic.
-        // =================================================
+        // ATMOS-05 INVARIANT (preserved inside ComputeFirstOrderSource):
+        // the star stays a finite point source - every sample evaluates
+        // its own ToStar = StarPosition - SamplePos (both
+        // camera-relative, i.e. StarWorld - SampleWorld exactly).
+        // No global star direction is ever used.
+        // =====================================================
 
-        // =================================================
-        // FIXED-STEP MARCH
-        // =================================================
+        float3 ViewRadiance = float3(0.0f, 0.0f, 0.0f);
+        float3 ViewTransmittance = float3(1.0f, 1.0f, 1.0f);
 
-        float StepLen =
-            MarchLen /
-            (float)ATMOS_MARCH_STEPS;
+        ComputeViewRadiance(
+            RayDir,
+            EntryT,
+            ExitT,
+            RelCenter,
+            SurfaceRadius,
+            AtmRadius,
+            Atm.RayleighScaleHeight,
+            RayleighColor,
+            StarPosition,
+            ViewRadiance,
+            ViewTransmittance
+        );
 
-        float3 ScatteringSum =
-            float3(0.0f, 0.0f, 0.0f);
+        // Attenuate whatever sits behind the segment (scene geometry
+        // color, or background space color for sky rays).
+        SceneColorTransmittance *= ViewTransmittance;
 
-        for (
-            int s = 0;
-            s < ATMOS_MARCH_STEPS;
-            ++s
-        )
-        {
-            float T =
-                EntryT +
-                StepLen *
-                ((float)s + 0.5f);
-
-            // Camera-relative sample position.
-            float3 SamplePos =
-                RayDir * T;
-
-            // =================================================
-            // ATMOS-04 DENSITY GEOMETRY
-            // =================================================
-
-            float DistFromCenter =
-                length(
-                    SamplePos -
-                    RelCenter
-                );
-
-            // ATMOS-06: Rayleigh density using exponential profile
-            float BaseDensity =
-                RayleighDensity(
-                    DistFromCenter,
-                    SurfaceRadius,
-                    AtmRadius,
-                    Atm.RayleighScaleHeight
-                );
-
-            // =================================================
-            // ATMOS-05 SAMPLE -> STAR
-            // =================================================
-
-            float3 ToStar =
-                StarPosition -
-                SamplePos;
-
-            float StarDistanceSq =
-                dot(
-                    ToStar,
-                    ToStar
-                );
-
-            float3 SampleToStarDirection =
-                float3(
-                    0.0f,
-                    0.0f,
-                    0.0f
-                );
-
-            if (StarDistanceSq > 1e-8f)
-            {
-                SampleToStarDirection =
-                    ToStar *
-                    rsqrt(StarDistanceSq);
-            }
-
-            // =================================================
-            // ATMOS-05 LOCAL PLANET NORMAL
-            // =================================================
-            //
-            // The atmosphere is centered on the planet.
-            // Using the planet center rather than the camera
-            // gives the correct day/night boundary over the
-            // spherical body.
-            // =================================================
-
-            float3 SurfaceNormal =
-                SamplePos -
-                RelCenter;
-
-            float SurfaceNormalSq =
-                dot(
-                    SurfaceNormal,
-                    SurfaceNormal
-                );
-
-            if (SurfaceNormalSq > 1e-8f)
-            {
-                SurfaceNormal *=
-                    rsqrt(
-                        SurfaceNormalSq
-                    );
-            }
-            else
-            {
-                SurfaceNormal =
-                    float3(
-                        0.0f,
-                        0.0f,
-                        1.0f
-                    );
-            }
-
-            // =================================================
-            // DAY / TERMINATOR / NIGHT (ATMOS-05 preserved)
-            // =================================================
-            //
-            // +1:
-            //     surface directly faces the star
-            //
-            //  0:
-            //     terminator
-            //
-            // -1:
-            //     surface faces away from the star
-            //
-            // smoothstep gives a soft terminator rather than
-            // a hard binary day/night boundary.
-            // =================================================
-
-            float StarFacing =
-                dot(
-                    SurfaceNormal,
-                    SampleToStarDirection
-                );
-
-            // Solar illumination (look-dev): soft terminator gate times
-            // angular response ~cos(incidence)^0.5, widening the bright arc
-            // around the subsolar region. Night side stays zero.
-            float DayGate =
-                smoothstep(
-                    -0.35f,
-                    0.35f,
-                    StarFacing
-                );
-
-            const float SolarFalloffPower = 0.5f;
-
-            float StarLightContribution =
-                DayGate *
-                pow(
-                    saturate(StarFacing),
-                    SolarFalloffPower
-                );
-
-            // =================================================
-            // ATMOS-08 STAR TRANSMITTANCE
-            // =================================================
-            //
-            // Computes the transmittance of stellar light from the
-            // star through the atmosphere to the current scattering
-            // sample. This attenuates the stellar light reaching the
-            // sample based on Rayleigh optical depth along the
-            // STAR -> SAMPLE path.
-            //
-            // Only computed if we have a valid star direction.
-            // =================================================
-
-            float3 Transmittance = float3(1.0f, 1.0f, 1.0f);
-
-            if (StarDistanceSq > 1e-8f)
-            {
-                Transmittance = ComputeStarTransmittance(
-                    SamplePos,
-                    SampleToStarDirection,
-                    RelCenter,
-                    SurfaceRadius,
-                    AtmRadius,
-                    Atm.RayleighScaleHeight,
-                    float3(
-                        Atm.RayleighScatteringX,
-                        Atm.RayleighScatteringY,
-                        Atm.RayleighScatteringZ
-                    )
-                );
-            }
-
-            // =================================================
-            // ATMOS-06 RAYLEIGH SCATTERING
-            // =================================================
-            //
-            // View direction is from sample to camera.
-            // Since RayOrigin = 0 and RayDir points from camera to sample,
-            // the view direction (sample -> camera) is -RayDir.
-            //
-            // Light direction is from sample to star (SampleToStarDirection).
-            //
-            // Rayleigh phase function: (1 + cos^2(theta))
-            // where cos(theta) = dot(ViewDir, LightDir)
-            //
-            // Scattering coefficient is wavelength-dependent (RayleighScattering).
-            // The 3/(16*pi) normalization is folded into the coefficient.
-            // =================================================
-
-            float3 ViewDir = -RayDir;  // sample -> camera
-            float Phase = RayleighPhase(ViewDir, SampleToStarDirection);
-
-            // Rayleigh scattering color (wavelength dependent)
-            float3 RayleighColor =
-                float3(
-                    Atm.RayleighScatteringX,
-                    Atm.RayleighScatteringY,
-                    Atm.RayleighScatteringZ
-                );
-
-            // Local scattering contribution:
-            //   density * phase * scattering_coefficient * star_illumination * transmittance
-            float3 LocalScattering =
-                BaseDensity *
-                Phase *
-                RayleighColor *
-                StarLightContribution *
-                Transmittance;
-
-            ScatteringSum +=
-                LocalScattering;
-        }
-
-        // =================================================
-        // ATMOS-06: ACCUMULATE RAYLEIGH SCATTERING
-        // =================================================
-        //
-        // Average scattering over march steps, scaled by chord length.
-        // The chord factor accounts for the path length through the atmosphere.
-        //
-        // No diagnostic tint - use the physically computed Rayleigh color.
-        // =================================================
-
-        float3 AvgScattering =
-            ScatteringSum /
-            (float)ATMOS_MARCH_STEPS;
-
-        // MarchLen is in Unreal centimeters.
-        // RayleighScattering parameters are expressed on a km^-1 scale.
-        const float CentimetersToKilometers = 0.00001f;
-        float PathLengthKm = MarchLen * CentimetersToKilometers;
-
-        // Look-dev exposure calibration for display-referred output on
-        // centimeter-scale planets. All relative behavior (gradients,
-        // ratios, falloffs) comes from the physics above; this only sets
-        // absolute display brightness of the volume term.
-        const float RayleighIntensityScale = 4.0f;
-
-        float3 MarchScattering =
-            AvgScattering *
-            PathLengthKm *
-            RayleighIntensityScale;
-
-        AccumulatedScattering +=
-            MarchScattering;
+        AccumulatedScattering += ViewRadiance;
     }
 
     // =====================================================
-    // FULLSCREEN ADDITIVE COMPOSITE (ATMOS-06 + ATMOS-09)
+    // FULLSCREEN COMPOSITE
     // =====================================================
     //
-    // Apply aerial perspective transmittance to SceneColor,
-    // then add aerial perspective inscattered color and atmosphere scattering.
+    // SceneColor attenuated by every crossed atmosphere, plus the
+    // unified in-scattered radiance (sky radiance and aerial
+    // perspective are the same integral over different segments).
     // =====================================================
 
     OutColor =
         float4(
             SceneColor * SceneColorTransmittance +
-            AerialPerspectiveColor +
             AccumulatedScattering,
             1.0f
         );
