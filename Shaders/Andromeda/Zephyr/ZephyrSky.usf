@@ -1,0 +1,526 @@
+// =========================================================
+// ZEPHYR SKY (pixel, ZEPHYR v2)
+// Virtual path: /Andromeda/Zephyr/ZephyrSky.usf
+// Entry: ZephyrSkyMainPS
+// =========================================================
+// Background composite. For every pixel:
+//
+//   1. Reconstruct the TRUE FSceneView camera ray (same
+//      camera-relative stabilization as the ATMOS path: the CPU
+//      precomputes Ri - Camera*Wi in double precision, so FOV,
+//      aspect, projection, editor jitter and PreViewTranslation
+//      are exact for game, PIE, editor-viewport and photo-mode
+//      views alike - no PlayerController is ever consulted).
+//   2. Read scene depth. Pixels holding opaque geometry pass
+//      through UNTOUCHED (ATMOS foreground preserved, order-
+//      independent compositing: opaque > ATMOS volume > ZEPHYR).
+//   3. Sky pixels: select the GOVERNING planet (closest ground
+//      below the camera, else nearest ray hit in transition zone,
+//      else nearest ray hit from space), map the ray to the
+//      Sky-View LUT (azimuth vs sun, elevation), fade across the
+//      near-space transition zone Rt..Rs (visual transition
+//      completes at Rs = PlanetRadius + MaxTerrain + 2 km while
+//      the physical shell stays Rt), add the
+//      transmittance-attenuated sun disk, overwrite.
+//
+// Zenith / horizon / sunset / night / high-altitude / space all
+// emerge from the baked transfer integral. The sun halo and the
+// bright forward horizon are the HG Mie lobe inside the LUT -
+// there is no painted glow sprite and no gradient lerp of any
+// artistic zenith/horizon color.
+//
+// OUTPUT: Linear HDR radiance * Exposure. UE tonemapper runs AFTER this pass.
+// =========================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
+#include "/Andromeda/Zephyr/ZephyrCommon.ush"
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+
+Texture2D SkySingleLUT;
+Texture2D SkyMultiLUT;
+Texture2D TransmittanceLUT;
+Texture2D MultiScatterLUT;
+SamplerState LutSampler;
+
+int2 ViewportSize;
+
+float3 CameraWorldPosition;
+float4x4 InvViewProjection;
+
+int PlanetCount;
+StructuredBuffer<FZephyrPlanetGPUData> PlanetBuffer;
+
+int DepthOcclusionEnabled;
+
+// READ-ONLY ATMOS coupling (see ZephyrShaders.h): ATMOS owns
+// limb chords when enabled; ZEPHYR must not double-count them.
+int AtmosEnabled;
+
+int StarValid;
+int DebugMode;
+int TransSliceHeight;
+int MSSliceHeight;
+int SkySliceHeight;
+float SunCosAngularRadius;
+float SunLuminance;
+float Exposure;
+float MieScale;
+float AbsorptionScale;
+float MultiScatterScale;
+
+void ZephyrSkyMainPS(
+    in float4 SvPosition : SV_Position,
+    out float4 OutColor : SV_Target0)
+{
+    float2 UV = SvPosition.xy
+        / max(float2(ViewportSize), float2(1.0f, 1.0f));
+
+    float3 SceneColor =
+        SceneColorTexture.Sample(SceneColorSampler, UV).rgb;
+
+    // No star position yet: skip safely, scene passes through untouched.
+    if (StarValid == 0 || PlanetCount <= 0)
+    {
+        OutColor = float4(SceneColor, 1.0f);
+        return;
+    }
+
+    // ---------------------------------------------------------
+    // Camera ray (ATMOS-04 stabilization heritage).
+    // ---------------------------------------------------------
+    float4 ClipPos = float4(
+        UV.x * 2.0f - 1.0f, 1.0f - UV.y * 2.0f, 1.0f, 1.0f);
+
+    float3 Row0 = float3(
+        InvViewProjection[0][0], InvViewProjection[0][1], InvViewProjection[0][2]);
+    float3 Row1 = float3(
+        InvViewProjection[1][0], InvViewProjection[1][1], InvViewProjection[1][2]);
+    float3 Row2 = float3(
+        InvViewProjection[2][0], InvViewProjection[2][1], InvViewProjection[2][2]);
+    float3 Row3 = float3(
+        InvViewProjection[3][0], InvViewProjection[3][1], InvViewProjection[3][2]);
+
+    float W = ClipPos.x * InvViewProjection[0][3]
+        + ClipPos.y * InvViewProjection[1][3]
+        + ClipPos.z * InvViewProjection[2][3]
+        + ClipPos.w * InvViewProjection[3][3];
+
+    if (!(W > 1e-6f) || !isfinite(W))
+    {
+        OutColor = float4(SceneColor, 1.0f);
+        return;
+    }
+
+    float3 Num = ClipPos.x * Row0 + ClipPos.y * Row1
+        + ClipPos.z * Row2 + ClipPos.w * Row3;
+    float3 RayVec = Num / W;
+    float RayLen = length(RayVec);
+
+    if (!(RayLen > 0.0f) || !isfinite(RayLen))
+    {
+        OutColor = float4(SceneColor, 1.0f);
+        return;
+    }
+
+    float3 RayDir = RayVec / RayLen;
+
+    // ---------------------------------------------------------
+    // Depth: geometry pixels pass through (ZEPHYR never covers
+    // opaque geometry, planets or terrain).
+    // ---------------------------------------------------------
+    float GeometryT = 1e10f;
+    bool bHasDepth = false;
+
+    if (DepthOcclusionEnabled != 0)
+    {
+        float SceneDepthDeviceZ =
+            SceneTexturesStruct.SceneDepthTexture.SampleLevel(
+                SceneTexturesStruct.PointClampSampler, UV, 0).r;
+
+        // In reversed-Z: 0.0 is cleared sky / far plane.
+        // Geometry has SceneDepthDeviceZ > 1e-7f.
+        if (SceneDepthDeviceZ > 1e-7f)
+        {
+            float SceneDepthW = SceneDepthDeviceZ
+                    * View.InvDeviceZToWorldZTransform[0]
+                + View.InvDeviceZToWorldZTransform[1]
+                + 1.0f / (SceneDepthDeviceZ
+                        * View.InvDeviceZToWorldZTransform[2]
+                    - View.InvDeviceZToWorldZTransform[3]);
+
+            float DepthToRayScale = W / RayLen;
+
+            if (SceneDepthW > 0.0f && DepthToRayScale > 0.0f)
+            {
+                GeometryT = SceneDepthW / DepthToRayScale;
+                if (GeometryT > 0.0f && isfinite(GeometryT))
+                {
+                    bHasDepth = true;
+                }
+                else
+                {
+                    GeometryT = 1e10f;
+                }
+            }
+        }
+    }
+
+    int ActivePlanets = PlanetCount;
+
+    // ---------------------------------------------------------
+    // Determine governing planet (unified logic for all cases).
+    // Priority:
+    //   1. Camera inside atmosphere shell (CamDist <= Rt): closest ground (min CamDist - Rg)
+    //   2. Camera in transition zone (Rt < CamDist <= max(Rs, Complete)): closest ground; fade completes at Complete
+    //   3. Camera in deep space (beyond all outer edges): nearest ray hit on atmosphere shell
+    // ---------------------------------------------------------
+    int GoverningSlice = -1;
+    float GoverningFade = 1.0f;
+    bool bCameraInsideAtmos = false;
+    bool bCameraInTransition = false;
+
+    // First pass: check if camera is inside any atmosphere shell
+    float BestInsideHeight = 1e30f;
+    float BestInsideRt = 1e30f;
+
+    for (int Sel = 0; Sel < ActivePlanets; ++Sel)
+    {
+        FZephyrPlanetGPUData Cand = PlanetBuffer[Sel];
+        float3 CandCenter = Cand.Packed0.xyz;
+        float CandRt = Cand.Packed1.x;
+        float CandRg = Cand.Packed0.w;
+
+        float CamDist = length(CandCenter);
+        if (CamDist < CandRg * (1.0f - 1e-4f))
+        {
+            continue; // Buried inside planet body
+        }
+
+        if (CamDist <= CandRt)
+        {
+            bCameraInsideAtmos = true;
+            float HeightAboveDatum = CamDist - CandRg;
+            if (HeightAboveDatum < BestInsideHeight
+                || (HeightAboveDatum == BestInsideHeight
+                    && CandRt < BestInsideRt))
+            {
+                BestInsideHeight = HeightAboveDatum;
+                BestInsideRt = CandRt;
+                GoverningSlice = Sel;
+            }
+        }
+    }
+
+    if (GoverningSlice < 0)
+    {
+        // Second pass: transition zones, per planet (mandated rule):
+        //   Complete = (PlanetRadius + TerrainHeight) * 1.1 (Packed6.w):
+        //              at/below it the planetary regime is 100% active.
+        //   Outer    = max(Rs, Complete): blend starts here or farther.
+        // Coverage is (Rt, Outer] so no gap exists between the physical
+        // shell and the completion radius in ANY configuration; the
+        // fade is monotone continuous (no pop, no flicker, no hole).
+        // Ranking (closest ground) is unchanged.
+        float BestZoneHeight = 1e30f;
+        for (int ZoneSel = 0; ZoneSel < ActivePlanets; ++ZoneSel)
+        {
+            FZephyrPlanetGPUData ZoneCand = PlanetBuffer[ZoneSel];
+            float ZoneDist = length(ZoneCand.Packed0.xyz);
+            float ZoneRg = ZoneCand.Packed0.w;
+            if (ZoneDist < ZoneRg * (1.0f - 1e-4f))
+            {
+                continue;
+            }
+            float ZoneRt = ZoneCand.Packed1.x;
+            float ZoneRs = ZephyrSkyTransitionRadiusCm(ZoneCand);
+            float ZoneComplete = ZephyrTransitionCompleteCm(ZoneCand);
+            float ZoneOuter = max(ZoneRs, ZoneComplete);
+            if (ZoneDist > ZoneRt && ZoneDist <= ZoneOuter)
+            {
+                bCameraInTransition = true;
+                float ZoneHeight = ZoneDist - ZoneRg;
+                if (ZoneHeight < BestZoneHeight)
+                {
+                    BestZoneHeight = ZoneHeight;
+                    GoverningSlice = ZoneSel;
+                }
+            }
+        }
+
+        if (GoverningSlice >= 0)
+        {
+            FZephyrPlanetGPUData ZoneP = PlanetBuffer[GoverningSlice];
+            float ZoneComplete = ZephyrTransitionCompleteCm(ZoneP);
+            float ZoneOuter = max(
+                ZephyrSkyTransitionRadiusCm(ZoneP), ZoneComplete);
+            GoverningFade = ZephyrSkyTransitionFade(
+                length(ZoneP.Packed0.xyz),
+                ZoneComplete,
+                ZoneOuter);
+            if (!(GoverningFade > 0.0f))
+            {
+                GoverningSlice = -1;
+            }
+        }
+    }
+
+    if (GoverningSlice < 0)
+    {
+        // Third pass: deep space - find nearest ray hit on atmosphere shell
+        int NearestHitSlice = -1;
+        float NearestHitT = 1e30f;
+        float2 NearestTAtm = float2(-1.0f, -1.0f);
+
+        for (int Sel = 0; Sel < ActivePlanets; ++Sel)
+        {
+            FZephyrPlanetGPUData Cand = PlanetBuffer[Sel];
+            float3 CandCenter = Cand.Packed0.xyz;
+            float CandRt = Cand.Packed1.x;
+
+            float2 THit = ZephyrRaySphere(float3(0, 0, 0), RayDir, CandCenter, CandRt);
+            if (THit.y > 0.0f)
+            {
+                float Entry = (THit.x >= 0.0f) ? THit.x : 0.0f;
+                if (Entry < NearestHitT)
+                {
+                    NearestHitT = Entry;
+                    NearestHitSlice = Sel;
+                    NearestTAtm = THit;
+                }
+            }
+        }
+
+        if (NearestHitSlice >= 0)
+        {
+            // Check if ray hits planet ground
+            FZephyrPlanetGPUData HitPlanet = PlanetBuffer[NearestHitSlice];
+            float3 HitCenter = HitPlanet.Packed0.xyz;
+            float HitRg = HitPlanet.Packed0.w;
+            float HitRt = HitPlanet.Packed1.x;
+
+            float2 THitGround = ZephyrRaySphere(float3(0, 0, 0), RayDir, HitCenter, HitRg);
+            bool bHitsPlanetGround = (THitGround.x >= 0.0f && THitGround.y > THitGround.x + HitRg * 2e-3f);
+
+            // If ray hits planet ground or scene depth has foreground geometry:
+            if (bHitsPlanetGround || (bHasDepth && GeometryT <= NearestTAtm.y * 1.001f))
+            {
+                OutColor = float4(SceneColor, 1.0f);
+                return;
+            }
+
+            // NO-DOUBLE-ATMOSPHERE RULE:
+            // ATMOS integrates limb chords in its own pass.
+            // When ATMOS is enabled it owns the limb.
+            if (AtmosEnabled != 0)
+            {
+                OutColor = float4(SceneColor, 1.0f);
+                return;
+            }
+
+            // Space limb: use SkyView LUT if available, else fallback to numerical integration
+            // For ZEPHYR v2, we sample the SkyView LUT for the limb view direction.
+            // The SkyView LUT was baked for the camera height (which is > Rt in space).
+            GoverningSlice = NearestHitSlice;
+            GoverningFade = 1.0f; // No fade for limb - SkyView LUT handles it
+            bCameraInsideAtmos = false;
+        }
+    }
+
+    // If no governing planet found, it's deep space
+    if (GoverningSlice < 0)
+    {
+        if (bHasDepth)
+        {
+            OutColor = float4(SceneColor, 1.0f);
+            return;
+        }
+
+        // Deep space: only sun disk (no atmosphere)
+        // Sun direction: use first planet's SunDirPlanet as reference (all ~same for distant star)
+        float3 SunDirRef = normalize(PlanetBuffer[0].Packed6.xyz);
+        float CosViewSun = dot(RayDir, SunDirRef);
+        float SunAA = fwidth(CosViewSun) + 1e-7f;
+        float SunMask = smoothstep(
+            SunCosAngularRadius - SunAA,
+            SunCosAngularRadius + SunAA,
+            CosViewSun);
+        float3 SunDisk = SunLuminance * SunMask;
+        // Linear HDR output (UE tonemaps after)
+        OutColor = float4(SceneColor + SunDisk * Exposure, 1.0f);
+        return;
+    }
+
+    // ---------------------------------------------------------
+    // We have a governing planet - render its sky
+    // ---------------------------------------------------------
+    FZephyrPlanetGPUData P = PlanetBuffer[GoverningSlice];
+    float3 RelCenter = P.Packed0.xyz;
+    float CamDist = length(RelCenter);
+    float RgCm = P.Packed0.w;
+    float RtCm = P.Packed1.x;
+
+    // SKY MASK: visible opaque geometry ALWAYS keeps its SceneColor.
+    if (bHasDepth)
+    {
+        OutColor = float4(SceneColor, 1.0f);
+        return;
+    }
+
+    // SUN LIGHT REFERENCE CONTRACT (all World Space):
+    //   SunDir = Planet->Sun (from ASun::AtmosphereLightReference),
+    //   Up     = -RelCenter / CamDist (world),
+    //   RayDir = world camera ray.
+    // No planet-local rotation is applied to SunDir in the renderer,
+    // so mu_s = dot(SunDir, Up), nu = dot(RayDir, SunDir), the sun
+    // disk and the occultation ray all agree in one frame.
+    float3 SunDir = normalize(P.Packed6.xyz);
+    float3 Up = -RelCenter / max(CamDist, 1e-6f);
+
+    // View elevation (sin of latitude)
+    float SinEl = clamp(dot(RayDir, Up), -1.0f, 1.0f);
+
+    // Azimuth: angle between view horizontal and sun horizontal
+    float3 SunH = SunDir - Up * dot(SunDir, Up);
+    float SunHLen = length(SunH);
+    float Azimuth01 = 0.0f;
+
+    if (SunHLen > 1e-3f)
+    {
+        SunH /= SunHLen;
+        float3 RayH = RayDir - Up * SinEl;
+        float RayHLen = length(RayH);
+        if (RayHLen > 1e-6f)
+        {
+            float CosAz = clamp(dot(RayH / RayHLen, SunH), -1.0f, 1.0f);
+            Azimuth01 = acos(CosAz) / 3.14159265f;
+        }
+    }
+
+    // Map to SkyView LUT coordinates
+    float VCoord = ZephyrSkyVFromSinEl(SinEl);
+
+    // Sample SkyView LUTs
+    float3 SkySS = ZephyrSampleSkySlice(
+        SkySingleLUT, LutSampler, Azimuth01, VCoord,
+        GoverningSlice, SkySliceHeight, ActivePlanets);
+    float3 SkyMS = ZephyrSampleSkySlice(
+        SkyMultiLUT, LutSampler, Azimuth01, VCoord,
+        GoverningSlice, SkySliceHeight, ActivePlanets);
+
+    // REGIME BLEND, not a brightness fade (visual refinement):
+    // SkyVisibility (GoverningFade) selects between render domains
+    // while AtmosphericRadiance (SkySS/SkyMS) stays physical for this
+    // camera height and is NEVER dimmed. At fade 0 the background
+    // regime shows through (SceneColor: space + aerial-stage limb and
+    // sky, so crossing the outer edge never dips to black); at fade 1
+    // (completion radius and inside) the LUT owns the pixel. Monotone
+    // continuous, no pop, no double count (mix, not add). The blend is
+    // applied once at the composite below, not here.
+    // (NOTE: bCameraInTransition/GoverningFade still drive the mix.)
+
+    // Sun disk
+    float CosViewSun = dot(RayDir, SunDir);
+    float SunAA = fwidth(CosViewSun) + 1e-7f;
+    float SunMask = smoothstep(
+        SunCosAngularRadius - SunAA,
+        SunCosAngularRadius + SunAA,
+        CosViewSun);
+
+    float ShellCm = max(RtCm - RgCm, 1.0f);
+    float HCam01 = clamp((CamDist - RgCm) / ShellCm, 0.0f, 1.0f);
+    float MuSunG = dot(SunDir, Up);
+
+    float2 TSunGround = ZephyrRaySphere(float3(0, 0, 0), SunDir, RelCenter, RgCm);
+    bool bSunOcculted = (TSunGround.x > 0.0f && TSunGround.y > TSunGround.x + RgCm * 2e-3f);
+
+    float3 SunTrans = float3(1, 1, 1);
+    if (bSunOcculted)
+    {
+        SunTrans = float3(0, 0, 0);
+    }
+    else
+    {
+        SunTrans = ZephyrSampleTransmittance(
+            TransmittanceLUT, LutSampler,
+            clamp(HCam01, 0.0f, 1.0f), MuSunG,
+            GoverningSlice, TransSliceHeight, ActivePlanets);
+    }
+
+    float3 SunDisk = SunLuminance * SunTrans * SunMask;
+
+    // Debug modes
+    if (DebugMode == 1) // ZEPHYR_TRANSMITTANCE: raw LUT slice
+    {
+        float Mu = UV.x * 2.0f - 1.0f;
+        float H = (1.0f - UV.y);
+        H = H * H;
+        float3 T = ZephyrSampleTransmittance(
+            TransmittanceLUT, LutSampler, H, Mu,
+            GoverningSlice, TransSliceHeight, ActivePlanets);
+        OutColor = float4(T * Exposure, 1.0f);
+        return;
+    }
+
+    if (DebugMode == 2) // ZEPHYR_SINGLE_SCATTER
+    {
+        OutColor = float4((SkySS + SunDisk) * Exposure, 1.0f);
+        return;
+    }
+    if (DebugMode == 3) // ZEPHYR_MULTI_SCATTER
+    {
+        OutColor = float4(SkyMS * Exposure, 1.0f);
+        return;
+    }
+    if (DebugMode == 4) // ZEPHYR_MIE
+    {
+        float CosT = clamp(CosViewSun, -1.0f, 1.0f);
+        float Lobe = ZephyrMiePhase(CosT, P.Packed1.w);
+        OutColor = float4(Lobe * SunTrans * P.Packed3.xyz * Exposure * 0.25f, 1.0f);
+        return;
+    }
+    if (DebugMode == 5) // ZEPHYR_RAYLEIGH
+    {
+        float Lobe = ZephyrRayleighPhase(clamp(CosViewSun, -1.0f, 1.0f));
+        OutColor = float4(Lobe * SunTrans * P.Packed2.xyz * Exposure * 2.0f, 1.0f);
+        return;
+    }
+    if (DebugMode == 6) // ZEPHYR_ABSORPTION: sun-path beam loss
+    {
+        OutColor = float4((1.0f - SunTrans) * Exposure, 1.0f);
+        return;
+    }
+    if (DebugMode == 7) // ZEPHYR_SKY_VIEW_LUT: raw SS atlas
+    {
+        float3 L = ZephyrSampleSkySlice(
+            SkySingleLUT, LutSampler, UV.x, UV.y,
+            GoverningSlice, SkySliceHeight, ActivePlanets);
+        OutColor = float4(L * Exposure, 1.0f);
+        return;
+    }
+    if (DebugMode == 8) // ZEPHYR_MULTI_SCATTER_LUT: raw MS atlas
+    {
+        float Mu = UV.x * 2.0f - 1.0f;
+        float H = (1.0f - UV.y);
+        H = H * H;
+        float3 M = ZephyrSampleMultiScatter(
+            MultiScatterLUT, LutSampler, H, Mu,
+            GoverningSlice, MSSliceHeight, ActivePlanets);
+        OutColor = float4(M * Exposure, 1.0f);
+        return;
+    }
+
+    // Full planetary sky radiance: LINEAR HDR
+    // NO ZephyrTonemap here - UE tonemapper runs after this pass.
+    // Regime composite: lerp(SceneColor, LUT-sky, GoverningFade).
+    // Inside/complete (fade 1) this equals the LUT exactly, as before;
+    // through the transition it crossfades background regime and LUT
+    // instead of blacking out. The sun disk is added unfaded (thin-air
+    // sun stays visible) and already carries its own transmittance.
+    float3 SkyRadiance =
+        lerp(SceneColor, SkySS + SkyMS, GoverningFade) + SunDisk;
+    OutColor = float4(SkyRadiance * Exposure, 1.0f);
+}

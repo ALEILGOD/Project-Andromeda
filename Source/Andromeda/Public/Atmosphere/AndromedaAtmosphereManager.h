@@ -6,8 +6,14 @@
 
 
 // =========================================================
-// ANDROMEDA ATMOSPHERE MANAGER
+// ANDROMEDA ATMOSPHERE MANAGER — PHASE 2.1 DEPRECATED
 // =========================================================
+// Replaced as data owner by FAndromedaAtmosphereSystem
+// (Atmosphere/AndromedaAtmosphereSystem.h), the single mailbox of
+// the unified atmosphere. The Registry no longer registers handles
+// here and no render stage reads from here. This class still
+// compiles and works but is off the active path; it will be
+// removed after visual validation. Do not add new callers.
 
 class ANDROMEDA_API FAndromedaAtmosphereManager
 {
@@ -63,12 +69,12 @@ public:
 
     bool FindAtmosphere(
         FAndromedaAtmosphereHandle Handle,
-        FAndromedaAtmosphereInstance& OutInstance
+        FLegacyAndromedaAtmosphereInstance& OutInstance
     ) const;
 
 
     void GetAtmosphereSnapshot(
-        TArray<FAndromedaAtmosphereInstance>& OutSnapshot
+        TArray<FLegacyAndromedaAtmosphereInstance>& OutSnapshot
     ) const;
 
 
@@ -87,7 +93,7 @@ private:
 
     mutable FCriticalSection RegistryLock;
 
-    TMap<uint32, FAndromedaAtmosphereInstance> Atmospheres;
+    TMap<uint32, FLegacyAndromedaAtmosphereInstance> Atmospheres;
 
     uint32 NextHandleId = 1;
 

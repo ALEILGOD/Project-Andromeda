@@ -1,0 +1,227 @@
+// =========================================================
+// ZEPHYR SKY-VIEW LUT (compute, ZEPHYR v2)
+// Virtual path: /Andromeda/Zephyr/ZephyrSkyView.usf
+// Entry: ZephyrSkyViewMainCS
+// =========================================================
+// Lsky(cameraHeight, viewDir): sky radiance seen from the
+// CURRENT camera, per planet slice, as TWO atlases:
+//
+//   OutSkySingle: int T_view * (S_Rayleigh + S_Mie) ds
+//   OutSkyMulti:  int T_view *  S_Multiple          ds
+//
+// METHOD (Hillaire 2020, section 5): for each texel, rebuild
+// the view ray (azimuth vs the sun, elevation with horizon
+// concentration), march it front-to-back through the shell:
+//
+//   L  = integral J(s) * T(camera -> s) ds
+//   J1 = (sigmaR*densR*PhaseR + sigmaM*densM*PhaseM) * T_star
+//   J2 = MS_LUT(height(s), sunZenith(s))
+//
+// with wavelength-dependent view-path extinction sharing the
+// single cross-section. T_star and J2 come from the
+// planet-dependent LUTs (never recomputed inline), so this
+// pass is VIEW-dependent only: camera altitude and sun
+// direction invalidate it, profile data does not beyond the
+// LUT contents themselves.
+//
+// SUN LIGHT REFERENCE: each planet slice uses ITS OWN world-frame
+// Planet->Sun direction (parallax preserved), baked from
+// ASun::AtmosphereLightReference and stored in Packed6.xyz. Same
+// world frame as the camera/ march geometry: no planet-local
+// rotation anywhere in this pass. The old single SunDirectionCam
+// uniform is REMOVED.
+//
+// Cameras above the shell are supported (EntryT > 0 -> limb/space rays).
+// =========================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Andromeda/Zephyr/ZephyrCommon.ush"
+
+StructuredBuffer<FZephyrPlanetGPUData> PlanetBuffer;
+Texture2D InTransmittance;
+Texture2D InMultiScatter;
+SamplerState LinearClampSampler;
+RWTexture2D<float4> OutSkySingle;
+RWTexture2D<float4> OutSkyMulti;
+
+int PlanetCount;
+int TransSliceHeight;
+int MSSliceHeight;
+int SliceHeight;
+float MieScale;
+float AbsorptionScale;
+float MultiScatterScale;
+
+[numthreads(8, 8, 1)]
+void ZephyrSkyViewMainCS(
+    uint3 GroupId : SV_GroupID,
+    uint3 GroupThreadId : SV_GroupThreadID,
+    uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    int TexelX = int(DispatchThreadId.x);
+    int TexelY = int(DispatchThreadId.y);
+
+    int Slice = TexelY / max(SliceHeight, 1);
+    int LocalY = TexelY - Slice * max(SliceHeight, 1);
+
+    if (Slice < 0 || Slice >= PlanetCount)
+    {
+        return;
+    }
+
+    FZephyrPlanetGPUData P = PlanetBuffer[Slice];
+
+    // Camera frame, centimeters, camera-relative (camera = 0).
+    float3 RelCenter = ZephyrRelCenterCm(P);
+    float RgCm = P.Packed0.w;
+    float RtCm = P.Packed1.x;
+
+    float CamDistCm = length(RelCenter);
+
+    float4 ZeroOut = float4(0, 0, 0, 1);
+    int2 OutCoord = int2(TexelX, TexelY);
+
+    // Buried camera: every direction hits rock, no sky segment.
+    if (CamDistCm < RgCm * (1.0f - 1e-4f))
+    {
+        OutSkySingle[OutCoord] = ZeroOut;
+        OutSkyMulti[OutCoord] = ZeroOut;
+        return;
+    }
+
+    float U = (float(TexelX) + 0.5f) / 192.0f;
+    float V = (float(LocalY) + 0.5f) / float(max(SliceHeight, 1));
+
+    float Azimuth = U * 3.14159265f; // 0 = toward sun .. pi = away
+    float SinEl = ZephyrSkySinElFromV(V);
+    float CosEl = sqrt(max(0.0f, 1.0f - SinEl * SinEl));
+
+    // SUN LIGHT REFERENCE CONTRACT (all World Space): SunDir is
+    // Planet->Sun from ASun::AtmosphereLightReference; UpCam and the
+    // marched ViewDir are world-frame. No planet-local rotation.
+    float3 UpCam = -RelCenter / max(CamDistCm, 1e-6f);
+    float3 SunDir = ZephyrSunDirPlanet(P);
+
+    // Sun-frame basis at the camera.
+    float3 SunH = SunDir - UpCam * dot(SunDir, UpCam);
+    float SunHLen = length(SunH);
+    if (!(SunHLen > 1e-3f))
+    {
+        // Sun near zenith: arbitrary stable perpendicular.
+        SunH = abs(UpCam.y) < 0.99f
+            ? normalize(cross(UpCam, float3(0, 1, 0)))
+            : normalize(cross(UpCam, float3(1, 0, 0)));
+    }
+    else
+    {
+        SunH /= SunHLen;
+    }
+    float3 Side = normalize(cross(UpCam, SunH));
+
+    float3 ViewDir = CosEl * (cos(Azimuth) * SunH + sin(Azimuth) * Side)
+        + SinEl * UpCam;
+
+    float2 TAtm = ZephyrRaySphere(
+        float3(0, 0, 0), ViewDir, RelCenter, RtCm);
+    if (TAtm.x < 0.0f && TAtm.y < 0.0f)
+    {
+        OutSkySingle[OutCoord] = ZeroOut;
+        OutSkyMulti[OutCoord] = ZeroOut;
+        return;
+    }
+
+    float EntryT = (TAtm.x >= 0.0f) ? TAtm.x : 0.0f;
+    float ExitT = TAtm.y;
+
+    // Ground clamp.
+    float2 TSurf = ZephyrRaySphere(
+        float3(0, 0, 0), ViewDir, RelCenter, RgCm);
+    if (TSurf.x >= 0.0f && TSurf.y > TSurf.x + RgCm * 2e-3f)
+    {
+        ExitT = min(ExitT, TSurf.x);
+    }
+
+    if (!(ExitT > EntryT))
+    {
+        OutSkySingle[OutCoord] = ZeroOut;
+        OutSkyMulti[OutCoord] = ZeroOut;
+        return;
+    }
+
+    float ShellKm = ZephyrShellKm(P);
+    float RgKm = ZephyrGroundRadiusKm(P);
+
+    float3 SigmaR = P.Packed2.xyz;
+    float3 SigmaM = P.Packed3.xyz * MieScale;
+    float Aniso = P.Packed1.w;
+
+    float MarchLen = ExitT - EntryT;
+    float CosT = clamp(dot(ViewDir, SunDir), -1.0f, 1.0f);
+    float RayPhaseR = ZephyrRayleighPhase(CosT);
+    float RayPhaseM = ZephyrMiePhase(CosT, Aniso);
+
+    float InvStepsSq = 1.0f / float(ZEPHYR_SKY_STEPS * ZEPHYR_SKY_STEPS);
+
+    float3 TransAccum = float3(1, 1, 1);
+    float3 SSAccum = float3(0, 0, 0);
+    float3 MSAccum = float3(0, 0, 0);
+
+    for (int Step = 0; Step < ZEPHYR_SKY_STEPS; ++Step)
+    {
+        // Non-linear quadratic distribution: clusters steps near the camera.
+        float MidFrac = (float(Step) + 0.5f) / float(ZEPHYR_SKY_STEPS);
+        float SampleDist = MarchLen * (MidFrac * MidFrac);
+        float CurStepLenCm = MarchLen * (2.0f * float(Step) + 1.0f) * InvStepsSq;
+        float CurStepLenKm = CurStepLenCm * ZEPHYR_CM_TO_KM;
+
+        float3 Pc = ViewDir * (EntryT + SampleDist);
+        float DistC = length(Pc - RelCenter);
+        float AltKm = DistC * ZEPHYR_CM_TO_KM - RgKm;
+        float H01 = clamp(AltKm / ShellKm, 0.0f, 1.0f);
+        float3 UpS = (Pc - RelCenter) / max(DistC, 1e-6f);
+        float MuS = dot(SunDir, UpS);
+
+        float DensR = ZephyrRayleighDensity(
+            AltKm, ShellKm, P.Packed1.y, P.Packed2.w);
+        float DensM = ZephyrMieDensity(
+            AltKm, ShellKm, P.Packed1.z, ZephyrMieDensityScale(P));
+
+        float3 TStar = ZephyrSampleTransmittance(
+            InTransmittance, LinearClampSampler,
+            H01, MuS, Slice, TransSliceHeight, PlanetCount);
+
+        float3 J1 = (DensR * SigmaR * RayPhaseR
+                + DensM * SigmaM * RayPhaseM)
+            * TStar;
+
+        float3 J2 = ZephyrSampleMultiScatter(
+            InMultiScatter, LinearClampSampler,
+            H01, MuS, Slice, MSSliceHeight, PlanetCount)
+            * MultiScatterScale;
+
+        SSAccum += TransAccum * J1 * CurStepLenKm;
+        MSAccum += TransAccum * J2 * CurStepLenKm;
+
+        float3 StepOD = ZephyrExtinction(
+                P, AltKm, MieScale, AbsorptionScale) * CurStepLenKm;
+        TransAccum *= exp(-StepOD);
+
+        if (!isfinite(SSAccum.x + SSAccum.y + SSAccum.z))
+        {
+            SSAccum = float3(0, 0, 0);
+            MSAccum = float3(0, 0, 0);
+            break;
+        }
+    }
+
+    // RADIANCE CALIBRATION (not physics): the march accumulates
+    // physical radiance (~1e-2 for an Earth-like column with
+    // normalized phases), which displays near-black. Scale ONCE,
+    // here, by ZEPHYR_RADIANCE_SCALE (display gain contract, see
+    // ZephyrCommon.ush: ratios, chromaticity and night-zero are
+    // untouched). Transmittance, MS-LUT contents, sun disk, debug
+    // views and Exposure are NOT scaled here. ZeroOut early paths
+    // above stay zero (no-sky markers, never radiance).
+    OutSkySingle[OutCoord] = float4(SSAccum * ZEPHYR_RADIANCE_SCALE, 1);
+    OutSkyMulti[OutCoord] = float4(MSAccum * ZEPHYR_RADIANCE_SCALE, 1);
+}

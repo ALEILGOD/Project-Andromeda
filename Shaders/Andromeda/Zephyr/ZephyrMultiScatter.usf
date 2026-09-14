@@ -1,0 +1,185 @@
+// =========================================================
+// ZEPHYR MULTI-SCATTERING LUT (compute, ZEPHYR v2)
+// Virtual path: /Andromeda/Zephyr/ZephyrMultiScatter.usf
+// Entry: ZephyrMultiScatterMainCS
+// =========================================================
+// MS(height, sunZenith): second-order in-scattering source at a
+// point (radiance per km) - the diffuse field that has ALREADY
+// been scattered once elsewhere, scattered once more toward the
+// observer, averaged over incident directions.
+//
+// METHOD: Dual-scattering approximation (NOT the full Hillaire
+// iterative multi-scattering). For each texel, gather incident
+// light along ZEPHYR_MS_DIRS (8) fibonacci-sphere directions;
+// along each, march ZEPHYR_MS_STEPS (8) short segments evaluating
+// the FULL first-order source (density x sigma x phase x LUT
+// star-transmittance, with finite-geometry ground bounce),
+// transported by Beer-Lambert segment transmittance. The average
+// incident field is scattered once more at P (density x sigma).
+//
+// This is a dual-scattering APPROXIMATION, not the full iterative
+// Hillaire/Bruneton multi-scattering (which precomputes scattering
+// densities and iterates orders 2..N). It captures the dominant
+// second-order contribution (terminator lift, horizon bleed, blue
+// hour ambient) but does NOT converge to the full infinite-order
+// solution. Disabling it (MultiScatterScale 0) removes these
+// effects, which debug views demonstrate.
+//
+// One-bounce Lambertian ground (Bruneton orders >= 2 include
+// the ground): downward gather rays hitting the planet add the
+// albedo-weighted reflected beam, transported to P.
+//
+// Depends ONLY on the planet profile (+ global debug scales):
+// invalidated on profile change alone.
+// =========================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Andromeda/Zephyr/ZephyrCommon.ush"
+
+StructuredBuffer<FZephyrPlanetGPUData> PlanetBuffer;
+Texture2D InTransmittance;
+SamplerState LinearClampSampler;
+RWTexture2D<float4> OutMultiScatter;
+
+int PlanetCount;
+int TransSliceHeight;
+int SliceHeight;
+float MieScale;
+float AbsorptionScale;
+
+[numthreads(8, 8, 1)]
+void ZephyrMultiScatterMainCS(
+    uint3 GroupId : SV_GroupID,
+    uint3 GroupThreadId : SV_GroupThreadID,
+    uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    int TexelX = int(DispatchThreadId.x);
+    int TexelY = int(DispatchThreadId.y);
+
+    int Slice = TexelY / max(SliceHeight, 1);
+    int LocalY = TexelY - Slice * max(SliceHeight, 1);
+
+    if (Slice < 0 || Slice >= PlanetCount)
+    {
+        return;
+    }
+
+    FZephyrPlanetGPUData P = PlanetBuffer[Slice];
+
+    float U = (float(TexelX) + 0.5f) / 32.0f;
+    float V = (float(LocalY) + 0.5f) / float(max(SliceHeight, 1));
+
+    float MuSun = ZephyrTransMuFromU(U);
+    float H01 = ZephyrTransH01FromV(V);
+
+    float RgKm = ZephyrGroundRadiusKm(P);
+    float RtKm = ZephyrAtmoRadiusKm(P);
+    float ShellKm = ZephyrShellKm(P);
+
+    float3 Point = float3(0.0f, RgKm + H01 * ShellKm, 0.0f);
+    float3 UpP = float3(0, 1, 0);
+    float SinS = sqrt(max(0.0f, 1.0f - MuSun * MuSun));
+    float3 SunDir = float3(SinS, MuSun, 0.0f);
+
+    float DensP_R = ZephyrRayleighDensity(
+        H01 * ShellKm, ShellKm, P.Packed1.y, P.Packed2.w);
+    float DensP_M = ZephyrMieDensity(
+        H01 * ShellKm, ShellKm, P.Packed1.z, ZephyrMieDensityScale(P));
+
+    float3 SigmaR = P.Packed2.xyz;
+    float3 SigmaM = P.Packed3.xyz * MieScale;
+    float Aniso = P.Packed1.w;
+
+    // Lambertian ground source below P (one bounce): albedo / pi
+    // times the attenuated beam arriving at the ground point.
+    float3 GroundSource = (P.Packed3.w / 3.14159265f)
+        * ZephyrSampleTransmittance(
+            InTransmittance, LinearClampSampler,
+            0.0f, MuSun, Slice, TransSliceHeight, PlanetCount)
+        * max(MuSun, 0.0f);
+
+    // Transport-scale gather: integrate over ~3 Rayleigh scale heights
+    // to capture the twilight wedge correctly on all planet sizes.
+    float GatherLen = 3.0f * ZephyrEffectiveScaleKm(ShellKm, P.Packed1.y);
+    float StepLen = GatherLen / float(max(ZEPHYR_MS_STEPS, 1));
+
+    float3 IncidentSum = float3(0, 0, 0);
+
+    for (int DirIndex = 0; DirIndex < ZEPHYR_MS_DIRS; ++DirIndex)
+    {
+        float3 Omega = ZephyrFibonacciDir(DirIndex, ZEPHYR_MS_DIRS);
+        float3 QToP = -Omega;
+
+        // Downward rays strike the ground: add reflected beam.
+        if (Omega.y < -1e-3f)
+        {
+            float2 TG = ZephyrRaySphere(Point, Omega, float3(0, 0, 0), RgKm);
+            if (TG.x > 0.0f && TG.x < GatherLen)
+            {
+                float3 ExtP = ZephyrExtinction(
+                    P, H01 * ShellKm, MieScale, AbsorptionScale);
+                float3 TSeg = exp(-ExtP * TG.x);
+                IncidentSum += GroundSource * TSeg;
+                continue;
+            }
+        }
+
+        float3 Gathered = float3(0, 0, 0);
+
+        for (int Step = 0; Step < ZEPHYR_MS_STEPS; ++Step)
+        {
+            float3 Q = Point + Omega * (StepLen * (float(Step) + 0.5f));
+            float RQ = length(Q);
+
+            if (RQ > RtKm || RQ < RgKm)
+            {
+                break;
+            }
+
+            float AltQ = RQ - RgKm;
+            float3 UpQ = Q / max(RQ, 1e-6f);
+
+            float DensQ_R = ZephyrRayleighDensity(
+                AltQ, ShellKm, P.Packed1.y, P.Packed2.w);
+            float DensQ_M = ZephyrMieDensity(
+                AltQ, ShellKm, P.Packed1.z, ZephyrMieDensityScale(P));
+
+            float CosT = clamp(dot(Omega, SunDir), -1.0f, 1.0f);
+
+            // First-order source at Q toward P.
+            float3 TStarQ = ZephyrSampleTransmittance(
+                InTransmittance, LinearClampSampler,
+                clamp(AltQ / ShellKm, 0.0f, 1.0f),
+                dot(SunDir, UpQ), Slice, TransSliceHeight, PlanetCount);
+
+            float3 J1 = (DensQ_R * SigmaR * ZephyrRayleighPhase(CosT)
+                    + DensQ_M * SigmaM * ZephyrMiePhase(CosT, Aniso))
+                * TStarQ;
+
+            // Segment transmittance Q -> P (mean-endpoint OD).
+            float3 ExtQ = ZephyrExtinction(P, AltQ, MieScale, AbsorptionScale);
+            float3 ExtP = ZephyrExtinction(
+                P, H01 * ShellKm, MieScale, AbsorptionScale);
+            float DistQP = StepLen * (float(Step) + 0.5f);
+            float3 TSeg = exp(-0.5f * (ExtP + ExtQ) * DistQP);
+
+            if (!isfinite(J1.x + J1.y + J1.z))
+            {
+                continue;
+            }
+
+            Gathered += J1 * TSeg * StepLen;
+        }
+
+        IncidentSum += Gathered;
+    }
+
+    IncidentSum /= float(ZEPHYR_MS_DIRS);
+
+    // Second scattering event at P.
+    // Stored RAW (no debug scales): view pass applies MultiScatterScale.
+    float3 MS = (DensP_R * SigmaR + DensP_M * SigmaM)
+        * IncidentSum;
+
+    OutMultiScatter[int2(TexelX, TexelY)] = float4(MS, 1);
+}

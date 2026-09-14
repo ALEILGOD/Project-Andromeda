@@ -42,7 +42,7 @@ public:
     // GPU DATA CONVERSION
     // =========================================================
     static void BuildGPUData(
-        const TArray<FAndromedaAtmosphereInstance>& Snapshot,
+        const TArray<FLegacyAndromedaAtmosphereInstance>& Snapshot,
         TArray<FAndromedaAtmosphereGPUData>& OutGPUData
     );
 

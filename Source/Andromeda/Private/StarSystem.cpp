@@ -1,6 +1,7 @@
 #include "StarSystem.h"
 
 #include "Engine/World.h"
+#include "Sun.h"
 #include "UObject/UnrealType.h"
 #include "PlanetaryLightingComponent.h"
 
@@ -767,6 +768,16 @@ AActor* AStarSystem::GetPlanetActor(
     }
 
     return SpawnedPlanet->PlanetActor.Get();
+}
+
+
+ASun* AStarSystem::GetSunActor() const
+{
+    // Read-only accessor for the spawned Sun (used by the
+    // atmosphere Registry to reach the AtmosphereLightReference).
+    // SunClass is TSubclassOf<AActor>: a strict cast keeps the API
+    // typed without constraining what STARMAP may spawn.
+    return Cast<ASun>(SpawnedSun.Get());
 }
 
 

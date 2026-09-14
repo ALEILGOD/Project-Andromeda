@@ -195,9 +195,16 @@ struct FAndromedaAtmosphereInstanceDesc
 };
 
 // =========================================================
-// ATMOSPHERE INSTANCE (registry data - not reflected)
+// LEGACY ATMOSPHERE INSTANCE (registry data - not reflected)
 // =========================================================
-struct FAndromedaAtmosphereInstance
+// PHASE 2.1 DEPRECATED: no longer written by the Registry nor
+// read from the manager by any render path. The aerial stage
+// derives this Rayleigh-only view locally from the unified
+// snapshot (FAndromedaAtmosphereInstance, see
+// AndromedaAtmosphereSystem.h). Renamed so the unified type owns
+// the canonical FAndromedaAtmosphereInstance name. Removal is
+// planned with the LUT-aerial follow-up.
+struct FLegacyAndromedaAtmosphereInstance
 {
     FAndromedaAtmosphereHandle Handle;
     FName DebugName = NAME_None;

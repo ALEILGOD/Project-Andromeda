@@ -1,0 +1,107 @@
+// =========================================================
+// ZEPHYR TRANSMITTANCE LUT (compute, ZEPHYR v2)
+// Virtual path: /Andromeda/Zephyr/ZephyrTransmittance.usf
+// Entry: ZephyrTransmittanceMainCS
+// =========================================================
+// T(height, sunZenith): fraction of stellar light surviving the
+// trip from a point at normalized height h01 in a direction of
+// zenith cosine mu to the top of the atmosphere.
+//
+// METHOD (Bruneton/Neyret 2008, section 4.1): fixed-step
+// integration of the wavelength-dependent optical depth along
+// the light path, T = exp(-OD), with Rayleigh + Mie + ozone
+// extinction sharing one cross-section. Paths hitting the
+// planet body return 0 (geometric occultation) - this is what
+// darkens the night side and builds the terminator.
+//
+// Planet slices are stacked vertically in the output atlas.
+// Depends ONLY on the planet profile (never on camera or star
+// position): invalidated on profile change alone.
+// =========================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Andromeda/Zephyr/ZephyrCommon.ush"
+
+StructuredBuffer<FZephyrPlanetGPUData> PlanetBuffer;
+RWTexture2D<float4> OutTransmittance;
+
+int PlanetCount;
+int SliceHeight;
+float MieScale;
+float AbsorptionScale;
+
+[numthreads(8, 8, 1)]
+void ZephyrTransmittanceMainCS(
+    uint3 GroupId : SV_GroupID,
+    uint3 GroupThreadId : SV_GroupThreadID,
+    uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    int TexelX = int(DispatchThreadId.x);
+    int TexelY = int(DispatchThreadId.y);
+
+    int Slice = TexelY / max(SliceHeight, 1);
+    int LocalY = TexelY - Slice * max(SliceHeight, 1);
+
+    if (Slice < 0 || Slice >= PlanetCount)
+    {
+        return;
+    }
+
+    FZephyrPlanetGPUData P = PlanetBuffer[Slice];
+
+    float U = (float(TexelX) + 0.5f) / 256.0f;
+    float V = (float(LocalY) + 0.5f) / float(max(SliceHeight, 1));
+
+    float Mu = ZephyrTransMuFromU(U);
+    float H01 = ZephyrTransH01FromV(V);
+
+    float RgKm = ZephyrGroundRadiusKm(P);
+    float RtKm = ZephyrAtmoRadiusKm(P);
+    float ShellKm = ZephyrShellKm(P);
+
+    // Point in the planet frame (up = +Y), kilometers.
+    float3 Point = float3(0.0f, RgKm + H01 * ShellKm, 0.0f);
+    float SinA = sqrt(max(0.0f, 1.0f - Mu * Mu));
+    float3 Dir = float3(SinA, Mu, 0.0f);
+
+    // Geometric occultation: the planet body between the point
+    // and the star kills the direct beam (night side source).
+    if (Mu < 0.0f)
+    {
+        float2 TGround = ZephyrRaySphere(Point, Dir, float3(0, 0, 0), RgKm);
+        if (TGround.x > 0.0f)
+        {
+            OutTransmittance[int2(TexelX, TexelY)] = float4(0, 0, 0, 1);
+            return;
+        }
+    }
+
+    float2 TTop = ZephyrRaySphere(Point, Dir, float3(0, 0, 0), RtKm);
+    float ExitT = TTop.y;
+
+    if (!(ExitT > 0.0f))
+    {
+        OutTransmittance[int2(TexelX, TexelY)] = float4(1, 1, 1, 1);
+        return;
+    }
+
+    float StepLen = ExitT / float(ZEPHYR_TRANS_STEPS);
+    float3 OpticalDepth = float3(0, 0, 0);
+
+    for (int Step = 0; Step < ZEPHYR_TRANS_STEPS; ++Step)
+    {
+        float3 Q = Point + Dir * (StepLen * (float(Step) + 0.5f));
+        float AltKm = length(Q) - RgKm;
+
+        OpticalDepth += ZephyrExtinction(P, AltKm, MieScale, AbsorptionScale) * StepLen;
+    }
+
+    float3 Transmittance = exp(-OpticalDepth);
+
+    if (!isfinite(Transmittance.x + Transmittance.y + Transmittance.z))
+    {
+        Transmittance = float3(1, 1, 1);
+    }
+
+    OutTransmittance[int2(TexelX, TexelY)] = float4(Transmittance, 1);
+}

@@ -1,5 +1,6 @@
 #include "Sun.h"
 
+#include "Atmosphere/AtmosphereLightReferenceComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -33,11 +34,29 @@ ASun::ASun()
 
     SunMesh->SetupAttachment(Root);
 
+    // =========================================================
+    // ATMOSPHERE LIGHT REFERENCE
+    //
+    // Source of truth of the atmospheric light direction.
+    // Auto-created with the Sun: no manual placement, no
+    // Blueprint, no per-planet setup. Identity transform; the
+    // direction is computed per planet on demand.
+    // =========================================================
+
+    AtmosphereLightReference =
+        CreateDefaultSubobject<UAtmosphereLightReferenceComponent>(
+            TEXT("AtmosphereLightReference")
+        );
+
+    AtmosphereLightReference->SetupAttachment(Root);
+
     SunMesh->SetCollisionEnabled(
         ECollisionEnabled::NoCollision
     );
 
     SunMesh->SetCastShadow(false);
+
+    ConfigureSunMesh();
 
     // =========================================================
     // PRIMARY SOLAR LIGHT
@@ -124,6 +143,7 @@ void ASun::BeginPlay()
     Super::BeginPlay();
 
     ConfigureSunLight();
+    ConfigureSunMesh();
 }
 
 void ASun::OnConstruction(
@@ -135,6 +155,28 @@ void ASun::OnConstruction(
     );
 
     ConfigureSunLight();
+    ConfigureSunMesh();
+}
+
+void ASun::ConfigureSunMesh()
+{
+    if (!SunMesh)
+    {
+        return;
+    }
+
+    // See bHideSunMeshForZephyrSky: the fixed-radius mesh cannot
+    // represent a star at all distances; ZEPHYR owns the sun
+    // visual (angular disk + halo). Same pattern as the hidden
+    // APlanet::AtmosphereMesh.
+    SunMesh->SetVisibility(
+        !bHideSunMeshForZephyrSky,
+        true
+    );
+
+    SunMesh->SetHiddenInGame(
+        bHideSunMeshForZephyrSky
+    );
 }
 
 void ASun::ConfigureSunLight()

@@ -59,19 +59,14 @@ namespace
 
 void FAndromedaAtmosphereViewExtension::Register()
 {
-    if (GViewExtension.IsValid())
-    {
-        return;
-    }
-
-    GViewExtension =
-        FSceneViewExtensions::NewExtension<
-            FAndromedaAtmosphereSceneViewExtension>();
-
+    // PHASE 2.1 DEPRECATED: registering this extension would create a
+    // SECOND independent Tonemap hook next to the unified one (double
+    // subscription). The unified extension owns the single hook and
+    // dispatches the aerial stage itself. Refuse loudly, do nothing.
     UE_LOG(
         LogAndromedaAtmos,
-        Log,
-        TEXT("[ATMOS-02] Scene view extension registered: atmosphere pass hooked to the post-processing chain (after tonemap).")
+        Warning,
+        TEXT("[ATMOS-UNIFIED] FAndromedaAtmosphereViewExtension::Register() is deprecated and ignored: single hook owned by FUnifiedAtmosphereViewExtension.")
     );
 }
 

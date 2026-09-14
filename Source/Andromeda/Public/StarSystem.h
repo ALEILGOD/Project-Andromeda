@@ -5,6 +5,8 @@
 #include "StarSystemGenerator.h"
 #include "StarSystem.generated.h"
 
+class ASun;
+
 
 USTRUCT()
 struct FSpawnedPlanetData
@@ -220,6 +222,14 @@ public:
     AActor* GetPlanetActor(
         int64 PlanetID
     ) const;
+
+    // Riferimento runtime al Sole spawnato (read-only, puo' essere
+    // nullptr se SunClass non era impostata o lo spawn e' fallito).
+    // Introdotto per l'AtmosphereLightReference: il Registry risolve
+    // il Sole SOLO attraverso questa API (mai con discovery globale,
+    // nomi o hardcode). Il resto di STARMAP e' intoccato.
+    UFUNCTION(BlueprintPure, Category = "Andromeda|Star System")
+    ASun* GetSunActor() const;
 
 
 private:

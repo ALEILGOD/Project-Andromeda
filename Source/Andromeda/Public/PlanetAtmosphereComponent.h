@@ -165,8 +165,14 @@ struct FPlanetAtmosphereParameters
 
 
 // =========================================================
-// PLANET ATMOSPHERE COMPONENT
+// PLANET ATMOSPHERE COMPONENT — PHASE 2.1 DEPRECATED
 // =========================================================
+// Violates the unified architecture (§6/§27: no per-planet manual
+// atmosphere Components/Materials). Planet atmospheres are derived
+// automatically from FPlanetRuntimeData by
+// AAndromedaAtmosphereRegistry into FAndromedaAtmosphereSystem; no
+// renderer consumes this component. Kept compiling only; removal of
+// the instantiation in Planet.cpp follows visual validation.
 
 UCLASS(
     ClassGroup = (Andromeda),

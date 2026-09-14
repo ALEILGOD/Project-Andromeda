@@ -2,6 +2,12 @@
 
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "Planet/Planet.h"
+#include "Sun.h"
+#include "Atmosphere/AndromedaAtmosphereSystem.h"
+#include "Atmosphere/AtmosphereLightReferenceComponent.h"
+#include "Planet/Zephyr/ZephyrProfileLibrary.h"
+#include "Planet/Zephyr/ZephyrSharedAtmosphere.h"
 
 
 // =========================================================
@@ -35,11 +41,8 @@ void AAndromedaAtmosphereRegistry::EndPlay(const EEndPlayReason::Type EndPlayRea
     // its world session. The renderer additionally clears the whole manager on
     // FWorldDelegates::OnWorldCleanup as a world-wide safety net; both paths
     // are idempotent (unregistering a missing handle is a no-op).
-    for (const FAndromedaAtmosphereHandle& Handle : AtmosphereHandles)
-    {
-        FAndromedaAtmosphereManager::Get().UnregisterAtmosphere(Handle);
-    }
-
+    // PHASE 2.1: legacy per-handle unregistration is obsolete;
+    // the registry no longer writes the ATMOS manager.
     AtmosphereHandles.Empty();
     StarSystem.Reset();
     bStarSystemFound = false;
@@ -47,10 +50,13 @@ void AAndromedaAtmosphereRegistry::EndPlay(const EEndPlayReason::Type EndPlayRea
     SearchStartWorldSeconds = -1.0;
     FindRetryCount = 0;
 
-    // Note: Star position cleanup would require ClearStarWorldPosition() in the
-    // manager's public API, which is not currently declared. The manager's
-    // Clear() resets atmospheres but not the star position snapshot. Leaving
-    // the star position as-is; a new session will overwrite it on first Tick.
+    // PHASE 2.1: drop the UNIFIED mailbox (planets + star) so no
+    // stale atmosphere outlives its world session (PIE stop, ...).
+    FAndromedaAtmosphereSystem::Get().Clear();
+
+    CachedSunActor.Reset();
+    CachedLightReference.Reset();
+    bSunFallbackLogged = false;
 
     Super::EndPlay(EndPlayReason);
 }
@@ -74,36 +80,12 @@ void AAndromedaAtmosphereRegistry::Tick(float DeltaTime)
     }
 
 
-    // StarSystem found: update atmosphere positions every frame so they
-    // follow the planets as they orbit.
+    // StarSystem found: republish the unified snapshot every frame
+    // so planet centers/rotations follow orbits + spin and the
+    // star stays current. Single writer, single mailbox.
     if (StarSystem.IsValid())
     {
-        TArray<FPlanetRuntimeData> Planets;
-        StarSystem->GetAllPlanetRuntimeData(Planets);
-
-
-        const int32 NumToUpdate = FMath::Min(
-            Planets.Num(),
-            AtmosphereHandles.Num()
-        );
-
-
-        for (int32 i = 0; i < NumToUpdate; ++i)
-        {
-            if (AtmosphereHandles[i].IsValid())
-            {
-                FAndromedaAtmosphereManager::Get().UpdateAtmosphereWorldPosition(
-                    AtmosphereHandles[i],
-                    Planets[i].WorldPosition
-                );
-            }
-        }
-
-        // Update star position for the renderer (Game Thread only).
-        // Use the StarSystem actor's own world location (public API).
-        FAndromedaAtmosphereManager::Get().SetStarWorldPosition(
-            StarSystem->GetActorLocation()
-        );
+        PublishUnifiedSnapshot();
     }
 }
 
@@ -178,46 +160,171 @@ void AAndromedaAtmosphereRegistry::SyncAtmospheres()
     bStarSystemFound = true;
 
 
-    // --------------------------------------------------------
-    // Step 3: register atmospheres for any new planets.
-    // --------------------------------------------------------
-    while (AtmosphereHandles.Num() < Planets.Num())
+    // PHASE 2.1: no per-handle ATMOS registration anymore. Planet
+    // atmospheres exist implicitly as unified instances derived
+    // from FPlanetRuntimeData (see PublishUnifiedSnapshot). Just
+    // publish from the first successful sync so the atmosphere
+    // exists before the next Tick.
+    PublishUnifiedSnapshot();
+}
+
+
+// =========================================================
+// UNIFIED PUBLISH (game thread, sole writer of the mailbox)
+// =========================================================
+
+void AAndromedaAtmosphereRegistry::PublishUnifiedSnapshot()
+{
+    if (!StarSystem.IsValid())
     {
-        const int32 PlanetIndex = AtmosphereHandles.Num();
-        const FPlanetRuntimeData& Planet = Planets[PlanetIndex];
+        return;
+    }
 
+    // Game thread: resolve the Sun's light reference (cached;
+    // re-resolved only when missing). Render thread never touches it.
+    ResolveSunLightReference();
 
-        FAndromedaAtmosphereInstanceDesc Desc;
-        Desc.Parameters.SurfaceRadius = Planet.PlanetRadius;
-        Desc.Parameters.AtmosphereRadius =
-            (Planet.PlanetRadius + Planet.TerrainHeight) * AtmosphereRadiusMultiplier;
-        Desc.WorldPosition = Planet.WorldPosition;
-        Desc.DebugName = FName(
-            *FString::Printf(
-                TEXT("Planet_%lld_Atm"),
-                Planet.PlanetID
-            )
-        );
+    TArray<FPlanetRuntimeData> Planets;
+    StarSystem->GetAllPlanetRuntimeData(Planets);
 
+    TArray<FAndromedaAtmosphereInstance> Entries;
+    Entries.Reserve(Planets.Num());
 
-        const FAndromedaAtmosphereHandle Handle =
-            FAndromedaAtmosphereManager::Get().RegisterAtmosphere(Desc);
+    for (const FPlanetRuntimeData& Planet : Planets)
+    {
+        // Physical identity: seed + archetype from the planet
+        // actor when available, runtime data otherwise.
+        EPlanetArchetype Archetype = EPlanetArchetype::Terran;
+        int64 Seed = Planet.PlanetSeed;
 
-
-        if (Handle.IsValid())
+        if (const APlanet* PlanetActor = Cast<APlanet>(Planet.PlanetActor))
         {
-            AtmosphereHandles.Add(Handle);
+            Archetype = PlanetActor->PlanetArchetype;
+            Seed = PlanetActor->PlanetSeed;
+        }
+
+        // Geometry convention shared with the ATMOS volumes.
+        // AtmosphereRadius reads the live multiplier (never
+        // hardcoded); SkyTransitionRadius is PlanetRadius +
+        // MaxTerrainHeight + ~2 km (200000 cm, shared reference)
+        // and stays DISTINCT from the physical shell.
+        const float SurfaceRadius = Planet.PlanetRadius;
+        const float AtmosphereRadius =
+            (Planet.PlanetRadius + Planet.TerrainHeight)
+            * AtmosphereRadiusMultiplier;
+
+        FAndromedaAtmosphereInstance Entry;
+        Entry.Profile =
+            UZephyrProfileLibrary::BuildProfile(
+                Seed,
+                Archetype,
+                SurfaceRadius,
+                AtmosphereRadius
+            );
+
+        if (!Entry.Profile.IsValidConfiguration())
+        {
+            continue;
+        }
+
+        Entry.PlanetCenter = Planet.WorldPosition;
+        Entry.PlanetID = Planet.PlanetID;
+        Entry.TerrainHeightCm = FMath::Max(Planet.TerrainHeight, 0.0f);
+        Entry.SkyTransitionRadiusCm =
+            AndromedaAtmosphereReference::ComputeSkyTransitionRadiusCm(
+                Planet.PlanetRadius,
+                Planet.TerrainHeight);
+        // Transition COMPLETION radius (mandated rule, per planet):
+        // (PlanetRadius + TerrainHeight) * 1.1, live runtime data,
+        // cm like every distance it is compared with. Separate from
+        // the physical shell (multiplier-driven, untouched) and from
+        // Rs above (outer blend start, retained).
+        Entry.TransitionCompleteRadiusCm =
+            AndromedaAtmosphereReference::ComputeTransitionCompleteRadiusCm(
+                Planet.PlanetRadius,
+                Planet.TerrainHeight);
+        // Planet rotation (world frame, TiltQuat * SpinQuat). Reported
+        // for diagnostics and terrain coherence. It is NOT applied to
+        // the sun direction: the Case A directional sun stays
+        // world-frame end to end (see SunDirectionWorld).
+        Entry.PlanetRotation = Planet.CurrentRotation;
+
+        // SUN LIGHT REFERENCE (source of truth, convention A:
+        // Planet -> Sun, world frame). The Registry never computes
+        // (Star - Center) itself: the Sun's AtmosphereLightReference
+        // owns that computation. Per planet (parallax preserved).
+        if (CachedLightReference.IsValid())
+        {
+            Entry.SunDirectionWorld =
+                CachedLightReference->GetDirectionTowardSunWorld(
+                    Planet.WorldPosition
+                );
         }
         else
         {
-            // Registration failed: stop trying to avoid an infinite loop.
+            // Documented fallback (no Sun actor/reference): same owned
+            // helper, explicit emission point (StarSystem location).
+            // Logged once in ResolveSunLightReference().
+            Entry.SunDirectionWorld =
+                UAtmosphereLightReferenceComponent::ComputeDirectionTowardSunWorld(
+                    StarSystem->GetActorLocation(),
+                    Planet.WorldPosition
+                );
+        }
+
+        Entries.Add(Entry);
+    }
+
+    // Single star source, single mailbox: the emission point comes
+    // from the Sun reference when available (authoritative), else
+    // the StarSystem location (documented fallback). Both render
+    // stages read this snapshot; neither reconstructs the sun.
+    const FVector EmissionPoint =
+        CachedLightReference.IsValid()
+            ? CachedLightReference->GetEmissionPointWorld()
+            : StarSystem->GetActorLocation();
+
+    FAndromedaAtmosphereSystem::Get().SetSnapshot(
+        Entries,
+        EmissionPoint
+    );
+}
+
+
+// =========================================================
+// SUN LIGHT REFERENCE
+// =========================================================
+
+void AAndromedaAtmosphereRegistry::ResolveSunLightReference()
+{
+    if (!StarSystem.IsValid())
+    {
+        return;
+    }
+
+    // Re-resolve only when the cached actor died or was never found
+    // (Sun spawns once with the system; no per-frame discovery).
+    if (!CachedSunActor.IsValid() || !CachedLightReference.IsValid())
+    {
+        CachedSunActor.Reset();
+        CachedLightReference.Reset();
+
+        if (AActor* SunActor = StarSystem->GetSunActor())
+        {
+            CachedSunActor = SunActor;
+            CachedLightReference =
+                SunActor->FindComponentByClass<UAtmosphereLightReferenceComponent>();
+        }
+
+        if (!CachedLightReference.IsValid() && !bSunFallbackLogged)
+        {
+            bSunFallbackLogged = true;
+
             UE_LOG(
                 LogAndromedaAtmos,
                 Warning,
-                TEXT("AAndromedaAtmosphereRegistry: failed to register atmosphere for planet %lld."),
-                Planet.PlanetID
+                TEXT("AAndromedaAtmosphereRegistry: no Sun AtmosphereLightReference found; using StarSystem location as emission point (documented fallback).")
             );
-            break;
         }
     }
 }

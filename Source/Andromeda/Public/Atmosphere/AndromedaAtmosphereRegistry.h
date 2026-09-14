@@ -8,6 +8,8 @@
 #include "StarSystem.h"
 #include "AndromedaAtmosphereRegistry.generated.h"
 
+class UAtmosphereLightReferenceComponent;
+
 
 // =========================================================
 // ANDROMEDA ATMOSPHERE REGISTRY
@@ -58,6 +60,15 @@ private:
     void SyncAtmospheres();
 
 
+    // PHASE 2.1 UNIFIED publish (sole writer):
+    // publishes the per-planet full-physics atmosphere instances
+    // + star position into FAndromedaAtmosphereSystem (game
+    // thread). This is the ONLY snapshot of the atmosphere system;
+    // both render stages read it. Replaces PublishZephyrSnapshot
+    // and the legacy per-handle ATMOS registration path.
+    void PublishUnifiedSnapshot();
+
+
     // Expires the search window if StarSystemSearchTimeoutSeconds have
     // elapsed since the first sync attempt without success (logs once).
     void CheckSearchWindowExpired(UWorld* World);
@@ -70,6 +81,20 @@ private:
 
     // Cached reference to the StarSystem actor.
     TWeakObjectPtr<AStarSystem> StarSystem;
+
+    // SUN LIGHT REFERENCE resolution (game thread only).
+    // Cached Sun actor (via AStarSystem::GetSunActor(), never global
+    // discovery) and its AtmosphereLightReference. Falls back to the
+    // StarSystem location as emission point when no Sun
+    // actor/reference exists (logged once): same owned helper,
+    // explicit point. See ResolveSunLightReference().
+    void ResolveSunLightReference();
+
+    TWeakObjectPtr<AActor> CachedSunActor;
+
+    TWeakObjectPtr<UAtmosphereLightReferenceComponent> CachedLightReference;
+
+    bool bSunFallbackLogged = false;
 
 
     // True once the StarSystem has been found AND its planets are available

@@ -39,7 +39,7 @@ FAndromedaAtmosphereHandle FAndromedaAtmosphereManager::RegisterAtmosphere(
     }
 
 
-    FAndromedaAtmosphereInstance Instance;
+    FLegacyAndromedaAtmosphereInstance Instance;
 
     Instance.Handle.Id = NextHandleId++;
     Instance.DebugName = Desc.DebugName;
@@ -77,7 +77,7 @@ bool FAndromedaAtmosphereManager::UnregisterAtmosphere(
 
     FScopeLock ScopeLock(&RegistryLock);
 
-    FAndromedaAtmosphereInstance RemovedInstance;
+    FLegacyAndromedaAtmosphereInstance RemovedInstance;
     const bool bRemoved = Atmospheres.RemoveAndCopyValue(Handle.Id, RemovedInstance);
 
 
@@ -124,7 +124,7 @@ bool FAndromedaAtmosphereManager::UpdateAtmosphereParameters(
 
     FScopeLock ScopeLock(&RegistryLock);
 
-    FAndromedaAtmosphereInstance* Instance = Atmospheres.Find(Handle.Id);
+    FLegacyAndromedaAtmosphereInstance* Instance = Atmospheres.Find(Handle.Id);
 
 
     if (!Instance)
@@ -152,7 +152,7 @@ bool FAndromedaAtmosphereManager::UpdateAtmosphereWorldPosition(
 
     FScopeLock ScopeLock(&RegistryLock);
 
-    FAndromedaAtmosphereInstance* Instance = Atmospheres.Find(Handle.Id);
+    FLegacyAndromedaAtmosphereInstance* Instance = Atmospheres.Find(Handle.Id);
 
 
     if (!Instance)
@@ -173,7 +173,7 @@ bool FAndromedaAtmosphereManager::UpdateAtmosphereWorldPosition(
 
 bool FAndromedaAtmosphereManager::FindAtmosphere(
     FAndromedaAtmosphereHandle Handle,
-    FAndromedaAtmosphereInstance& OutInstance
+    FLegacyAndromedaAtmosphereInstance& OutInstance
 ) const
 {
     if (!Handle.IsValid())
@@ -184,7 +184,7 @@ bool FAndromedaAtmosphereManager::FindAtmosphere(
 
     FScopeLock ScopeLock(&RegistryLock);
 
-    const FAndromedaAtmosphereInstance* Instance = Atmospheres.Find(Handle.Id);
+    const FLegacyAndromedaAtmosphereInstance* Instance = Atmospheres.Find(Handle.Id);
 
 
     if (!Instance)
@@ -200,7 +200,7 @@ bool FAndromedaAtmosphereManager::FindAtmosphere(
 
 
 void FAndromedaAtmosphereManager::GetAtmosphereSnapshot(
-    TArray<FAndromedaAtmosphereInstance>& OutSnapshot
+    TArray<FLegacyAndromedaAtmosphereInstance>& OutSnapshot
 ) const
 {
     FScopeLock ScopeLock(&RegistryLock);

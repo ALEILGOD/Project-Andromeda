@@ -6,8 +6,12 @@
 
 
 // =========================================================
-// PLANET ATMOSPHERE RENDERER
+// PLANET ATMOSPHERE RENDERER — PHASE 2.1 DEPRECATED
 // =========================================================
+// Single-planet global-static renderer predating multi-planet
+// support. No active path reads it (unified rendering owns
+// FUnifiedAtmosphereRenderer). Kept compiling only; removal
+// follows visual validation together with UPlanetAtmosphereComponent.
 
 UCLASS(BlueprintType)
 class ANDROMEDA_API UPlanetAtmosphereRenderer

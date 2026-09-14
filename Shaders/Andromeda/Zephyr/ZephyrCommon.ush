@@ -1,0 +1,467 @@
+// =========================================================
+// ZEPHYR COMMON (ZEPHYR v2)
+// Virtual path: /Andromeda/Zephyr/ZephyrCommon.ush
+// =========================================================
+// Shared physical core of the ZEPHYR true planetary sky.
+//
+// TECHNOLOGIES (origin of every formula below):
+//   - Precomputed atmospheric scattering (transmittance, single
+//     and multiple scattering, optical depth):
+//     Bruneton / Neyret, "Precomputed Atmospheric Scattering"
+//     (EGSR 2008).
+//   - LUT architecture (Transmittance + Multi-Scattering +
+//     Sky-View LUT, front-to-back sky integral
+//     L = int T_view * (S_Rayleigh + S_Mie + S_Multiple) ds):
+//     Hillaire, "A Scalable and Production Ready Sky and
+//     Atmosphere Rendering Technique" (EGSR 2020).
+//   - Rayleigh scattering: molecular exponential density +
+//     (1 + cos^2) phase (Rayleigh 1871; standard form used by
+//     Bruneton/Hillaire).
+//   - Mie scattering: exponential aerosol density +
+//     Henyey-Greenstein phase function (Henyey/Greenstein 1941;
+//     standard aerosol approximation in real-time atmospheres).
+//   - Absorption: ozone-like layer with Gaussian vertical
+//     profile modulating wavelength-dependent extinction
+//     (Chappuis-band class absorber, Hillaire 2020 values).
+//
+// UNITS: planet frames here are kilometers (radii arrive in cm
+// and are converted ONCE at load: RadiusKm = RadiusCm * 1e-5).
+// Scattering/absorption coefficients are km^-1, march steps in
+// km. The cm->km conversion happens explicitly - cm and km are
+// never mixed (ZEPHYR-01 section 6).
+//
+// LAYOUT CONTRACT: FZephyrPlanetGPUData MUST match the C++
+// struct in ZephyrTypes.h EXACTLY (7 x float4 = 112 bytes).
+// =========================================================
+
+struct FZephyrPlanetGPUData
+{
+    float4 Packed0; // RelCenter.xyz (cm, camera-relative), GroundRadius (cm)
+    float4 Packed1; // AtmoRadius (cm), RayleighScaleH (km), MieScaleH (km), MieAnisotropy
+    float4 Packed2; // Rayleigh sigma rgb (km^-1), DensityScale (molecular: Rayleigh + absorption)
+    float4 Packed3; // Mie sigma rgb (km^-1), GroundAlbedo
+    float4 Packed4; // Absorption peak sigma rgb (km^-1), AbsLayerCenter (km above ground)
+    float4 Packed5; // AbsLayerWidth (km), ViewHeight (km), MieDensityScale (aerosol, decoupled), SkyTransitionRadius = outer blend start (cm)
+    // SUN LIGHT REFERENCE: Packed6.xyz is Planet->Sun (toward the source)
+    // in WORLD SPACE, baked from ASun::AtmosphereLightReference. Up and
+    // RayDir are also evaluated in World Space. No planet-local rotation
+    // is applied to SunDir in the renderer. (Legacy field name kept.)
+    float4 Packed6; // SunDirWorld.xyz (unit vector, world frame), TransitionCompleteRadiusCm (inner blend edge, 100% regime)
+};
+
+// Display-referred exposure of the baked sky radiance.
+// APPLIED ONCE in ZephyrSkyView.usf (OutSkySingle/OutSkyMulti bake
+// outputs). Nowhere else: not in the MS LUT, not in transmittance,
+// not in the sun disk, not in Exposure (stays 1.0).
+//
+// CALIBRATION NOTE (ZEPHYR-01 fix): this was 8.0, inherited from
+// the unnormalized-phase era (when Rayleigh returned (1+cos^2)
+// ~1-2 instead of 3/(16*pi) ~0.06-0.12, i.e. ~16x hotter).
+// With physically normalized phases, 8.0 leaves even an
+// Earth-column sky at ~0.1 display (near-black); 24.0 restores
+// the intended mapping (Earth column -> clearly visible blue
+// zenith, bright saturating horizon, white sun glare) while
+// preserving every ratio the transport produces: zenith/horizon
+// contrast, sunset reddening, night darkness (0 stays 0) and
+// the SS/MS balance are untouched. This is the same role as
+// exposure in Hillaire-style pipelines - a display gain, never
+// a painted color. Same value feeds SS, MS and limb paths so
+// they stay mutually consistent.
+#define ZEPHYR_RADIANCE_SCALE 24.0f
+
+// Explicit unit conversion (cm -> km). Applied once per length.
+#define ZEPHYR_CM_TO_KM 0.00001f
+
+// LUT bake march resolutions (quality knobs, documented).
+#define ZEPHYR_TRANS_STEPS 40
+#define ZEPHYR_MS_DIRS 8
+// Resolves the dual-scattering gather over its transport-scale
+// support (~3 density e-folds, see GatherLen in
+// ZephyrMultiScatter.usf): 8 midpoint steps keep ~0.4 e-folds
+// per step on any planet size. Same integral, converged
+// quadrature; the MS LUT is baked once and cached.
+#define ZEPHYR_MS_STEPS 8
+#define ZEPHYR_SKY_STEPS 24
+
+// =========================================================
+// PLANET FRAME ACCESSORS (planet-centric, km)
+// =========================================================
+
+float3 ZephyrRelCenterCm(FZephyrPlanetGPUData P)
+{
+    return P.Packed0.xyz;
+}
+
+float ZephyrGroundRadiusKm(FZephyrPlanetGPUData P)
+{
+    return P.Packed0.w * ZEPHYR_CM_TO_KM;
+}
+
+float ZephyrAtmoRadiusKm(FZephyrPlanetGPUData P)
+{
+    return P.Packed1.x * ZEPHYR_CM_TO_KM;
+}
+
+float ZephyrShellKm(FZephyrPlanetGPUData P)
+{
+    return max(
+        ZephyrAtmoRadiusKm(P) - ZephyrGroundRadiusKm(P),
+        1e-6f);
+}
+
+// Effective scale height: honors the profile scale while the
+// shell can resolve it; when the scale dwarfs the shell (tiny
+// toy planets) binds it to the shell so a thin bright core
+// fading with altitude exists on ANY planet size. Same
+// convention as the ATMOS density profile. True Earth-like
+// configurations (scale < shell) are unaffected.
+float ZephyrEffectiveScaleKm(float ShellKm, float ScaleKm)
+{
+    return min(max(ScaleKm, 1e-6f), ShellKm * 0.35f);
+}
+
+// Absorption layer center/width are stored in km above ground
+// but clamped into the shell so toy-planet atmospheres keep a
+// real spectral layer instead of losing it to space.
+float ZephyrAbsCenterKm(FZephyrPlanetGPUData P)
+{
+    float ShellKm = ZephyrShellKm(P);
+    return clamp(P.Packed4.w, ShellKm * 0.1f, ShellKm * 0.9f);
+}
+
+float ZephyrAbsWidthKm(FZephyrPlanetGPUData P)
+{
+    float ShellKm = ZephyrShellKm(P);
+    return clamp(P.Packed5.x, ShellKm * 0.05f, ShellKm * 0.5f);
+}
+
+// Aerosol density scale (archetype loading, pressure-decoupled).
+// The ONLY density factor used for Mie evaluations, in
+// scattering and extinction alike (energy consistency).
+float ZephyrMieDensityScale(FZephyrPlanetGPUData P)
+{
+    return P.Packed5.z;
+}
+
+// Sun direction at camera (unit vector, Planet->Sun, WORLD SPACE).
+// Stored in Packed6.xyz. Same frame as RelCenter/Up/RayDir by contract.
+float3 ZephyrSunDirPlanet(FZephyrPlanetGPUData P)
+{
+    return P.Packed6.xyz;
+}
+
+// =========================================================
+// SKY VISUAL-TRANSITION RADIUS (rebuild §17/§18)
+// =========================================================
+// Rs = PlanetRadius + MaxTerrainHeight + ~2 km (200000 cm),
+// published per planet by the registry (shared CPU reference).
+// STRICTLY DISTINCT from the physical shell Rt (from
+// AtmosphereRadiusMultiplier): the sky becomes visually fully
+// atmospheric by Rs without truncating the physics at Rs.
+// 0 = legacy snapshot: fall back to Rt (transition == shell).
+float ZephyrSkyTransitionRadiusCm(FZephyrPlanetGPUData P)
+{
+    return (P.Packed5.w > 0.0f) ? P.Packed5.w : P.Packed1.x;
+}
+
+// Transition COMPLETION radius (mandated rule, per planet):
+//   (PlanetRadius + TerrainHeight) * 1.1  [cm, world length]
+// Baked CPU-side into Packed6.w. At/below it the planetary regime
+// is 100% active. 0 = legacy data: fall back to the physical shell
+// so the shader never reads an empty bound.
+float ZephyrTransitionCompleteCm(FZephyrPlanetGPUData P)
+{
+    return (P.Packed6.w > 0.0f) ? P.Packed6.w : P.Packed1.x;
+}
+
+// Sky influence weight for a camera at CamDistCm:
+//   1                       at/below the completion radius,
+//   smooth 1 -> 0 fade      across the near-space zone Completion..Outer,
+//   0                       at and beyond Outer (deep space).
+// Monotone continuous by construction: no pop, no flicker, no band
+// (smoothstep is C1-continuous at both ends). When Outer <= Complete
+// (degenerate) this is a hard step at Complete, never a hole.
+float ZephyrSkyTransitionFade(
+    float CamDistCm, float CompleteCm, float OuterCm)
+{
+    if (CamDistCm <= CompleteCm)
+    {
+        return 1.0f;
+    }
+    if (!(OuterCm > CompleteCm))
+    {
+        return 0.0f;
+    }
+    float F = (CamDistCm - CompleteCm)
+        / max(OuterCm - CompleteCm, 1e-6f);
+    F = clamp(F, 0.0f, 1.0f);
+    // Smoothstep fade: C1-continuous at both ends, no visible
+    // band when the camera crosses Complete or Outer.
+    return 1.0f - F * F * (3.0f - 2.0f * F);
+}
+
+// =========================================================
+// STABILIZED RAY / SPHERE INTERSECTION
+// =========================================================
+// Same roots as |O + tD - C|^2 = R^2, discriminant normalized
+// by R before evaluation (ATMOS-04 stabilization heritage:
+// keeps magnitude near O(1) at planetary distances).
+float2 ZephyrRaySphere(
+    float3 RayOrigin,
+    float3 RayDir,
+    float3 SphereCenter,
+    float SphereRadius)
+{
+    if (!(SphereRadius > 0.0f))
+    {
+        return float2(-1.0f, -1.0f);
+    }
+
+    float3 V = SphereCenter - RayOrigin;
+    float B = dot(V, RayDir);
+    float C = dot(V, V) - SphereRadius * SphereRadius;
+
+    float InvR = 1.0f / SphereRadius;
+    float Bn = B * InvR;
+    float Cn = C * (InvR * InvR);
+    float Disc = Bn * Bn - Cn;
+
+    if (Disc < 0.0f)
+    {
+        return float2(-1.0f, -1.0f);
+    }
+
+    float SqrtD = sqrt(Disc);
+    return float2(
+        (Bn - SqrtD) * SphereRadius,
+        (Bn + SqrtD) * SphereRadius);
+}
+
+// =========================================================
+// DENSITY PROFILES (Bruneton-class exponentials)
+// =========================================================
+// Normalized to 1 at the surface; hKm is altitude above ground.
+float ZephyrRayleighDensity(
+    float AltitudeKm, float ShellKm, float ScaleKm, float DensityScale)
+{
+    float H = ZephyrEffectiveScaleKm(ShellKm, ScaleKm);
+    float A = clamp(AltitudeKm, 0.0f, ShellKm);
+    return exp(-A / H) * DensityScale;
+}
+
+float ZephyrMieDensity(
+    float AltitudeKm, float ShellKm, float ScaleKm, float DensityScale)
+{
+    float H = ZephyrEffectiveScaleKm(ShellKm, ScaleKm);
+    float A = clamp(AltitudeKm, 0.0f, ShellKm);
+    return exp(-A / H) * DensityScale;
+}
+
+// Gaussian ozone-like layer: peak at the layer center, width
+// AbsWidthKm. Zero at the surface and at the top when the layer
+// sits inside the shell.
+float ZephyrAbsorptionDensity(
+    float AltitudeKm, float CenterKm, float WidthKm, float DensityScale)
+{
+    float D = (AltitudeKm - CenterKm) / max(WidthKm, 1e-6f);
+    return exp(-D * D) * DensityScale;
+}
+
+// Wavelength-dependent extinction coefficient (km^-1) at one
+// altitude. Scattering and extinction SHARE this cross-section
+// (energy-consistent: saturation, sunset reddening and the
+// terminator contrast emerge from transport, not tinting).
+float3 ZephyrExtinction(
+    FZephyrPlanetGPUData P,
+    float AltitudeKm,
+    float MieScale,
+    float AbsorptionScale)
+{
+    float RgKm = ZephyrGroundRadiusKm(P);
+    float ShellKm = ZephyrShellKm(P);
+
+    float DensR = ZephyrRayleighDensity(
+        AltitudeKm, ShellKm, P.Packed1.y, P.Packed2.w);
+    float DensM = ZephyrMieDensity(
+        AltitudeKm, ShellKm, P.Packed1.z, ZephyrMieDensityScale(P));
+    float DensA = ZephyrAbsorptionDensity(
+        AltitudeKm,
+        ZephyrAbsCenterKm(P),
+        ZephyrAbsWidthKm(P),
+        P.Packed2.w);
+
+    return DensR * P.Packed2.xyz
+        + DensM * P.Packed3.xyz * MieScale
+        + DensA * P.Packed4.xyz * AbsorptionScale;
+}
+
+// =========================================================
+// PHASE FUNCTIONS
+// =========================================================
+// Rayleigh: 3/(16*pi) * (1 + cos^2). Physically normalized over 4pi (integral = 1).
+float ZephyrRayleighPhase(float CosTheta)
+{
+    return (3.0f / (16.0f * 3.14159265f)) * (1.0f + CosTheta * CosTheta);
+}
+
+// Henyey-Greenstein Mie phase (Henyey/Greenstein 1941): physically normalized over 4pi.
+float ZephyrMiePhase(float CosTheta, float Anisotropy)
+{
+    float G = clamp(Anisotropy, -0.99f, 0.99f);
+    float G2 = G * G;
+    float Denom = 1.0f + G2 - 2.0f * G * CosTheta;
+    return (1.0f / (4.0f * 3.14159265f)) * (1.0f - G2) / pow(max(Denom, 1e-4f), 1.5f);
+}
+
+// Exponential display-referred curve for HDR sky radiance:
+// preserves chromaticity ratios, prevents clamping to pure white,
+// and cleanly maps large dynamic ranges into [0, 1].
+float3 ZephyrTonemap(float3 LinearColor)
+{
+    return float3(1.0f, 1.0f, 1.0f) - exp(-max(LinearColor, 0.0f));
+}
+
+// Fibonacci-sphere gather direction k of K (no lookup tables,
+// no dynamic array indexing: fully procedural, SM5-safe).
+float3 ZephyrFibonacciDir(int Index, int Count)
+{
+    float K = float(max(Count, 1));
+    float Golden = 2.39996322972865332f; // pi * (3 - sqrt(5))
+    float Y = 1.0f - (float(Index) + 0.5f) * (2.0f / K);
+    float Radius = sqrt(max(0.0f, 1.0f - Y * Y));
+    float Theta = Golden * float(Index);
+    return float3(cos(Theta) * Radius, Y, sin(Theta) * Radius);
+}
+
+// =========================================================
+// TRANSMITTANCE LUT MAPPING (Hillaire-class)
+// =========================================================
+// x: sun-path zenith cosine mu in [-1, 1] (linear, 256 texels).
+// y: height fraction h01 in [0, 1] stored QUADRATICALLY
+//    (h01 = v^2) so texel density concentrates near the ground
+//    where the optical-depth gradient is steepest.
+float ZephyrTransMuFromU(float U)
+{
+    return U * 2.0f - 1.0f;
+}
+
+float ZephyrTransH01FromV(float V)
+{
+    return V * V;
+}
+
+float ZephyrTransVFromH01(float H01)
+{
+    return sqrt(clamp(H01, 0.0f, 1.0f));
+}
+
+// Bilinear-safe atlas sample with half-texel slice inset (planet
+// slices are stacked vertically; the inset prevents bleeding
+// across slice borders during bilinear filtering).
+// Maps parameter p in [0,1] to texel center coordinate: (p * (W-1) + 0.5) / W
+float3 ZephyrSampleTransmittance(
+    Texture2D TransAtlas,
+    SamplerState LutSampler,
+    float Height01,
+    float Mu,
+    int Slice,
+    int SliceHeight,
+    int PlanetCount)
+{
+    float pU = Mu * 0.5f + 0.5f;  // Mu in [-1,1] -> pU in [0,1]
+    float pV = ZephyrTransVFromH01(Height01);  // h01 in [0,1] -> pV in [0,1] (quadratic)
+    
+    // Map to texel centers: (p * (Dim-1) + 0.5) / Dim
+    float U = (pU * (255.0f) + 0.5f) / 256.0f;
+    float VLocal = pV * float(SliceHeight - 1) + 0.5f;
+    float V = (float(Slice) * float(SliceHeight) + VLocal)
+        / float(SliceHeight * max(PlanetCount, 1));
+    return TransAtlas.SampleLevel(LutSampler, float2(U, V), 0).rgb;
+}
+
+// =========================================================
+// MULTI-SCATTERING LUT MAPPING
+// =========================================================
+// x: sun zenith cosine at the point; y: height fraction
+// (same quadratic packing as transmittance).
+// Maps parameter p in [0,1] to texel center coordinate: (p * (W-1) + 0.5) / W
+float3 ZephyrSampleMultiScatter(
+    Texture2D MSAtlas,
+    SamplerState LutSampler,
+    float Height01,
+    float MuSun,
+    int Slice,
+    int SliceHeight,
+    int PlanetCount)
+{
+    float pU = MuSun * 0.5f + 0.5f;  // MuSun in [-1,1] -> pU in [0,1]
+    float pV = ZephyrTransVFromH01(Height01);  // h01 in [0,1] -> pV in [0,1] (quadratic)
+    
+    // Map to texel centers: (p * (Dim-1) + 0.5) / Dim
+    float U = (pU * 31.0f + 0.5f) / 32.0f;  // MultiScatterWidth = 32
+    float VLocal = pV * float(SliceHeight - 1) + 0.5f;
+    float V = (float(Slice) * float(SliceHeight) + VLocal)
+        / float(SliceHeight * max(PlanetCount, 1));
+    return MSAtlas.SampleLevel(LutSampler, float2(U, V), 0).rgb;
+}
+
+// =========================================================
+// SKY-VIEW LUT MAPPING (Hillaire-class, EGSR 2020)
+// =========================================================
+// x: azimuth between view and sun, 0 (toward sun) .. pi (away),
+//    stored as x = azimuth / pi.
+// y: view elevation latitude l in [-pi/2, pi/2] stored with
+//    horizon concentration per Hillaire Eq. (from paper):
+//    v = 0.5 + 0.5 * sign(l) * sqrt(|l| / (pi/2))
+//    Forward: l = sign(t) * (2*|t|)^2 * (pi/2) where t = 2*v - 1
+//    Then sinEl = sin(l).
+// Maps parameter p in [0,1] to texel center coordinate: (p * (W-1) + 0.5) / W
+float ZephyrSkyLatitudeFromV(float V)
+{
+    // Inverse mapping: v -> latitude l in [-pi/2, pi/2]
+    float T = V * 2.0f - 1.0f;           // t in [-1, 1]
+    float AbsT = abs(T);
+    float L = sign(T) * (AbsT * AbsT) * 1.57079633f; // (pi/2)
+    return L;
+}
+
+float ZephyrSkyVFromLatitude(float Latitude)
+{
+    // Forward mapping: latitude l -> v in [0, 1]
+    float AbsL = abs(Latitude);
+    float T = sign(Latitude) * sqrt(AbsL / 1.57079633f); // sqrt(|l| / (pi/2))
+    return T * 0.5f + 0.5f;
+}
+
+float ZephyrSkySinElFromV(float V)
+{
+    float Lat = ZephyrSkyLatitudeFromV(V);
+    return sin(Lat);
+}
+
+float ZephyrSkyVFromSinEl(float SinEl)
+{
+    float Lat = asin(clamp(SinEl, -1.0f, 1.0f));
+    return ZephyrSkyVFromLatitude(Lat);
+}
+
+// Maps parameter p in [0,1] to texel center coordinate: (p * (W-1) + 0.5) / W
+float3 ZephyrSampleSkySlice(
+    Texture2D SkyAtlas,
+    SamplerState LutSampler,
+    float Azimuth01,
+    float VCoord,
+    int Slice,
+    int SliceHeight,
+    int PlanetCount)
+{
+    // Map azimuth [0,1] to texel centers across SkyViewWidth (192)
+    float U = (clamp(Azimuth01, 0.0f, 1.0f) * 191.0f + 0.5f) / 192.0f;
+    
+    // Map VCoord [0,1] to texel centers within slice
+    float VLocal = clamp(VCoord, 0.0f, 1.0f) * float(SliceHeight - 1) + 0.5f;
+    float V = (float(Slice) * float(SliceHeight) + VLocal)
+        / float(SliceHeight * max(PlanetCount, 1));
+    return SkyAtlas.SampleLevel(
+        LutSampler, float2(U, V), 0).rgb;
+}

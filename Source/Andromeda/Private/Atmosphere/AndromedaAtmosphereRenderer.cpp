@@ -4,6 +4,7 @@
 
 #include "Atmosphere/AndromedaAtmosphereManager.h"
 #include "Atmosphere/AndromedaAtmosphereTypes.h"
+#include "Atmosphere/AndromedaAtmosphereSystem.h"
 
 #include "GlobalShader.h"
 #include "PixelShaderUtils.h"
@@ -197,12 +198,12 @@ void FAndromedaAtmosphereRenderer::RegisterShaderDirectoryMapping()
 // =========================================================
 
 void FAndromedaAtmosphereRenderer::BuildGPUData(
-    const TArray<FAndromedaAtmosphereInstance>& Snapshot,
+    const TArray<FLegacyAndromedaAtmosphereInstance>& Snapshot,
     TArray<FAndromedaAtmosphereGPUData>& OutGPUData)
 {
     OutGPUData.Reset(Snapshot.Num());
 
-    for (const FAndromedaAtmosphereInstance& Instance : Snapshot)
+    for (const FLegacyAndromedaAtmosphereInstance& Instance : Snapshot)
     {
         FAndromedaAtmosphereGPUData GPUData = {};
 
@@ -267,11 +268,46 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
     // Step 1: get the atmosphere snapshot from the manager.
     // --------------------------------------------------------
 
-    TArray<FAndromedaAtmosphereInstance> AtmosphereSnapshot;
+    // PHASE 2.1: the aerial stage reads the UNIFIED snapshot
+    // (full-physics instances) and derives its legacy Rayleigh-only
+    // view locally. Nothing is written to FAndromedaAtmosphereManager
+    // anymore; it is deprecated. Mie/absorption intentionally have no
+    // mapping: this stage shader evaluates Rayleigh transport only
+    // (documented limitation until the LUT aerial follow-up).
+    TArray<FAndromedaAtmosphereInstance> UnifiedSnapshot;
+    FVector UnifiedStarWorldPosition = FVector::ZeroVector;
+    uint64 UnifiedSnapshotVersion = 0;
 
-    FAndromedaAtmosphereManager::Get().GetAtmosphereSnapshot(
-        AtmosphereSnapshot
+    FAndromedaAtmosphereSystem::Get().GetSnapshot(
+        UnifiedSnapshot,
+        UnifiedStarWorldPosition,
+        UnifiedSnapshotVersion
     );
+
+    TArray<FLegacyAndromedaAtmosphereInstance> AtmosphereSnapshot;
+    AtmosphereSnapshot.Reserve(UnifiedSnapshot.Num());
+
+    for (const FAndromedaAtmosphereInstance& UnifiedEntry : UnifiedSnapshot)
+    {
+        FLegacyAndromedaAtmosphereInstance LegacyInstance;
+        LegacyInstance.Parameters.SurfaceRadius =
+            UnifiedEntry.Profile.GroundRadius;
+        LegacyInstance.Parameters.AtmosphereRadius =
+            UnifiedEntry.Profile.AtmosphereRadius;
+        LegacyInstance.Parameters.RayleighScattering =
+            UnifiedEntry.Profile.RayleighScattering;
+        LegacyInstance.Parameters.RayleighScaleHeight =
+            UnifiedEntry.Profile.RayleighScaleHeight;
+        LegacyInstance.WorldPosition =
+            UnifiedEntry.PlanetCenter;
+        LegacyInstance.DebugName = FName(
+            *FString::Printf(
+                TEXT("Planet_%lld_Atm"),
+                UnifiedEntry.PlanetID
+            )
+        );
+        AtmosphereSnapshot.Add(LegacyInstance);
+    }
 
     const int32 AtmosphereCount =
         AtmosphereSnapshot.Num();
@@ -301,8 +337,9 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
     // uses the copied value here.
     // --------------------------------------------------------
 
-    const FVector StarWorldPosition =
-        FAndromedaAtmosphereManager::Get().GetStarWorldPosition();
+    // PHASE 2.1: star comes from the unified snapshot (same source
+    // the sky stage uses). No second sun direction.
+    const FVector StarWorldPosition = UnifiedStarWorldPosition;
 
     const bool bHasStarPosition =
         StarWorldPosition != FVector::ZeroVector;
@@ -327,7 +364,7 @@ FScreenPassTexture FAndromedaAtmosphereRenderer::RenderAtmospheres(
     );
 
     for (
-        const FAndromedaAtmosphereInstance& Instance :
+        const FLegacyAndromedaAtmosphereInstance& Instance :
         AtmosphereSnapshot
     )
     {
@@ -727,7 +764,10 @@ bool FAndromedaAtmosphereRenderer::ValidateShaderInfrastructure()
 
 void FAndromedaAtmosphereRenderer::HandlePostEngineInit()
 {
-    FAndromedaAtmosphereViewExtension::Register();
+    // PHASE 2.1 DEPRECATED hook: the aerial stage no longer owns a
+    // Tonemap subscription. FUnifiedAtmosphereViewExtension owns the
+    // single hook and dispatches this stage in deterministic order.
+    // Intentionally NOT calling FAndromedaAtmosphereViewExtension::Register().
 
     WorldCleanupDelegateHandle =
         FWorldDelegates::OnWorldCleanup.AddStatic(
