@@ -1,5 +1,4 @@
 using UnrealBuildTool;
-using System.IO;
 
 public class Andromeda : ModuleRules
 {
@@ -15,33 +14,19 @@ public class Andromeda : ModuleRules
                 "CoreUObject",
                 "Engine",
                 "InputCore",
-                "ProceduralMeshComponent"
+                "ProceduralMeshComponent",
+                "RHI",
+                "RenderCore",
+                "Renderer"
             }
         );
 
         PrivateDependencyModuleNames.AddRange(
             new string[]
             {
-                "RenderCore",
-                "RHI",
-                "Renderer"
+                "Projects",
+                "HillaireAtmosphere"
             }
         );
-
-        PrivateIncludePaths.Add(
-    Path.Combine(
-        EngineDirectory,
-        "Source/Runtime/Renderer/Public"
-    )
-);
-
-        PrivateIncludePaths.Add(
-            Path.Combine(
-                EngineDirectory,
-                "Source/Runtime/Renderer/Internal"
-            )
-        );
-
-
     }
 }

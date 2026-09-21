@@ -1,0 +1,96 @@
+// HILLAIRE ATMOSPHERE - TRANSMITTANCE LUT PASS (P0, compute).
+// Phase 2A: REAL generation (replaces the Phase-1 stub).
+//
+// Reference: RenderTransmittanceLutPS in
+// Resources/RenderSkyRayMarching.hlsl (OutputTransmittance path):
+//   uv = pixPos / (W,H)  ->  UvToLutTransmittanceParams  ->
+//   WorldPos = (0,0,viewHeight),
+//   WorldDir = (0, sqrt(1-cos^2), cos)  ->
+//   40 fixed-step march, transmittance = exp(-OpticalDepth).
+//
+// Pipeline note (task section 16): the reference bakes this with a
+// fullscreen raster tri, but the math is strictly per-texel (no vertex
+// interpolation, no derivatives, no blending), so a per-texel compute
+// invocation is the exact same computation. Dispatch (W/8, H/8, 1).
+//
+// Coordinate convention (task section 7, port-spec risk): texel (x, y) maps
+// to uv ((x+0.5)/W, (y+0.5)/H) with uv.x = x_mu (angle) and uv.y = x_r
+// (radius), exactly like the reference pixPos/(W,H). Generation and sampling
+// share this convention, so the LUT is self-consistent; a raw byte-compare
+// against DX11 dumps must account for row order, NOT for math differences.
+// Units: km throughout, planet-local frame (center = origin).
+//
+// Light semantics (task section 10): the optical-depth march is
+// light-independent by construction (it accumulates medium extinction only),
+// so this LUT is keyed by atmosphere profile alone - never by sun/camera.
+//
+// Compile verification (Phase 2A gate): this entry compiles as
+// FHillaireTransmittanceLutCS/MainCS (SF_Compute); see the Phase 2A report.
+
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireLutCore.ush"
+
+// Bound 1:1 from FHillaireAtmosphereMediumParams (HillaireShaders.h).
+float BottomRadiusKm;
+float TopRadiusKm;
+float RayleighExpScale;
+float MieExpScale;
+float3 RayleighScatteringKm;
+float AbsorptionWidthKm;
+float3 MieScatteringKm;
+float AbsorptionLinear0;
+float3 MieExtinctionKm;
+float AbsorptionConstant0;
+float3 MieAbsorptionKm;
+float AbsorptionLinear1;
+float3 AbsorptionExtinctionKm;
+float AbsorptionConstant1;
+
+RWTexture2D<float4> TransmittanceUav;
+
+// 40 fixed samples: HillaireLimits::TransmittanceMarchSamples (reference
+// SampleCountIni = 40.0f in RenderTransmittanceLutPS).
+#define HILLAIRE_TRANSMITTANCE_SAMPLE_COUNT 40.0f
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	uint LutW;
+	uint LutH;
+	TransmittanceUav.GetDimensions(LutW, LutH);
+	if (DispatchId.x >= LutW || DispatchId.y >= LutH)
+	{
+		return;
+	}
+
+	// Reference: float2 uv = pixPos / float2(W, H), pixPos = position.xy.
+	float2 uv = (float2(DispatchId.xy) + 0.5f) / float2(LutW, LutH);
+
+	HillaireAtmosphereParams Atmosphere = HillaireMakeAtmosphereParams(
+		BottomRadiusKm, TopRadiusKm,
+		RayleighScatteringKm, RayleighExpScale,
+		MieScatteringKm, MieExtinctionKm, MieAbsorptionKm, MieExpScale,
+		AbsorptionExtinctionKm, AbsorptionWidthKm,
+		AbsorptionLinear0, AbsorptionConstant0,
+		AbsorptionLinear1, AbsorptionConstant1,
+		// GroundAlbedo is unused on the optical-depth path (no ground bounce
+		// for transmittance: reference calls with ground = false).
+		float3(0.0f, 0.0f, 0.0f));
+
+	// Reference: UvToLutTransmittanceParams + WorldPos/WorldDir construction.
+	float viewHeight;
+	float viewZenithCosAngle;
+	HillaireUvToLutTransmittanceParams(
+		Atmosphere.BottomRadius, Atmosphere.TopRadius,
+		viewHeight, viewZenithCosAngle, uv);
+
+	float3 WorldPos = float3(0.0f, 0.0f, viewHeight);
+	float3 WorldDir = float3(0.0f, sqrt(saturate(1.0 - viewZenithCosAngle * viewZenithCosAngle)), viewZenithCosAngle);
+
+	float3 OpticalDepth = HillaireIntegrateOpticalDepth(
+		Atmosphere, WorldPos, WorldDir, HILLAIRE_TRANSMITTANCE_SAMPLE_COUNT);
+
+	// Reference: return float4(exp(-OD), 1.0).
+	float3 transmittance = exp(-OpticalDepth);
+	TransmittanceUav[DispatchId.xy] = float4(transmittance, 1.0f);
+}

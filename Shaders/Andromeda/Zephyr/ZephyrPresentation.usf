@@ -1,0 +1,237 @@
+// ZEPHYR PRESENTATION - bounded sky-only aesthetic overlay (compute).
+//
+// Runs at AfterDOF, AFTER the authoritative ATMOS BeforeDOF composite. ATMOS
+// owns the physical sky; this pass adds ONLY a bounded presentation tint
+// (per-planet cloud/haze) to SKY pixels and passes everything else through
+// byte-identical:
+//
+//   DeviceZ > SkyDepthEpsilon  -> opaque geometry -> identity (no white blocks)
+//   DeviceZ <= SkyDepthEpsilon -> sky/background -> overlay applies
+//
+// Additional hard guards (deep space, ray misses the atmosphere, night) all
+// return the input unchanged: no giant halo, no duplicated atmosphere, no
+// artificial night glow, no double-scatter.
+//
+// Row-vector conventions match HillaireSkyBackground.usf exactly (clip-z 0.5
+// ray fan, mul(float4(clip,1), InvProjMatrix), then
+// mul(dir, (float3x3)ViewToPlanetLocalRot)).
+
+#include "/Engine/Private/Common.ush"
+
+Texture2D<float4> SceneColorInput;
+Texture2D<float> SceneDepthInput;
+SamplerState LinearClampSampler;
+
+float4x4 InvProjMatrix;
+float4x4 ViewToPlanetLocalRot;
+float3 CameraPlanetLocalKm;
+
+float3 PrimarySunDirLocal;
+float3 SunColorAttenuation;
+
+float BottomRadiusKm;
+float TopRadiusKm;
+float ViewHeightKm;
+
+float ZephyrTransitionFactor;
+float DaylightFactor;
+
+float3 ZenithColor;
+float3 HorizonColor;
+float3 SunGlowColor;
+float3 MieColor;
+float RayleighScale;
+float MieScale;
+
+float WeatherHazeFactor;
+float3 WeatherHazeColor;
+
+uint CloudLayerCount;
+float4 CloudLayerAltitudeConfigure[4];
+float4 CloudLayerColorDetail[4];
+float4 CloudLayerWindWater[4];
+
+float TimeSeconds;
+float PresentationIntensity;
+
+float2 ViewRectMin;
+float2 ViewRectSize;
+float SkyDepthEpsilon;
+
+RWTexture2D<float4> CompositeOutputUav;
+
+// Bounded presentation budgets (mirror ZephyrPresentation:: in ZephyrTypes.h).
+#define ZEPHYR_MAX_CLOUD_ADD 0.45
+#define ZEPHYR_MAX_HAZE_ADD 0.20
+#define ZEPHYR_MAX_TOTAL_ADD 0.60
+
+// Single authoritative solar-elevation curve (mirror of
+// ZephyrPresentation::DaylightFactor in ZephyrTypes.h): 0 below civil
+// twilight, 1 at full day, smooth in between. Evaluated at the ray's
+// atmosphere point below so the terminator stays continuous and the planet's
+// night side contributes nothing regardless of where the camera stands.
+#define ZEPHYR_TWILIGHT_BEGIN_ELEV_COS (-0.12)
+#define ZEPHYR_FULL_DAY_ELEV_COS (0.25)
+
+float ZephyrDaylightCurve(float SunElevCos)
+{
+	float T = saturate((SunElevCos - ZEPHYR_TWILIGHT_BEGIN_ELEV_COS)
+		/ (ZEPHYR_FULL_DAY_ELEV_COS - ZEPHYR_TWILIGHT_BEGIN_ELEV_COS));
+	return T * T * (3.0 - 2.0 * T);
+}
+
+// Nearest positive ray/sphere intersection (ro/rd relative to sphere center).
+float ZephyrRaySphereNearest(float3 ro, float3 rd, float radius)
+{
+	float b = dot(ro, rd);
+	float c = dot(ro, ro) - radius * radius;
+	float disc = b * b - c;
+	if (disc < 0.0)
+	{
+		return -1.0;
+	}
+	float s = sqrt(disc);
+	float t0 = -b - s;
+	float t1 = -b + s;
+	if (t0 >= 0.0) return t0;
+	if (t1 >= 0.0) return t1;
+	return -1.0;
+}
+
+float ZephyrHash13(float3 p)
+{
+	p = frac(p * 0.1031);
+	p += dot(p, p.yzx + 33.33);
+	return frac((p.x + p.y) * p.z);
+}
+
+float ZephyrValueNoise(float3 p)
+{
+	float3 i = floor(p);
+	float3 f = frac(p);
+	f = f * f * (3.0 - 2.0 * f);
+	float n000 = ZephyrHash13(i + float3(0, 0, 0));
+	float n100 = ZephyrHash13(i + float3(1, 0, 0));
+	float n010 = ZephyrHash13(i + float3(0, 1, 0));
+	float n110 = ZephyrHash13(i + float3(1, 1, 0));
+	float n001 = ZephyrHash13(i + float3(0, 0, 1));
+	float n101 = ZephyrHash13(i + float3(1, 0, 1));
+	float n011 = ZephyrHash13(i + float3(0, 1, 1));
+	float n111 = ZephyrHash13(i + float3(1, 1, 1));
+	return lerp(
+		lerp(lerp(n000, n100, f.x), lerp(n010, n110, f.x), f.y),
+		lerp(lerp(n001, n101, f.x), lerp(n011, n111, f.x), f.y),
+		f.z);
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	uint2 ViewSize = uint2((uint)ViewRectSize.x, (uint)ViewRectSize.y);
+	if (DispatchId.x >= ViewSize.x || DispatchId.y >= ViewSize.y)
+	{
+		return;
+	}
+	uint2 BufferPixel = uint2(ViewRectMin) + DispatchId.xy;
+
+	float4 SceneColor = SceneColorInput.Load(int3(BufferPixel, 0));
+	float DeviceZ = SceneDepthInput.Load(int3(BufferPixel, 0));
+
+	// Opaque scene geometry: identity. ZEPHYR can never paint the surface.
+	if (DeviceZ > SkyDepthEpsilon)
+	{
+		CompositeOutputUav[BufferPixel] = SceneColor;
+		return;
+	}
+
+	// Deep space / not entering an atmosphere: identity (no halo, no double).
+	if (ZephyrTransitionFactor <= 0.0)
+	{
+		CompositeOutputUav[BufferPixel] = SceneColor;
+		return;
+	}
+
+	// View ray in the planet-local frame (same fan as the ATMOS sky composite).
+	float2 ViewUv = (float2(DispatchId.xy) + 0.5) / float2(ViewSize);
+	float3 ClipSpace = float3(ViewUv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.5);
+	float4 HViewPos = mul(float4(ClipSpace, 1.0), InvProjMatrix);
+	float3 ViewDirLocal = normalize(mul(HViewPos.xyz / HViewPos.w, (float3x3)ViewToPlanetLocalRot));
+
+	float CamLen = length(CameraPlanetLocalKm);
+	float3 UpVector = CamLen > 1e-6 ? CameraPlanetLocalKm / CamLen : float3(0.0, 0.0, 1.0);
+
+	// Ray must hit the atmosphere shell: otherwise identity (deep space).
+	float tTop = ZephyrRaySphereNearest(CameraPlanetLocalKm, ViewDirLocal, TopRadiusKm);
+	if (tTop < 0.0)
+	{
+		CompositeOutputUav[BufferPixel] = SceneColor;
+		return;
+	}
+
+	float ViewZenithCos = clamp(dot(ViewDirLocal, UpVector), -1.0, 1.0);
+
+	// Sky-dome weight: strongest at the horizon, fading toward the zenith.
+	float HorizonWeight = pow(saturate(1.0 - ViewZenithCos), 2.0);
+
+	// Solar gate at the RAY's atmosphere point (same curve as the camera
+	// daylight). Inside the shell the sample point IS the camera, so this
+	// equals the CPU camera factor exactly. The min keeps the camera factor
+	// authoritative while guaranteeing zero contribution for night-side rays
+	// and a smooth terminator.
+	float3 SunDirLocal = float3(0.0, 0.0, 1.0);
+	const float SunLenSq = dot(PrimarySunDirLocal, PrimarySunDirLocal);
+	if (SunLenSq > 1e-12)
+	{
+		SunDirLocal = PrimarySunDirLocal * rsqrt(SunLenSq);
+	}
+	const float3 SamplePosLocal = (CamLen <= TopRadiusKm)
+		? CameraPlanetLocalKm
+		: CameraPlanetLocalKm + ViewDirLocal * tTop;
+	const float SampleLen = length(SamplePosLocal);
+	const float3 SampleUp = SampleLen > 1e-6 ? SamplePosLocal / SampleLen : UpVector;
+	const float RayDayWeight = ZephyrDaylightCurve(dot(SampleUp, SunDirLocal));
+
+	// Night / below-twilight: both factors reach 0 => zero addition.
+	float DayWeight = min(saturate(DaylightFactor), RayDayWeight);
+
+	// Haze: horizon band tinted by the planet profile + weather.
+	float HazeAmount = ZephyrTransitionFactor * DayWeight * HorizonWeight
+		* (0.35 + 0.65 * saturate(WeatherHazeFactor));
+	float3 HazeTint = lerp(HorizonColor, WeatherHazeColor, saturate(WeatherHazeFactor));
+	float3 HazeAdd = HazeTint * (HazeAmount * ZEPHYR_MAX_HAZE_ADD);
+
+	// Clouds: a soft veil from the first enabled layer, drifting with time.
+	float3 CloudAdd = float3(0.0, 0.0, 0.0);
+	if (CloudLayerCount > 0u)
+	{
+		float Coverage = saturate(CloudLayerAltitudeConfigure[0].z);
+		float Density = saturate(CloudLayerAltitudeConfigure[0].w);
+		float Enabled = CloudLayerWindWater[0].w;
+		float3 CloudTint = CloudLayerColorDetail[0].rgb;
+		if (Enabled > 0.5 && Coverage > 0.0)
+		{
+			float3 Drift = float3(CloudLayerWindWater[0].x, CloudLayerWindWater[0].y, 0.0) * TimeSeconds * 0.01;
+			float3 Np = ViewDirLocal * (6.0 + 10.0 * Density) + Drift;
+			float N = ZephyrValueNoise(Np) * 0.6 + ZephyrValueNoise(Np * 2.13) * 0.4;
+			float CloudMask = saturate((N - (1.0 - Coverage)) * 3.0);
+			float CloudAmount = ZephyrTransitionFactor * DayWeight * CloudMask
+				* HorizonWeight * Density;
+			CloudAdd = CloudTint * (CloudAmount * ZEPHYR_MAX_CLOUD_ADD);
+		}
+	}
+
+	float3 Add = (HazeAdd + CloudAdd) * max(0.0, PresentationIntensity);
+	Add = min(Add, float3(ZEPHYR_MAX_TOTAL_ADD, ZEPHYR_MAX_TOTAL_ADD, ZEPHYR_MAX_TOTAL_ADD));
+
+	// Bloom-headroom fade (the documented ZEPHYR presentation contract): the
+	// presentation fades out as the ATMOS base approaches white, so ZEPHYR can
+	// never drive an already-bright sky pixel across the bloom threshold. A
+	// fade tied to the authoritative base, NOT a constant reduction.
+	const float BaseLuma = dot(SceneColor.rgb, float3(0.2126, 0.7152, 0.0722));
+	Add *= saturate(1.0 - BaseLuma);
+
+	// Same pre-exposed buffer-space convention as the ATMOS composites.
+	Add *= View.PreExposure;
+
+	CompositeOutputUav[BufferPixel] = float4(SceneColor.rgb + Add, SceneColor.a);
+}

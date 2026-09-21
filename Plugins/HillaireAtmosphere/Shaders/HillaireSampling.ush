@@ -1,0 +1,141 @@
+// HILLAIRE ATMOSPHERE - SAMPLING HELPERS (Phase 1).
+//
+// Ported from Resources/RenderSkyCommon.hlsl (golden DX11 reference).
+// Texture/sampler DECLARATIONS are gone (UE binds SRVs/samplers via parameter
+// structs in HillaireShaders.h); the UV math, phase functions and disk
+// functions are verbatim and frozen.
+
+#pragma once
+
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+
+#define HILLAIRE_NONLINEARSKYVIEWLUT 1
+#define HILLAIRE_SKYVIEW_WIDTH 192.0f
+#define HILLAIRE_SKYVIEW_HEIGHT 108.0f
+
+void HillaireUvToSkyViewLutParams(
+	float bottomRadius,
+	out float viewZenithCosAngle, out float lightViewCosAngle,
+	in float viewHeight, in float2 uv)
+{
+	// Constrain uvs to valid sub texel range (avoid zenith derivative issue making LUT usage visible)
+	uv = float2(
+		HillaireFromSubUvsToUnit(uv.x, HILLAIRE_SKYVIEW_WIDTH),
+		HillaireFromSubUvsToUnit(uv.y, HILLAIRE_SKYVIEW_HEIGHT));
+
+	float Vhorizon = sqrt(max(0.0f, viewHeight * viewHeight - bottomRadius * bottomRadius));
+	float CosBeta = Vhorizon / viewHeight;				// GroundToHorizonCos
+	float Beta = acos(CosBeta);
+	float ZenithHorizonAngle = HILLAIRE_PI - Beta;
+
+	if (uv.y < 0.5f)
+	{
+		float coord = 2.0 * uv.y;
+		coord = 1.0 - coord;
+#if HILLAIRE_NONLINEARSKYVIEWLUT
+		coord *= coord;
+#endif
+		coord = 1.0 - coord;
+		viewZenithCosAngle = cos(ZenithHorizonAngle * coord);
+	}
+	else
+	{
+		float coord = uv.y * 2.0 - 1.0;
+#if HILLAIRE_NONLINEARSKYVIEWLUT
+		coord *= coord;
+#endif
+		viewZenithCosAngle = cos(ZenithHorizonAngle + Beta * coord);
+	}
+
+	float coord = uv.x;
+	coord *= coord;
+	lightViewCosAngle = -(coord * 2.0 - 1.0);
+}
+
+void HillaireSkyViewLutParamsToUv(
+	float bottomRadius,
+	in bool bIntersectGround, in float viewZenithCosAngle, in float lightViewCosAngle,
+	in float viewHeight, out float2 uv)
+{
+	// max(0, .) guard: a camera below the modeled bottom (e.g. terrain above the
+	// base sphere) degrades to a finite horizon, never NaN.
+	float Vhorizon = sqrt(max(0.0f, viewHeight * viewHeight - bottomRadius * bottomRadius));
+	float CosBeta = Vhorizon / viewHeight;				// GroundToHorizonCos
+	float Beta = acos(CosBeta);
+	float ZenithHorizonAngle = HILLAIRE_PI - Beta;
+
+	if (!bIntersectGround)
+	{
+		float coord = acos(viewZenithCosAngle) / ZenithHorizonAngle;
+		coord = 1.0 - coord;
+#if HILLAIRE_NONLINEARSKYVIEWLUT
+		coord = sqrt(coord);
+#endif
+		coord = 1.0 - coord;
+		uv.y = coord * 0.5f;
+	}
+	else
+	{
+		float coord = (acos(viewZenithCosAngle) - ZenithHorizonAngle) / Beta;
+#if HILLAIRE_NONLINEARSKYVIEWLUT
+		coord = sqrt(coord);
+#endif
+		uv.y = coord * 0.5f + 0.5f;
+	}
+
+	{
+		float coord = -lightViewCosAngle * 0.5f + 0.5f;
+		coord = sqrt(coord);
+		uv.x = coord;
+	}
+
+	// Constrain uvs to valid sub texel range (avoid zenith derivative issue making LUT usage visible)
+	uv = float2(
+		HillaireFromUnitToSubUvs(uv.x, HILLAIRE_SKYVIEW_WIDTH),
+		HillaireFromUnitToSubUvs(uv.y, HILLAIRE_SKYVIEW_HEIGHT));
+}
+
+float HillaireRayleighPhase(float cosTheta)
+{
+	float factor = 3.0f / (16.0f * HILLAIRE_PI);
+	return factor * (1.0f + cosTheta * cosTheta);
+}
+
+float HillaireCornetteShanksMiePhase(float g, float cosTheta)
+{
+	float k = 3.0 / (8.0 * HILLAIRE_PI) * (1.0 - g * g) / (2.0 + g * g);
+	return k * (1.0 + cosTheta * cosTheta) / pow(1.0 + g * g - 2.0 * g * -cosTheta, 1.5);
+}
+
+// Stellar disk (reference GetSunLuminance, angular-radius overload).
+// Legacy 4-arg wrapper threshold (bit-identical): 0.5 * 0.505 deg in rad.
+// NOTE: the reference multiplies by (1 - gScreenshotCaptureActive); UE passes
+// an explicit flag instead of a global (no hidden globals in this codebase).
+float3 HillaireGetSunLuminance(
+	float3 planetLocalPos, float3 planetLocalDir,
+	float planetRadius, float3 sunLocalDir, float angularRadius,
+	bool bSuppressDisk)
+{
+	if (bSuppressDisk)
+	{
+		return (float3)0;
+	}
+	if (angularRadius > 0.0f && dot(planetLocalDir, sunLocalDir) > cos(angularRadius))
+	{
+		float t = HillaireRaySphereIntersectNearest(
+			planetLocalPos, planetLocalDir, (float3)0.0f, planetRadius);
+		if (t < 0.0f) // no intersection: ray escapes to the star
+		{
+			return (float3)HILLAIRE_SUN_DISK_RADIANCE; // bounded (see HillaireCommon.ush); scaled by sun throughput at composite
+		}
+	}
+	return (float3)0;
+}
+
+float3 HillaireGetSunLuminanceLegacy(
+	float3 planetLocalPos, float3 planetLocalDir,
+	float planetRadius, float3 sunLocalDir, bool bSuppressDisk)
+{
+	return HillaireGetSunLuminance(planetLocalPos, planetLocalDir, planetRadius,
+		sunLocalDir, 0.5f * 0.505f * HILLAIRE_PI / 180.0f, bSuppressDisk);
+}

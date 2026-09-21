@@ -9,7 +9,7 @@ class USkyLightComponent;
 class UStaticMeshComponent;
 class USceneComponent;
 class UTextureCube;
-class UAtmosphereLightReferenceComponent;
+class UHillaireStarLinkComponent;
 
 UCLASS()
 class ANDROMEDA_API ASun : public AActor
@@ -73,24 +73,6 @@ public:
         Category = "Andromeda|Sun"
     )
     TObjectPtr<USkyLightComponent> SpaceAmbientLight;
-
-    // =========================================================
-    // ATMOSPHERE LIGHT REFERENCE (SUN LIGHT REFERENCE)
-    // =========================================================
-    // Authoritative light-direction reference for the unified
-    // atmosphere (UAtmosphereLightReferenceComponent).
-    // "The physical direction from which sunlight comes"
-    // (Planet -> Sun, world frame). The atmosphere NEVER
-    // reconstructs the sun direction on its own: the Registry
-    // queries this reference per planet on the game thread and
-    // bakes the result into the snapshot. Not a second sun, not
-    // a second light source: no lighting, no simulation state.
-    UPROPERTY(
-        VisibleAnywhere,
-        BlueprintReadOnly,
-        Category = "Andromeda|Sun"
-    )
-    TObjectPtr<UAtmosphereLightReferenceComponent> AtmosphereLightReference;
 
     // =========================================================
     // LIGHTING PARAMETERS
@@ -170,31 +152,32 @@ public:
     TObjectPtr<UTextureCube> AmbientCubemap;
 
     /**
-     * Nasconde la mesh visiva della stella (default: nascosta).
-     *
-     * MOTIVAZIONE (ZEPHYR-01 white-sphere fix): la SunMesh e' una
-     * sfera opaca di raggio fisso nel mondo (asset Sphere_6510340D,
-     * ~50 cm). Un raggio fisso non puo' mai rappresentare
-     * correttamente una stella: da vicino riempie la vista come
-     * una "sfera bianca" priva di senso fisico (il PlayerStart di
-     * Andromeda_Main si trova a ~52 cm dal centro del sole!),
-     * da lontano diventa un puntino arbitrario. Il visuale
-     * corretto della stella (disco angolare da 0.53 gradi +
-     * alone Mie, attenuato dalla transmittance atmosferica) e'
-     * prodotto da ZEPHYR per ogni camera e distanza.
-     * La posizione della stella, le luci (SunLight, SkyLight) e
-     * il trasporto radiativo restano invariati: cambia solo la
-     * mesh decorativa. Precedente: AtmosphereMesh di APlanet,
-     * nascosta per lo stesso motivo (i sistemi volumetrici
-     * possiedono il look). Disabilitare qui per ripristinare
-     * la mesh legacy (sconsigliato).
+     * Stable star identity for this sun, derived from its star system.
+     * Set once at spawn time by the owning AStarSystem.
      */
     UPROPERTY(
-        EditAnywhere,
-        BlueprintReadWrite,
+        VisibleAnywhere,
+        BlueprintReadOnly,
         Category = "Andromeda|Sun"
     )
-    bool bHideSunMeshForZephyrSky = true;
+    FGuid StableStarId;
+
+    // =========================================================
+    // HILLAIRE STAR LINK (ATMOS WIRING)
+    // =========================================================
+
+    /**
+     * Feeds this primary star into the Hillaire light feed (Phase 2E).
+     * Constructor-owned: every generated ASun (the actor returned by
+     * AStarSystem::GetSunActor) automatically carries exactly one.
+     * Plain ActorComponent: never attached to any mesh.
+     */
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Sun"
+    )
+    TObjectPtr<UHillaireStarLinkComponent> HillaireStarLink;
 
 private:
 

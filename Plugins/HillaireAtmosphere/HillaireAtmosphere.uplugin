@@ -1,0 +1,20 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Hillaire Atmosphere",
+	"Description": "Phase 1: Hillaire/Bruneton atmosphere foundation for UE5.8 (per-planet state, N x M light sources, per-view snapshots, LUT/RDG infrastructure). No final rendering yet.",
+	"Category": "Rendering",
+	"CreatedBy": "Andromeda",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "HillaireAtmosphere",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

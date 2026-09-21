@@ -7,8 +7,8 @@
 
 class UProceduralMeshComponent;
 class UPlanetTerrainGenerator;
-class UPlanetAtmosphereComponent;
 class UPlanetaryLightingComponent;
+class UHillairePlanetLinkComponent;
 
 UCLASS()
 class ANDROMEDA_API APlanet : public AActor
@@ -46,23 +46,23 @@ public:
     UPROPERTY(
         VisibleAnywhere,
         BlueprintReadOnly,
-        Category = "Andromeda|Planet|Atmosphere"
-    )
-    TObjectPtr<UPlanetAtmosphereComponent> Atmosphere;
-
-    UPROPERTY(
-        VisibleAnywhere,
-        BlueprintReadOnly,
-        Category = "Andromeda|Planet|Atmosphere"
-    )
-    TObjectPtr<UProceduralMeshComponent> AtmosphereMesh;
-
-    UPROPERTY(
-        VisibleAnywhere,
-        BlueprintReadOnly,
         Category = "Andromeda|Planet|Lighting"
     )
     TObjectPtr<UPlanetaryLightingComponent> PlanetaryLighting;
+
+    /**
+     * Feeds this procedural planet into the Hillaire planet feed
+     * (Phase 2F: live center, ground radius, terrain height, atmosphere
+     * height). Constructor-owned: every generated APlanet automatically
+     * carries exactly one. Plain ActorComponent: never attached to the
+     * generated mesh itself.
+     */
+    UPROPERTY(
+        VisibleAnywhere,
+        BlueprintReadOnly,
+        Category = "Andromeda|Planet"
+    )
+    TObjectPtr<UHillairePlanetLinkComponent> HillairePlanetLink;
 
     UPROPERTY(
         EditAnywhere,
@@ -172,6 +172,4 @@ protected:
     void InitializePlanet();
 
     void GeneratePlanetMesh();
-
-    void GenerateAtmosphereMesh();
 };

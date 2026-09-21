@@ -1,16 +1,22 @@
 #include "Sun.h"
 
-#include "Atmosphere/AtmosphereLightReferenceComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/TextureCube.h"
+#include "HillaireStarLinkComponent.h"
+#include "StarSystem.h"
 #include "UObject/ConstructorHelpers.h"
 
 ASun::ASun()
 {
-    PrimaryActorTick.bCanEverTick = false;
+    // Tick enabled so HillaireStarLinkComponent can push the live
+    // sun direction to the atmosphere feed. Use TG_PostUpdateWork to
+    // run after planetary lighting components have updated their
+    // CurrentStarDirection.
+    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.TickGroup = TG_PostUpdateWork;
 
     // =========================================================
     // ROOT
@@ -33,22 +39,6 @@ ASun::ASun()
         );
 
     SunMesh->SetupAttachment(Root);
-
-    // =========================================================
-    // ATMOSPHERE LIGHT REFERENCE
-    //
-    // Source of truth of the atmospheric light direction.
-    // Auto-created with the Sun: no manual placement, no
-    // Blueprint, no per-planet setup. Identity transform; the
-    // direction is computed per planet on demand.
-    // =========================================================
-
-    AtmosphereLightReference =
-        CreateDefaultSubobject<UAtmosphereLightReferenceComponent>(
-            TEXT("AtmosphereLightReference")
-        );
-
-    AtmosphereLightReference->SetupAttachment(Root);
 
     SunMesh->SetCollisionEnabled(
         ECollisionEnabled::NoCollision
@@ -136,11 +126,30 @@ ASun::ASun()
     SpaceAmbientLight->SetCastShadows(false);
 
     ConfigureSunLight();
+
+    // =========================================================
+    // HILLAIRE STAR LINK (ATMOS WIRING)
+    //
+    // Plain ActorComponent owned by the star Actor itself (never by a
+    // mesh): every spawned Sun feeds the Hillaire light feed with its
+    // own live direction/intensity/color. No second lighting system.
+    // =========================================================
+
+    HillaireStarLink =
+        CreateDefaultSubobject<UHillaireStarLinkComponent>(
+            TEXT("HillaireStarLink")
+        );
 }
 
 void ASun::BeginPlay()
 {
     Super::BeginPlay();
+
+    // Set stable star ID from owning star system
+    if (AStarSystem* StarSystem = Cast<AStarSystem>(GetOwner()))
+    {
+        StableStarId = StarSystem->GetStableStarId();
+    }
 
     ConfigureSunLight();
     ConfigureSunMesh();
@@ -165,17 +174,15 @@ void ASun::ConfigureSunMesh()
         return;
     }
 
-    // See bHideSunMeshForZephyrSky: the fixed-radius mesh cannot
-    // represent a star at all distances; ZEPHYR owns the sun
-    // visual (angular disk + halo). Same pattern as the hidden
-    // APlanet::AtmosphereMesh.
+    // CLEAN SLATE: no sky renderer replaces the decorative mesh,
+    // so it stays visible as authored.
     SunMesh->SetVisibility(
-        !bHideSunMeshForZephyrSky,
+        true,
         true
     );
 
     SunMesh->SetHiddenInGame(
-        bHideSunMeshForZephyrSky
+        false
     );
 }
 

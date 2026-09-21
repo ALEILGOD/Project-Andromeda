@@ -225,11 +225,18 @@ public:
 
     // Riferimento runtime al Sole spawnato (read-only, puo' essere
     // nullptr se SunClass non era impostata o lo spawn e' fallito).
-    // Introdotto per l'AtmosphereLightReference: il Registry risolve
-    // il Sole SOLO attraverso questa API (mai con discovery globale,
-    // nomi o hardcode). Il resto di STARMAP e' intoccato.
+    // API generica STARMAP: restituisce l'attore sole del sistema,
+    // senza dipendenze atmosferiche. Il resto di STARMAP e' intoccato.
     UFUNCTION(BlueprintPure, Category = "Andromeda|Star System")
     ASun* GetSunActor() const;
+
+    /**
+     * Returns a stable, deterministic FGuid for this star system's star.
+     * Derived from UniverseSeed + SystemCoordinate so it's stable across
+     * frames, spawns, and sessions. Same star system = same StarId.
+     */
+    UFUNCTION(BlueprintPure, Category = "Andromeda|Star System")
+    FGuid GetStableStarId() const;
 
 
 private:

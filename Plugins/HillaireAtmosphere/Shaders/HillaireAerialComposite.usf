@@ -1,0 +1,120 @@
+// HILLAIRE ATMOSPHERE - AERIAL COMPOSITE (P4, compute).
+// Phase 2D: post-process composite of the Phase-2C camera volume onto scene color.
+//
+// Verbatim port of the FASTAERIALPERSPECTIVE composite branch in
+// RenderSkyRayMarching.hlsl (lines 484-512):
+//   tDepth = length(fragWorldPos - camPos)
+//   Slice = tDepth / AerialKmPerSlice; Weight = 1; if (Slice < 0.5) { Weight = saturate(Slice*2); Slice = 0.5; }
+//   w = sqrt(Slice / 32)
+//   AP = Weight * Volume.SampleLevel(linearClamp, (pix/res, w))
+//   L += AP.rgb; Opacity = AP.a            (output (L, Opacity))
+//
+// UE5.8 adaptations (all documented, math preserved):
+// - Fullscreen compute [8x8x1] over the view rect instead of the reference
+//   fullscreen raster tri: strictly per-pixel math, identical computation.
+// - Scene color/depth come from the post-processing chain (BeforeDOF hook):
+//   color via exact-texel Load (no resampling blur - mirrors the reference
+//   per-pixel march), depth via SceneTexturesStruct.SceneDepthTexture Load.
+// - Device depth is reversed-Z (0.0 = far/sky). Pixels at/below
+//   CompositeSkyDepthEpsilon are returned IDENTICAL: no aerial on background
+//   (no double-scatter - background belongs to the future SkyView path).
+// - Clip reconstruction uses the snapshot ProjectionMatrix (inverted once on
+//   CPU, same matrices as the volume bake so rays match exactly):
+//   Clip = (viewUV*(2,-2)+(-1,1), DeviceZ); viewPos = InvProj*Clip/w;
+//   tDepth = length(viewPos) (camera sits at the view-space origin).
+// - Volume UV = view-rect-normalized coords (exact correspondence with the
+//   bake froxel mapping); w identical to reference. Out-of-range w clamps to
+//   the deepest slice via LinearClamp (reference-identical: finite).
+// - Output: SceneColor * (1-AP.a) + SunColor * AP.rgb * PreExposure, alpha
+//   preserved. (1-AP.a) == mean view-ray transmittance by construction of the
+//   Phase-2C volume. SunColor = slot-0 ColorAttenuation (unit-white transfer
+//   architecture); PreExposure from the view UB (the same exposure the base
+//   pass used, so buffer-space math is consistent - task section 17).
+// - Camera-outside-atmosphere and disabled states are handled on the CPU
+//   (identity passthrough); the shader only runs when compositing applies.
+// - No sun disk: sky pixels skip, and the disk belongs to final/sky work.
+
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+// Engine common header: pulls /Engine/Generated/GeneratedUniformBuffers.ush,
+// which declares the SceneTexturesStruct + View uniform-buffer accessors
+// generated from the C++ SHADER_PARAMETER_STRUCT_INCLUDEs (same mechanism as
+// ScreenSpaceShadows / DistanceFieldLightingPost). No Hillaire identifier
+// collides with it (all Hillaire symbols are Hillaire*-prefixed; verified no
+// engine global named LinearClampSampler exists).
+#include "/Engine/Private/Common.ush"
+
+// Bound 1:1 from FHillaireAerialCompositeCS::FParameters (HillaireShaders.h).
+// Scene depth is an explicit SRV (testable binding; production extracts the
+// raw ref from the post-processing scene-textures UB - see ViewExtension).
+// View.PreExposure arrives via FViewUniformShaderParameters struct include
+// (standard view-UB accessor, same exposure the base pass used).
+Texture2D<float4> SceneColorInput;
+Texture2D<float> SceneDepthInput;
+Texture3D<float4> AerialVolume;
+SamplerState LinearClampSampler;
+// Inverse projection (snapshot ProjectionMatrix, inverted once on CPU).
+// Row-vector convention: mul(float4(clip,1), InvProjMatrix).
+float4x4 InvProjMatrix;
+// Slot-0 sun Color*Intensity (linear), unit-white transfer convention.
+float3 SunColorAttenuation;
+// View-rect origin/size in buffer pixels (exact-texel Load mapping).
+float2 ViewRectMin;
+float2 ViewRectSize;
+// Slice depth: tDepth / AerialKmPerSlice (per-planet: envelope / 25, so the
+// volume resolution and the near fade are atmosphere-relative; see HillaireLimits).
+float AerialKmPerSlice;
+// Sky/background device-Z threshold (reversed-Z: 0 = far).
+float SkyDepthEpsilon;
+
+RWTexture2D<float4> CompositeOutputUav;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	uint2 ViewSize = uint2((uint)ViewRectSize.x, (uint)ViewRectSize.y);
+	if (DispatchId.x >= ViewSize.x || DispatchId.y >= ViewSize.y)
+	{
+		return;
+	}
+	uint2 BufferPixel = uint2(ViewRectMin) + DispatchId.xy;
+
+	float4 SceneColor = SceneColorInput.Load(int3(BufferPixel, 0));
+	float DeviceZ = SceneDepthInput.Load(int3(BufferPixel, 0));
+
+	// Sky/background: identity (no aerial, no double-scatter).
+	if (DeviceZ <= SkyDepthEpsilon)
+	{
+		CompositeOutputUav[BufferPixel] = SceneColor;
+		return;
+	}
+
+	// Clip reconstruction (reference lines 484-488, UE clip conventions:
+	// y-down screen pixels map with the same (2,-2)/(-1,1) flip as DX11).
+	float2 ViewUv = (float2(DispatchId.xy) + 0.5f) / float2(ViewSize);
+	float3 ClipSpace = float3(ViewUv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), DeviceZ);
+	float4 HViewPos = mul(float4(ClipSpace, 1.0f), InvProjMatrix);
+	float3 ViewPos = HViewPos.xyz / HViewPos.w;
+	float tDepth = length(ViewPos);
+
+	// Slice mapping + near fade (reference lines 489-497 verbatim).
+	float Slice = tDepth / AerialKmPerSlice;
+	float Weight = 1.0f;
+	if (Slice < 0.5f)
+	{
+		Weight = saturate(Slice * 2.0f);
+		Slice = 0.5f;
+	}
+	uint VolW;
+	uint VolH;
+	uint VolD;
+	AerialVolume.GetDimensions(VolW, VolH, VolD);
+	float w = sqrt(Slice / (float)VolD);
+
+	float4 AP = Weight * AerialVolume.SampleLevel(LinearClampSampler, float3(ViewUv, w), 0.0f);
+
+	// Composite (reference lines 500-510, pre-exposed buffer space):
+	// transmit background, add sun-scaled inscatter. Alpha preserved.
+	float3 Transmitted = SceneColor.rgb * (1.0f - AP.a);
+	float3 Inscatter = SunColorAttenuation * AP.rgb * View.PreExposure;
+	CompositeOutputUav[BufferPixel] = float4(Transmitted + Inscatter, SceneColor.a);
+}

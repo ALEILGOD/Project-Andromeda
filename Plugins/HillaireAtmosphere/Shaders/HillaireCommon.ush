@@ -1,0 +1,122 @@
+// HILLAIRE ATMOSPHERE - COMMON MATH (Phase 1).
+//
+// Ported from Resources/SkyAtmosphereCommon.hlsl (golden DX11 reference).
+// The cbuffer is GONE: every helper takes explicit parameters (UE global
+// shaders bind via parameter structs, never registers). The FORMULAS are
+// verbatim - this file is frozen math, not a stub.
+//
+// Coordinate note: the engine feeds camera-relative KM floats (see
+// HillaireUnits.h). The planet-local transform below is still applied
+// EXACTLY ONCE at the planet boundary, preserving the reference invariant
+// that the scattering core always sees the planet center as local origin.
+
+#pragma once
+
+// UE global-shader requirement: Platform.ush must be included (first) by
+// every shader in the compilation chain.
+#include "/Engine/Public/Platform.ush"
+
+#define HILLAIRE_PI 3.1415926535897932384626433832795f
+
+// Stellar disk radiance, relative to the resolved sun throughput (disk
+// luminance = HILLAIRE_SUN_DISK_RADIANCE * SunColorAttenuation * PreExposure).
+// The DX11 reference used an arbitrary 1e6 for a bloom-free, tonemap-clamped
+// demo; through UE's bloom chain that energy dominated the frame (giant
+// artificial halo, washed-out sunrise/sunset) and was not physical. This
+// bounded value saturates the disk to white under ACES while keeping the disk
+// a disk instead of a screen-wide glow.
+#define HILLAIRE_SUN_DISK_RADIANCE 16.0f
+
+float4 HillaireQuatConjugate(float4 q) { return float4(-q.xyz, q.w); }
+float3 HillaireQuatRotate(float4 q, float3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+
+// P_local = conj(Q) * (P_world - Center). Directions skip the translation.
+float3 HillaireWorldToPlanetLocal(float3 w, float3 planetCenter, float4 planetQuat)
+{
+	return HillaireQuatRotate(HillaireQuatConjugate(planetQuat), w - planetCenter);
+}
+float3 HillairePlanetLocalToWorld(float3 l, float3 planetCenter, float4 planetQuat)
+{
+	return planetCenter + HillaireQuatRotate(planetQuat, l);
+}
+float3 HillaireDirToPlanetLocal(float3 worldDir, float4 planetQuat)
+{
+	return HillaireQuatRotate(HillaireQuatConjugate(planetQuat), worldDir);
+}
+
+// Quadratic nearest-positive-root with max(0,.) semantics. Used for top /
+// ground tMax, MoveToTopAtmosphere and disk occlusion. Precision-sensitive
+// for huge radii: callers MUST pass planet-local (recentered) positions.
+float HillaireRaySphereIntersectNearest(float3 r0, float3 rd, float3 s0, float sR)
+{
+	float a = dot(rd, rd);
+	float3 s0_r0 = r0 - s0;
+	float b = 2.0 * dot(rd, s0_r0);
+	float c = dot(s0_r0, s0_r0) - (sR * sR);
+	float delta = b * b - 4.0 * a * c;
+	if (delta < 0.0 || a == 0.0)
+	{
+		return -1.0;
+	}
+	float sol0 = (-b - sqrt(delta)) / (2.0 * a);
+	float sol1 = (-b + sqrt(delta)) / (2.0 * a);
+	if (sol0 < 0.0 && sol1 < 0.0)
+	{
+		return -1.0;
+	}
+	if (sol0 < 0.0)
+	{
+		return max(0.0, sol1);
+	}
+	else if (sol1 < 0.0)
+	{
+		return max(0.0, sol0);
+	}
+	return max(0.0, min(sol0, sol1));
+}
+
+float HillaireFromUnitToSubUvs(float u, float resolution)
+{
+	return (u + 0.5f / resolution) * (resolution / (resolution + 1.0f));
+}
+float HillaireFromSubUvsToUnit(float u, float resolution)
+{
+	return (u - 0.5f / resolution) * (resolution / (resolution - 1.0f));
+}
+
+// Transmittance LUT (Bruneton 2017) parameterization, 256x64.
+void HillaireLutTransmittanceParamsToUv(
+	float bottomRadius, float topRadius,
+	in float viewHeight, in float viewZenithCosAngle, out float2 uv)
+{
+	float H = sqrt(max(0.0f, topRadius * topRadius - bottomRadius * bottomRadius));
+	float rho = sqrt(max(0.0f, viewHeight * viewHeight - bottomRadius * bottomRadius));
+
+	float discriminant = viewHeight * viewHeight * (viewZenithCosAngle * viewZenithCosAngle - 1.0) + topRadius * topRadius;
+	float d = max(0.0, (-viewHeight * viewZenithCosAngle + sqrt(discriminant)));
+
+	float d_min = topRadius - viewHeight;
+	float d_max = rho + H;
+	float x_mu = (d - d_min) / (d_max - d_min);
+	float x_r = rho / H;
+
+	uv = float2(x_mu, x_r);
+}
+
+void HillaireUvToLutTransmittanceParams(
+	float bottomRadius, float topRadius,
+	out float viewHeight, out float viewZenithCosAngle, in float2 uv)
+{
+	float x_mu = uv.x;
+	float x_r = uv.y;
+
+	float H = sqrt(topRadius * topRadius - bottomRadius * bottomRadius);
+	float rho = H * x_r;
+	viewHeight = sqrt(rho * rho + bottomRadius * bottomRadius);
+
+	float d_min = topRadius - viewHeight;
+	float d_max = rho + H;
+	float d = d_min + x_mu * (d_max - d_min);
+	viewZenithCosAngle = d == 0.0 ? 1.0f : (H * H - rho * rho - d * d) / (2.0 * viewHeight * d);
+	viewZenithCosAngle = clamp(viewZenithCosAngle, -1.0, 1.0);
+}

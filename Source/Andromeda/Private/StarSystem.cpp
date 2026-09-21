@@ -350,6 +350,21 @@ void AStarSystem::SpawnPlanets()
             *PlanetWorldPosition.ToString()
         );
     }
+
+    // Ensure Sun actor ticks AFTER all planet actors so that:
+    // 1. StarSystem updates orbits/rotations (in its Tick, TG_PrePhysics)
+    // 2. Planet actors tick (TG_PostUpdateWork) -> PlanetaryLightingComponent updates CurrentStarDirection, HillairePlanetLinkComponent pushes planet state
+    // 3. Sun actor ticks (TG_PostUpdateWork) -> HillaireStarLinkComponent reads updated planetary lighting and pushes sun direction
+    if (SpawnedSun)
+    {
+        for (const FSpawnedPlanetData& SpawnedPlanet : SpawnedPlanets)
+        {
+            if (SpawnedPlanet.PlanetActor)
+            {
+                SpawnedSun->AddTickPrerequisiteActor(SpawnedPlanet.PlanetActor);
+            }
+        }
+    }
 }
 
 
@@ -773,11 +788,29 @@ AActor* AStarSystem::GetPlanetActor(
 
 ASun* AStarSystem::GetSunActor() const
 {
-    // Read-only accessor for the spawned Sun (used by the
-    // atmosphere Registry to reach the AtmosphereLightReference).
+    // Read-only accessor for the spawned Sun (generic STARMAP API).
     // SunClass is TSubclassOf<AActor>: a strict cast keeps the API
     // typed without constraining what STARMAP may spawn.
     return Cast<ASun>(SpawnedSun.Get());
+}
+
+
+FGuid AStarSystem::GetStableStarId() const
+{
+    // Stable star identity derived from the star system's seed and coordinate.
+    // Uses FNV-1a 64-bit hash for determinism across frames, spawns, and sessions.
+    uint64 Hash = 14695981039346656037ULL;
+    const uint64 Seed = static_cast<uint64>(UniverseSeed);
+    const uint64 CoordX = static_cast<uint64>(SystemCoordinate.X);
+    const uint64 CoordY = static_cast<uint64>(SystemCoordinate.Y);
+    const uint64 CoordZ = static_cast<uint64>(SystemCoordinate.Z);
+    
+    for (int32 i = 0; i < 8; ++i) { Hash ^= (Seed >> (i * 8)) & 0xFFULL; Hash *= 1099511628211ULL; }
+    for (int32 i = 0; i < 8; ++i) { Hash ^= (CoordX >> (i * 8)) & 0xFFULL; Hash *= 1099511628211ULL; }
+    for (int32 i = 0; i < 8; ++i) { Hash ^= (CoordY >> (i * 8)) & 0xFFULL; Hash *= 1099511628211ULL; }
+    for (int32 i = 0; i < 8; ++i) { Hash ^= (CoordZ >> (i * 8)) & 0xFFULL; Hash *= 1099511628211ULL; }
+    
+    return FGuid(static_cast<uint32>(Hash >> 32), static_cast<uint32>(Hash & 0xFFFFFFFF), 0, 0);
 }
 
 

@@ -1,0 +1,183 @@
+// HILLAIRE ATMOSPHERE - MULTI-SCATTERING LUT PASS (P1, compute).
+// Phase 2A: REAL generation (replaces the Phase-1 stub).
+//
+// Verbatim port of NewMultiScattCS in Resources/RenderSkyRayMarching.hlsl:
+// per-texel (u = sun-zenith-cos, v = height) bake of the multi-scattering
+// transfer with 8x8 = 64 stratified sphere directions, 20 fixed-step marches
+// each (ground = true, uniform phase), groupshared 64->1 reduction, and the
+// MULTI_SCATTERING_POWER_SERIE == 1 geometric-series closure. The
+// MultipleScatteringFactor bake (OutputTexture = Factor * L) is preserved.
+//
+// Threading is verbatim: [numthreads(1, 1, 64)], dispatch (W, H, 1) with
+// W = H = 32 (HillaireLimits::MultiScatteringSize). groupshared reduction
+// with GroupMemoryBarrierWithGroupSync maps 1:1 to SM5.
+//
+// Ordering (task section 9): this pass READS the just-baked transmittance
+// LUT (Transmittance -> MS). RDG enforces the UAV-write -> SRV-read barrier.
+// Determinism (task section 19): stratified fixed directions, fixed step
+// count, no random, no temporal state, no frame input.
+//
+// Light semantics (task section 10): ILLUMINANCE_IS_ONE (globalL = 1), so the
+// baked transfer is light-independent; keyed by (profile, MS factor) only.
+
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireLutCore.ush"
+
+// Bound 1:1 from FHillaireMultiScatteringCS::FParameters (HillaireShaders.h).
+float BottomRadiusKm;
+float TopRadiusKm;
+float RayleighExpScale;
+float MieExpScale;
+float3 RayleighScatteringKm;
+float AbsorptionWidthKm;
+float3 MieScatteringKm;
+float AbsorptionLinear0;
+float3 MieExtinctionKm;
+float AbsorptionConstant0;
+float3 MieAbsorptionKm;
+float AbsorptionLinear1;
+float3 AbsorptionExtinctionKm;
+float AbsorptionConstant1;
+float3 GroundAlbedo;
+float PlanetRadiusOffsetKm;
+float MultipleScatteringFactor;
+float MultiScatteringLutRes;
+
+Texture2D<float4> TransmittanceLut;
+SamplerState LinearClampSampler;
+RWTexture2D<float4> MultiScatteringUav;
+
+// 20 fixed samples: HillaireLimits::MultiScatteringMarchSamples (reference
+// SampleCountIni = 20 in NewMultiScattCS).
+#define HILLAIRE_MULTISCATTERING_SAMPLE_COUNT 20.0f
+
+groupshared float3 MultiScatAs1SharedMem[64];
+groupshared float3 LSharedMem[64];
+
+[numthreads(1, 1, 64)]
+void MainCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	uint LutW;
+	uint LutH;
+	MultiScatteringUav.GetDimensions(LutW, LutH);
+	if (ThreadId.x >= LutW || ThreadId.y >= LutH)
+	{
+		return;
+	}
+
+	float2 pixPos = float2(ThreadId.xy) + 0.5f;
+	float2 uv = pixPos / MultiScatteringLutRes;
+
+	uv = float2(
+		HillaireFromSubUvsToUnit(uv.x, MultiScatteringLutRes),
+		HillaireFromSubUvsToUnit(uv.y, MultiScatteringLutRes));
+
+	HillaireAtmosphereParams Atmosphere = HillaireMakeAtmosphereParams(
+		BottomRadiusKm, TopRadiusKm,
+		RayleighScatteringKm, RayleighExpScale,
+		MieScatteringKm, MieExtinctionKm, MieAbsorptionKm, MieExpScale,
+		AbsorptionExtinctionKm, AbsorptionWidthKm,
+		AbsorptionLinear0, AbsorptionConstant0,
+		AbsorptionLinear1, AbsorptionConstant1,
+		GroundAlbedo);
+
+	// Reference texel -> parameter mapping (verbatim).
+	float cosSunZenithAngle = uv.x * 2.0 - 1.0;
+	float3 sunDir = float3(0.0, sqrt(saturate(1.0 - cosSunZenithAngle * cosSunZenithAngle)), cosSunZenithAngle);
+	// Reference adjusts viewHeight by PLANET_RADIUS_OFFSET to stay in range.
+	float viewHeight = Atmosphere.BottomRadius + saturate(uv.y + PlanetRadiusOffsetKm)
+		* (Atmosphere.TopRadius - Atmosphere.BottomRadius - PlanetRadiusOffsetKm);
+
+	float3 WorldPos = float3(0.0f, 0.0f, viewHeight);
+	float3 WorldDir = float3(0.0f, 0.0f, 1.0f);
+
+	const float SphereSolidAngle = 4.0 * HILLAIRE_PI;
+	const float IsotropicPhase = 1.0 / SphereSolidAngle;
+
+	// 8x8 stratification (reference SQRTSAMPLECOUNT block verbatim).
+	const float sqrtSample = 8.0f;
+	float i = 0.5f + float(ThreadId.z / 8);
+	float j = 0.5f + float(ThreadId.z - float((ThreadId.z / 8) * 8));
+	{
+		float randA = i / sqrtSample;
+		float randB = j / sqrtSample;
+		float theta = 2.0f * HILLAIRE_PI * randA;
+		float phi = acos(1.0f - 2.0f * randB);
+		float cosPhi = cos(phi);
+		float sinPhi = sin(phi);
+		float cosTheta = cos(theta);
+		float sinTheta = sin(theta);
+		WorldDir.x = cosTheta * sinPhi;
+		WorldDir.y = sinTheta * sinPhi;
+		WorldDir.z = cosPhi;
+
+		// Phase-2A march configuration (Task 26 regression: these values are
+		// frozen - the MS output must stay bit-stable versus Phase 2A).
+		HillaireSingleScatteringResult result = HillaireIntegrateScatteredLuminance(
+			Atmosphere, WorldPos, WorldDir, sunDir,
+			TransmittanceLut, LinearClampSampler,
+			true, HILLAIRE_MULTISCATTERING_SAMPLE_COUNT, PlanetRadiusOffsetKm,
+			false, float2(0.0f, 0.0f),
+			false, 0.0f,
+		// No MS approximation on the bake path itself (circular). The
+		// texture/sampler slots reuse the bound transmittance inputs;
+		// they are never sampled with bUseMultiScatteringApprox = false.
+		false, TransmittanceLut, 0.0f,
+		// Reference default (line 27): no-op clamp, keeps Phase-2A output
+		// bit-stable. See HillaireLimits::IntegratorTMaxMaxKm.
+		9000000.0f);
+
+		MultiScatAs1SharedMem[ThreadId.z] = result.MultiScatAs1 * SphereSolidAngle / (sqrtSample * sqrtSample);
+		LSharedMem[ThreadId.z] = result.L * SphereSolidAngle / (sqrtSample * sqrtSample);
+	}
+
+	// 64 -> 1 reduction (reference tree verbatim).
+	GroupMemoryBarrierWithGroupSync();
+	if (ThreadId.z < 32)
+	{
+		MultiScatAs1SharedMem[ThreadId.z] += MultiScatAs1SharedMem[ThreadId.z + 32];
+		LSharedMem[ThreadId.z] += LSharedMem[ThreadId.z + 32];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (ThreadId.z < 16)
+	{
+		MultiScatAs1SharedMem[ThreadId.z] += MultiScatAs1SharedMem[ThreadId.z + 16];
+		LSharedMem[ThreadId.z] += LSharedMem[ThreadId.z + 16];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (ThreadId.z < 8)
+	{
+		MultiScatAs1SharedMem[ThreadId.z] += MultiScatAs1SharedMem[ThreadId.z + 8];
+		LSharedMem[ThreadId.z] += LSharedMem[ThreadId.z + 8];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (ThreadId.z < 4)
+	{
+		MultiScatAs1SharedMem[ThreadId.z] += MultiScatAs1SharedMem[ThreadId.z + 4];
+		LSharedMem[ThreadId.z] += LSharedMem[ThreadId.z + 4];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (ThreadId.z < 2)
+	{
+		MultiScatAs1SharedMem[ThreadId.z] += MultiScatAs1SharedMem[ThreadId.z + 2];
+		LSharedMem[ThreadId.z] += LSharedMem[ThreadId.z + 2];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (ThreadId.z < 1)
+	{
+		MultiScatAs1SharedMem[ThreadId.z] += MultiScatAs1SharedMem[ThreadId.z + 1];
+		LSharedMem[ThreadId.z] += LSharedMem[ThreadId.z + 1];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (ThreadId.z > 0)
+		return;
+
+	// Geometric-series closure (reference MULTI_SCATTERING_POWER_SERIE == 1).
+	float3 MultiScatAs1 = MultiScatAs1SharedMem[0] * IsotropicPhase;
+	float3 InScatteredLuminance = LSharedMem[0] * IsotropicPhase;
+	float3 r = MultiScatAs1;
+	float3 SumOfAllMultiScatteringEventsContribution = 1.0f / (1.0f - r);
+	float3 L = InScatteredLuminance * SumOfAllMultiScatteringEventsContribution;
+
+	MultiScatteringUav[ThreadId.xy] = float4(MultipleScatteringFactor * L, 1.0f);
+}

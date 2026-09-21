@@ -1,0 +1,19 @@
+// HILLAIRE ATMOSPHERE - LUT DEBUG VIEWER (P5, test-only).
+// Not part of shipping behaviour. Selects one LUT for on-screen inspection
+// (LutKind: 0 = Transmittance, 1 = MultiScattering, 2 = SkyView).
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4> DebugLutTexture;
+SamplerState DebugLutSampler;
+uint LutKind;
+
+float4 MainPS(float4 SvPosition : SV_Position, float2 Uv : TEXCOORD0) : SV_Target0
+{
+	float4 V = DebugLutTexture.SampleLevel(DebugLutSampler, Uv, 0);
+	if (LutKind == 0)
+	{
+		return float4(V.rgb, 1.0f);
+	}
+	return float4(V.rgb, 1.0f);
+}

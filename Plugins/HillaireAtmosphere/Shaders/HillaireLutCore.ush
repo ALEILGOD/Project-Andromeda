@@ -1,0 +1,528 @@
+// HILLAIRE ATMOSPHERE - LUT GENERATION CORE (Phase 2A).
+//
+// Faithful port of the LUT-generation math from the golden DX11 reference:
+//   Resources/RenderSkyRayMarching.hlsl  (IntegrateScatteredLuminance,
+//     RenderTransmittanceLutPS, NewMultiScattCS)
+//   Resources/RenderSkyCommon.hlsl       (sampleMediumRGB, GetMultipleScattering,
+//     PLANET_RADIUS_OFFSET)
+//
+// What was REMOVED vs. the reference (all provably dead for LUT baking):
+// - Depth-buffer resolve (DepthBufferValue >= 0 branch): every LUT caller
+//   passes DepthBufferValue = -1. It needs gSkyInvViewProjMat/world
+//   conversions that belong to the volume/final passes (Phase 2C+), never to
+//   LUT generation.
+// - SHADOWMAP_ENABLED / DEBUGENABLED / blue-noise dither: screen-pass only.
+// - NewMultiScatStep0/1Out accumulators: consumed only by the legacy Bruneton
+//   3D scattering chain, which the port spec keeps test-only/omitted. The
+//   Hillaire MS LUT output uses MultiScatAs1 + L only.
+// - pixPos: debug-only in the reference integrator. Dropped from the signature.
+//
+// What is CONFIGURABLE per caller (bool flags, one integrator, no math fork):
+// - VariableSampleCount + DistantMarch: OFF for T (40 fixed) and MS bake
+//   (20 fixed), ON for SkyView (legacy 4-14 distribution, shell-aware to 256).
+// - MieRayPhase: OFF for T/MS bake (uniform phase), ON for SkyView (real
+//   Cornette-Shanks + Rayleigh phases from HillaireSampling.ush).
+// - MultiScatteringApprox: OFF on the MS-bake path itself (it GENERATES that
+//   LUT - sampling it would be circular), ON for SkyView (the reference
+//   MULTISCATAPPROX_ENABLED=1 permutation selected whenever
+//   MultipleScatteringFactor > 0, i.e. the default).
+//
+// What is VERBATIM: medium sampling, optical-depth accumulation, throughput
+// weighting (Frostbite slide-28 form), earth shadow, ground bounce,
+// 8x8 sphere stratification, groupshared reduction contract (the reduction
+// itself lives in HillaireMultiScattering.usf), geometric-series closure,
+// MultipleScatteringFactor bake, ILLUMINANCE_IS_ONE (globalL = 1: the baked
+// transfer is light-independent; runtime sun color multiplies at composite).
+//
+// Parameter passing: every helper takes an explicit HillaireAtmosphereParams
+// struct built by HillaireMakeAtmosphereParams from shader uniforms. There is
+// no cbuffer/register layout to mirror (UE binds each uniform individually;
+// see HillaireShaders.h FHillaireAtmosphereUniformParams - names match 1:1).
+
+#pragma once
+
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireSampling.ush"
+
+// Tunable LUT-generation constants that must stay centralized (task section
+// 20). The .usf entries bind these from HillaireLimits.h; this default keeps
+// standalone compilation sane and documents the reference value.
+#ifndef HILLAIRE_DEFAULT_PLANET_RADIUS_OFFSET_KM
+#define HILLAIRE_DEFAULT_PLANET_RADIUS_OFFSET_KM 0.01f
+#endif
+
+// ---------------------------------------------------------------------------
+// Reference-derived sampler scale adaptation (CORRECTED VOLUME MODEL).
+//
+// The reference sampler counts are calibrated for Earth's atmosphere in
+// ABSOLUTE km: min density scale H_min = 1.2 km (Mie), the variable-march
+// "DistantMarch" threshold is 60 km (= 50 * H_min), and the 40/20-step fixed
+// bakes assume the envelope IS the atmosphere's optical thickness (100 km =
+// 83.33 * H_min, i.e. ~12.5 Rayleigh scale heights). When the corrected
+// volume model enlarges the envelope for terrain containment (extra volume
+// near-vacuum by construction), those absolute numbers under-resolve the
+// dense layer on small planets. Both quantities are generalized to H_min
+// units, which is EXACTLY the reference for Earth (H_min = 1.2 -> threshold
+// 60 km, reference envelope 100 km; every Earth output stays bit-identical)
+// and scales correctly for any planet.
+// ---------------------------------------------------------------------------
+#define HILLAIRE_DISTANT_MARCH_SCALE_UNITS 50.0f
+#define HILLAIRE_REFERENCE_ENVELOPE_SCALE_UNITS 83.333333f
+#define HILLAIRE_MAX_ENVELOPE_SAMPLE_SCALE 16.0f
+#define HILLAIRE_INTEGRATOR_MAX_SAMPLES 512.0f
+#define HILLAIRE_VARIABLE_MARCH_MAX_SAMPLES 256.0f
+
+// Mirrors reference `AtmosphereParameters` (Bruneton naming kept so ported
+// lines stay textually comparable). Lengths in km, sigmas in 1/km.
+struct HillaireAtmosphereParams
+{
+	float BottomRadius;
+	float TopRadius;
+	float RayleighDensityExpScale;
+	float3 RayleighScattering;
+	float MieDensityExpScale;
+	float3 MieScattering;
+	float3 MieExtinction;
+	float3 MieAbsorption;
+	float AbsorptionDensity0LayerWidth;
+	float AbsorptionDensity0ConstantTerm;
+	float AbsorptionDensity0LinearTerm;
+	float AbsorptionDensity1ConstantTerm;
+	float AbsorptionDensity1LinearTerm;
+	float3 AbsorptionExtinction;
+	float3 GroundAlbedo;
+};
+
+HillaireAtmosphereParams HillaireMakeAtmosphereParams(
+	float BottomRadiusKm, float TopRadiusKm,
+	float3 RayleighScatteringKm, float RayleighExpScale,
+	float3 MieScatteringKm, float MieExtinctionKm, float MieAbsorptionKm, float MieExpScale,
+	float3 AbsorptionExtinctionKm, float AbsorptionWidthKm,
+	float AbsorptionLinear0, float AbsorptionConstant0,
+	float AbsorptionLinear1, float AbsorptionConstant1,
+	float3 GroundAlbedo)
+{
+	HillaireAtmosphereParams P;
+	P.BottomRadius = BottomRadiusKm;
+	P.TopRadius = TopRadiusKm;
+	P.RayleighDensityExpScale = RayleighExpScale;
+	P.RayleighScattering = RayleighScatteringKm;
+	P.MieDensityExpScale = MieExpScale;
+	P.MieScattering = MieScatteringKm;
+	P.MieExtinction = MieExtinctionKm;
+	P.MieAbsorption = MieAbsorptionKm;
+	P.AbsorptionDensity0LayerWidth = AbsorptionWidthKm;
+	P.AbsorptionDensity0ConstantTerm = AbsorptionConstant0;
+	P.AbsorptionDensity0LinearTerm = AbsorptionLinear0;
+	P.AbsorptionDensity1ConstantTerm = AbsorptionConstant1;
+	P.AbsorptionDensity1LinearTerm = AbsorptionLinear1;
+	P.AbsorptionExtinction = AbsorptionExtinctionKm;
+	P.GroundAlbedo = GroundAlbedo;
+	return P;
+}
+
+float HillaireMinDensityScaleKm(HillaireAtmosphereParams Atmosphere)
+{
+	// Reference DistantMarch scale unit: the SHORTER of the two exponential
+	// scale heights (Mie, 1.2 km on Earth) - the thinnest feature a march
+	// must resolve.
+	return 1.0f / max(1e-4f, max(-Atmosphere.RayleighDensityExpScale, -Atmosphere.MieDensityExpScale));
+}
+
+// Fixed-march sample count for envelope-limited bakes (Transmittance,
+// MultiScattering, Aerial slices): keeps SampleCountIni when the envelope is
+// the self-similar optical thickness, scales it (bounded) with the envelope /
+// scale ratio when containment enlarges the volume. Earth: factor 1, output
+// bit-identical.
+float HillaireEnvelopeAwareSampleCount(
+	float SampleCountIni, float TMaxKm, float MinDensityScaleKm)
+{
+	const float ReferenceEnvelopeKm =
+		HILLAIRE_REFERENCE_ENVELOPE_SCALE_UNITS * MinDensityScaleKm;
+	const float EnvelopeFactor = clamp(
+		ceil(TMaxKm / max(ReferenceEnvelopeKm, 1e-4f)),
+		1.0f, HILLAIRE_MAX_ENVELOPE_SAMPLE_SCALE);
+	return min(SampleCountIni * EnvelopeFactor, HILLAIRE_INTEGRATOR_MAX_SAMPLES);
+}
+
+// Mirrors reference MediumSampleRGB (RenderSkyCommon.hlsl).
+struct HillaireMediumSampleRGB
+{
+	float3 Scattering;
+	float3 Absorption;
+	float3 Extinction;
+	float3 ScatteringMie;
+	float3 ScatteringRay;
+};
+
+HillaireMediumSampleRGB HillaireSampleMediumRGB(float3 WorldPos, HillaireAtmosphereParams Atmosphere)
+{
+	// WorldPos is PLANET-LOCAL (planet center = origin); height above ground.
+	float viewHeight = length(WorldPos) - Atmosphere.BottomRadius;
+
+	float densityMie = exp(Atmosphere.MieDensityExpScale * viewHeight);
+	float densityRay = exp(Atmosphere.RayleighDensityExpScale * viewHeight);
+	float densityOzo = saturate(viewHeight < Atmosphere.AbsorptionDensity0LayerWidth ?
+		Atmosphere.AbsorptionDensity0LinearTerm * viewHeight + Atmosphere.AbsorptionDensity0ConstantTerm :
+		Atmosphere.AbsorptionDensity1LinearTerm * viewHeight + Atmosphere.AbsorptionDensity1ConstantTerm);
+
+	HillaireMediumSampleRGB s;
+	s.ScatteringMie = densityMie * Atmosphere.MieScattering;
+	s.ScatteringRay = densityRay * Atmosphere.RayleighScattering;
+	float3 extinctionMie = densityMie * Atmosphere.MieExtinction;
+	float3 absorptionOzo = densityOzo * Atmosphere.AbsorptionExtinction;
+	s.Scattering = s.ScatteringMie + s.ScatteringRay;
+	s.Absorption = densityMie * Atmosphere.MieAbsorption + absorptionOzo;
+	s.Extinction = extinctionMie + s.ScatteringRay + absorptionOzo;
+	return s;
+}
+
+struct HillaireSingleScatteringResult
+{
+	float3 L;
+	float3 OpticalDepth;
+	float3 Transmittance;
+	float3 MultiScatAs1;
+};
+
+// ---------------------------------------------------------------------------
+// Transmittance path: optical-depth-only integration.
+// Reference: IntegrateScatteredLuminance called from RenderTransmittanceLutPS
+// with (ground = false, SampleCountIni = 40, VariableSampleCount = false,
+// MieRayPhase = false); only the .OpticalDepth output is consumed, via
+// exp(-OD). Every sun-dependent term (TransmittanceToSun, phase, earth
+// shadow, S/L/MS accumulators) provably does NOT feed OpticalDepth, which
+// accumulates medium.extinction * dt only - so this function integrates
+// exactly the terms the reference output depends on, nothing else.
+// ---------------------------------------------------------------------------
+float3 HillaireIntegrateOpticalDepth(
+	HillaireAtmosphereParams Atmosphere,
+	float3 WorldPos, float3 WorldDir, float SampleCountIni)
+{
+	float3 earthO = float3(0.0f, 0.0f, 0.0f);
+	float tBottom = HillaireRaySphereIntersectNearest(WorldPos, WorldDir, earthO, Atmosphere.BottomRadius);
+	float tTop = HillaireRaySphereIntersectNearest(WorldPos, WorldDir, earthO, Atmosphere.TopRadius);
+	float tMax = 0.0f;
+	if (tBottom < 0.0f)
+	{
+		if (tTop < 0.0f)
+		{
+			return float3(0.0f, 0.0f, 0.0f);
+		}
+		tMax = tTop;
+	}
+	else
+	{
+		if (tTop > 0.0f)
+		{
+			tMax = min(tTop, tBottom);
+		}
+	}
+
+	float SampleCount = HillaireEnvelopeAwareSampleCount(
+		SampleCountIni, tMax, HillaireMinDensityScaleKm(Atmosphere));
+	float3 OpticalDepth = float3(0.0f, 0.0f, 0.0f);
+	float t = 0.0f;
+	for (float s = 0.0f; s < SampleCount; s += 1.0f)
+	{
+		// Fixed-step path (reference VariableSampleCount == false branch).
+		float NewT = tMax * (s + 0.3f) / SampleCount;
+		float dt = NewT - t;
+		t = NewT;
+
+		float3 P = WorldPos + t * WorldDir;
+		HillaireMediumSampleRGB medium = HillaireSampleMediumRGB(P, Atmosphere);
+		OpticalDepth += medium.Extinction * dt;
+	}
+	return OpticalDepth;
+}
+
+// Minimal sampling interfaces (also used INSIDE the integrator for the MS
+// approximation, hence declared before it - HLSL needs declaration order).
+// Transmittance lookup (mirrors the TransmittanceLutTexture.SampleLevel call
+// inside the reference integrator).
+float3 HillaireSampleTransmittanceLut(
+	HillaireAtmosphereParams Atmosphere,
+	Texture2D<float4> TransmittanceLutTexture, SamplerState LinearClampSampler,
+	float ViewHeightKm, float ViewZenithCosAngle)
+{
+	float2 uv;
+	HillaireLutTransmittanceParamsToUv(
+		Atmosphere.BottomRadius, Atmosphere.TopRadius,
+		ViewHeightKm, ViewZenithCosAngle, uv);
+	return TransmittanceLutTexture.SampleLevel(LinearClampSampler, uv, 0).rgb;
+}
+
+// Multi-scattering transfer lookup (mirrors GetMultipleScattering in
+// RenderSkyCommon.hlsl; MultiScatteringLUTRes = 32 bound from HillaireLimits).
+float3 HillaireSampleMultiScatteringLut(
+	HillaireAtmosphereParams Atmosphere,
+	Texture2D<float4> MultiScatteringLutTexture, SamplerState LinearClampSampler,
+	float MultiScatteringLutRes,
+	float3 WorldPos, float ViewZenithCosAngle)
+{
+	float2 uv = saturate(float2(ViewZenithCosAngle * 0.5f + 0.5f,
+		(length(WorldPos) - Atmosphere.BottomRadius) / (Atmosphere.TopRadius - Atmosphere.BottomRadius)));
+	uv = float2(
+		HillaireFromUnitToSubUvs(uv.x, MultiScatteringLutRes),
+		HillaireFromUnitToSubUvs(uv.y, MultiScatteringLutRes));
+	return MultiScatteringLutTexture.SampleLevel(LinearClampSampler, uv, 0).rgb;
+}
+
+// Move the ray start to the top of the atmosphere (reference
+// MoveToTopAtmosphere verbatim; offset parameterized, never literal).
+bool HillaireMoveToTopAtmosphere(
+	inout float3 WorldPos, float3 WorldDir,
+	float TopRadiusKm, float PlanetRadiusOffsetKm)
+{
+	float viewHeight = length(WorldPos);
+	if (viewHeight > TopRadiusKm)
+	{
+		float tTop = HillaireRaySphereIntersectNearest(
+			WorldPos, WorldDir, float3(0.0f, 0.0f, 0.0f), TopRadiusKm);
+		if (tTop >= 0.0f)
+		{
+			float3 UpVector = WorldPos / viewHeight;
+			float3 UpOffset = UpVector * -PlanetRadiusOffsetKm;
+			WorldPos = WorldPos + WorldDir * tTop + UpOffset;
+		}
+		else
+		{
+			// Ray misses the atmosphere entirely.
+			return false;
+		}
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Full integrator (reference IntegrateScatteredLuminance).
+//
+// Caller configurations (all verbatim from RenderSkyRayMarching.hlsl):
+// - MS bake (NewMultiScattCS): ground = true, 20 fixed steps
+//   (bVariableSampleCount = false), uniform phase (bMieRayPhase = false),
+//   no MS approximation (it GENERATES that LUT).
+// - SkyView bake (SkyViewLutPS): ground = false, VariableSampleCount = true
+//   (legacy 4-14 distribution below 60 km, shell-aware DistantMarch up to 256
+//   above), real phase functions (bMieRayPhase = true), MS approximation ON
+//   (the MULTISCATAPPROX_ENABLED=1 permutation the sample selects whenever
+//   MultipleScatteringFactor > 0, i.e. the default).
+// - T/MS callers pass the Phase-2A values, so their outputs are bit-stable
+//   versus Phase 2A (single-light regression gate, task section 26).
+//
+// globalL (sun throughput): UNIT WHITE on every LUT path. The reference bakes
+// gSunIlluminance (= white x IllumScale, default 1.0) into SkyView, which is
+// numerically identical at default settings; unit white is REQUIRED here by
+// the N x M transfer architecture (all LUTs are sun-color-independent; the
+// runtime Color x Intensity multiplies at composite, Phase 2C+). This keeps
+// the SkyView key complete (profile + slot-0 dir + height) with no
+// color/intensity staleness possible.
+// ---------------------------------------------------------------------------
+HillaireSingleScatteringResult HillaireIntegrateScatteredLuminance(
+	HillaireAtmosphereParams Atmosphere,
+	float3 WorldPos, float3 WorldDir, float3 SunDir,
+	Texture2D<float4> TransmittanceLutTexture, SamplerState LinearClampSampler,
+	bool bGround, float SampleCountIni, float PlanetRadiusOffsetKm,
+	bool bVariableSampleCount, float2 RayMarchMinMaxSPP,
+	bool bMieRayPhase, float MiePhaseG,
+	bool bUseMultiScatteringApprox,
+	Texture2D<float4> MultiScatteringLutTexture, float MultiScatteringLutRes,
+	float tMaxMax)
+{
+	HillaireSingleScatteringResult result;
+	result.L = float3(0.0f, 0.0f, 0.0f);
+	result.OpticalDepth = float3(0.0f, 0.0f, 0.0f);
+	result.Transmittance = float3(0.0f, 0.0f, 0.0f);
+	result.MultiScatAs1 = float3(0.0f, 0.0f, 0.0f);
+
+	float3 earthO = float3(0.0f, 0.0f, 0.0f);
+	float tBottom = HillaireRaySphereIntersectNearest(WorldPos, WorldDir, earthO, Atmosphere.BottomRadius);
+	float tTop = HillaireRaySphereIntersectNearest(WorldPos, WorldDir, earthO, Atmosphere.TopRadius);
+	float tMax = 0.0f;
+	if (tBottom < 0.0f)
+	{
+		if (tTop < 0.0f)
+		{
+			return result;
+		}
+		tMax = tTop;
+	}
+	else
+	{
+		if (tTop > 0.0f)
+		{
+			tMax = min(tTop, tBottom);
+		}
+	}
+	// Reference line 78 verbatim: slice/voxel-limited marches clamp tMax.
+	// T/MS/SkyView callers pass 9000000.0f (reference default) so their
+	// outputs stay bit-stable versus Phase 2A/2B.
+	tMax = min(tMax, tMaxMax);
+
+	// Sample count (reference VariableSampleCount block, with the scale-relative
+	// DistantMarch threshold: 60 km on Earth == 50 Mie scale heights; exactly
+	// the reference value for the reference profile, correct for any planet).
+	// A ray that STARTS inside the atmosphere (surface sky / aerial bakes) has
+	// the dense layer at its origin, so long rays use the near-loaded quadratic
+	// distribution (the reference's !DistantMarch branch); rays starting
+	// outside use the uniform distant march (density in the middle of the
+	// chord). Both are reference branch distributions.
+	const float MinDensityScaleKm = HillaireMinDensityScaleKm(Atmosphere);
+	const bool bRayStartsInside = length(WorldPos) <= Atmosphere.TopRadius + 1e-3f;
+	float SampleCount = SampleCountIni;
+	float SampleCountFloor = SampleCountIni;
+	float tMaxFloor = tMax;
+	bool bDistantMarch = false;
+	if (bVariableSampleCount)
+	{
+		if (tMax > HILLAIRE_DISTANT_MARCH_SCALE_UNITS * MinDensityScaleKm)
+		{
+			SampleCount = clamp(
+				ceil(tMax / (0.5f * MinDensityScaleKm)),
+				16.0f, HILLAIRE_VARIABLE_MARCH_MAX_SAMPLES);
+			SampleCountFloor = floor(SampleCount);
+			tMaxFloor = tMax * SampleCountFloor / SampleCount;
+			bDistantMarch = !bRayStartsInside;
+		}
+		else
+		{
+			SampleCount = lerp(RayMarchMinMaxSPP.x, RayMarchMinMaxSPP.y, saturate(tMax * 0.01f));
+			SampleCountFloor = floor(SampleCount);
+			tMaxFloor = tMax * SampleCountFloor / SampleCount;
+		}
+	}
+	else
+	{
+		// Fixed bakes (Transmittance / MultiScattering / aerial slices):
+		// envelope-aware count (see HillaireEnvelopeAwareSampleCount).
+		SampleCount = HillaireEnvelopeAwareSampleCount(SampleCountIni, tMax, MinDensityScaleKm);
+		SampleCountFloor = SampleCount;
+		tMaxFloor = tMax;
+	}
+	float dt = tMax / SampleCount;
+
+	// Phase functions (reference: hgPhase with USE_CornetteShanks + RayleighPhase).
+	const float UniformPhase = 1.0 / (4.0 * HILLAIRE_PI);
+	const float3 wi = SunDir;
+	const float3 wo = WorldDir;
+	float cosTheta = dot(wi, wo);
+	float MiePhaseValue = HillaireCornetteShanksMiePhase(MiePhaseG, -cosTheta);
+	float RayleighPhaseValue = HillaireRayleighPhase(cosTheta);
+
+	// Unit-illuminance transfer on every LUT path (see header note).
+	float3 globalL = float3(1.0f, 1.0f, 1.0f);
+
+	float3 L = float3(0.0f, 0.0f, 0.0f);
+	float3 throughput = float3(1.0f, 1.0f, 1.0f);
+	float3 OpticalDepth = float3(0.0f, 0.0f, 0.0f);
+	float t = 0.0f;
+	for (float s = 0.0f; s < SampleCount; s += 1.0f)
+	{
+		if (bVariableSampleCount && !bDistantMarch)
+		{
+			// Non-linear near-loaded distribution (reference verbatim).
+			float t0 = s / SampleCountFloor;
+			float t1 = (s + 1.0f) / SampleCountFloor;
+			t0 = t0 * t0;
+			t1 = t1 * t1;
+			t0 = tMaxFloor * t0;
+			if (t1 > 1.0f)
+			{
+				t1 = tMax;
+			}
+			else
+			{
+				t1 = tMaxFloor * t1;
+			}
+			t = t0 + (t1 - t0) * 0.3f;
+			dt = t1 - t0;
+		}
+		else
+		{
+			// Fixed uniform steps (T/MS-bake path and DistantMarch).
+			float NewT = tMax * (s + 0.3f) / SampleCount;
+			dt = NewT - t;
+			t = NewT;
+		}
+
+		float3 P = WorldPos + t * WorldDir;
+
+		HillaireMediumSampleRGB medium = HillaireSampleMediumRGB(P, Atmosphere);
+		float3 SampleOpticalDepth = medium.Extinction * dt;
+		float3 SampleTransmittance = exp(-SampleOpticalDepth);
+		OpticalDepth += SampleOpticalDepth;
+
+		float pHeight = length(P);
+		float3 UpVector = P / pHeight;
+		float SunZenithCosAngle = dot(SunDir, UpVector);
+		float2 uv;
+		HillaireLutTransmittanceParamsToUv(
+			Atmosphere.BottomRadius, Atmosphere.TopRadius,
+			pHeight, SunZenithCosAngle, uv);
+		float3 TransmittanceToSun = TransmittanceLutTexture.SampleLevel(LinearClampSampler, uv, 0).rgb;
+
+		float3 PhaseTimesScattering;
+		if (bMieRayPhase)
+		{
+			PhaseTimesScattering = medium.ScatteringMie * MiePhaseValue + medium.ScatteringRay * RayleighPhaseValue;
+		}
+		else
+		{
+			PhaseTimesScattering = medium.Scattering * UniformPhase;
+		}
+
+		// Earth shadow (reference: PLANET_RADIUS_OFFSET lift, bound from
+		// HillaireLimits.h PlanetRadiusOffsetKm via shader uniforms - never
+		// a literal, so gas-giant tuning stays centralized).
+		float tEarth = HillaireRaySphereIntersectNearest(
+			P, SunDir, earthO + PlanetRadiusOffsetKm * UpVector, Atmosphere.BottomRadius);
+		float earthShadow = tEarth >= 0.0f ? 0.0f : 1.0f;
+
+		// Multi-scattering approximation (reference MULTISCATAPPROX_ENABLED=1
+		// permutation): reads the baked MS transfer LUT. OFF on the MS-bake
+		// path itself (it GENERATES that LUT - sampling it would be circular).
+		float3 multiScatteredLuminance = float3(0.0f, 0.0f, 0.0f);
+		if (bUseMultiScatteringApprox)
+		{
+			multiScatteredLuminance = HillaireSampleMultiScatteringLut(
+				Atmosphere, MultiScatteringLutTexture, LinearClampSampler,
+				MultiScatteringLutRes, P, SunZenithCosAngle);
+		}
+
+		float shadow = 1.0f; // SHADOWMAP off on the LUT path
+		float3 S = globalL * (earthShadow * shadow * TransmittanceToSun * PhaseTimesScattering
+			+ multiScatteredLuminance * medium.Scattering);
+
+		// MULTI_SCATTERING_POWER_SERIE == 1 branch (reference default).
+		float3 MS = medium.Scattering * 1.0f;
+		float3 MSint = (MS - MS * SampleTransmittance) / medium.Extinction;
+		result.MultiScatAs1 += throughput * MSint;
+
+		// Frostbite slide-28 analytical step integration.
+		float3 Sint = (S - S * SampleTransmittance) / medium.Extinction;
+		L += throughput * Sint;
+		throughput *= SampleTransmittance;
+	}
+
+	if (bGround && tMax == tBottom && tBottom > 0.0)
+	{
+		// Bounced light off the ground (reference ground block verbatim).
+		float3 P = WorldPos + tBottom * WorldDir;
+		float pHeight = length(P);
+		float3 UpVector = P / pHeight;
+		float SunZenithCosAngle = dot(SunDir, UpVector);
+		float2 uv;
+		HillaireLutTransmittanceParamsToUv(
+			Atmosphere.BottomRadius, Atmosphere.TopRadius,
+			pHeight, SunZenithCosAngle, uv);
+		float3 TransmittanceToSun = TransmittanceLutTexture.SampleLevel(LinearClampSampler, uv, 0).rgb;
+
+		float NdotL = saturate(dot(normalize(UpVector), normalize(SunDir)));
+		L += globalL * TransmittanceToSun * throughput * NdotL * Atmosphere.GroundAlbedo / HILLAIRE_PI;
+	}
+
+	result.L = L;
+	result.OpticalDepth = OpticalDepth;
+	result.Transmittance = throughput;
+	return result;
+}

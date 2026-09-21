@@ -1,0 +1,179 @@
+// HILLAIRE ATMOSPHERE - AERIAL PERSPECTIVE VOLUME (P3, compute).
+// Phase 2C: REAL evaluation (replaces the Phase-1 raster stub).
+//
+// Verbatim port of RenderCameraVolumePS in
+// Resources/RenderSkyRayMarching.hlsl (MULTISCATAPPROX_ENABLED=1
+// configuration, selected by the sample whenever MultipleScatteringFactor
+// > 0, i.e. the default): per-froxel march through the camera ray, reading
+// the Transmittance LUT (t2) AND the MultiScattering LUT (t6).
+//
+// Per-froxel structure (reference):
+//   ClipSpace = (pixPos / res) * (2,-2) - (1,-1), z = 0.5
+//   HViewPos = mul(gSkyInvProjMat, float4(ClipSpace, 1))
+//   WorldDir = planetLocal(normalize(mul(invViewMat, HViewPos / w)))
+//   camPos/sunDir planet-local; Slice = ((sliceId+0.5)/32)^2 * 32
+//   tMax = Slice * AerialKmPerSlice (per-planet envelope / 25); under-ground
+//   voxel clamp-out; above-top
+//   MoveToTopAtmosphere (miss -> (0,0,0,1)); shrink tMaxMax
+//   march (ground = false, fixed max(1,(sliceId+1)*2) steps,
+//          MieRayPhase = true, MS approx ON)
+//   output (L, 1 - mean(Transmittance)).
+//
+// Pipeline notes (task sections 6-7):
+// - The reference bakes with raster-instanced 32x32 slices, but every froxel
+//   is independent (no interpolation, no derivatives, no blending), so a
+//   per-froxel compute thread [numthreads(4,4,4)], dispatch (8,8,8), is the
+//   exact same computation. sliceId == DispatchId.z (0..31).
+// - Matrix convention: UE uploads FMatrix transposed into HLSL float4x4
+//   semantics, so the reference column-vector mul(M, v) becomes row-vector
+//   mul(v, M) here. HViewPos = mul(float4(ClipSpace,1), InvProjMatrix) and
+//   dir = normalize(mul(HViewPos.xyz / HViewPos.w, (float3x3)ViewToPlanetLocalRot))
+//   are mathematically identical to reference lines 809-812. The CPU mirror
+//   uses UE row-vector maps on the true matrices, which is the same map -
+//   GPU-vs-CPU agreement is asserted.
+// - View-dependent by construction (camera + rays enter per froxel): the
+//   volume is evaluated ON DEMAND into pooled scratch, never cached as
+//   planet-global data (task section 9). T/MS/SkyView inputs stay cached.
+//
+// Units: km throughout, planet-local frame (center = origin).
+//
+// Light semantics (task sections 5, 12-14 analogue): slot-0 primary sun,
+// planet-local, UNIT-WHITE transfer (Andromeda convention, Phase-2B
+// compatible; identical to reference at default IllumScale 1.0).
+
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireLutCore.ush"
+
+// Bound 1:1 from FHillaireAerialPerspectiveCS::FParameters (HillaireShaders.h).
+float BottomRadiusKm;
+float TopRadiusKm;
+float RayleighExpScale;
+float MieExpScale;
+float3 RayleighScatteringKm;
+float AbsorptionWidthKm;
+float3 MieScatteringKm;
+float AbsorptionLinear0;
+float3 MieExtinctionKm;
+float AbsorptionConstant0;
+float3 MieAbsorptionKm;
+float AbsorptionLinear1;
+float3 AbsorptionExtinctionKm;
+float AbsorptionConstant1;
+// Planet-local camera position, km (GT-resolved, snapshot-derived).
+float3 CameraPlanetLocalKm;
+// Inverse projection (snapshot ProjectionMatrix, inverted once on CPU/RT).
+// Row-vector convention: mul(float4(clip,1), InvProjMatrix).
+float4x4 InvProjMatrix;
+// View-to-planet-local rotation only, translation zeroed:
+// Qconj * transpose(snapshot ViewMatrix rotation). Row-vector convention:
+// mul(dir_view, (float3x3)ViewToPlanetLocalRot).
+float4x4 ViewToPlanetLocalRot;
+// Slot-0 primary sun, planet-local unit dir TO the sun (GT-resolved).
+float3 PrimarySunDirLocal;
+float MiePhaseG;
+float PlanetRadiusOffsetKm;
+float AerialGroundClampLiftKm;
+float AerialKmPerSlice;
+float MultiScatteringLutRes;
+
+Texture2D<float4> TransmittanceLut;
+Texture2D<float4> MultiScatteringLut;
+SamplerState LinearClampSampler;
+RWTexture3D<float4> AerialVolumeUav;
+
+[numthreads(4, 4, 4)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	uint LutW;
+	uint LutH;
+	uint LutD;
+	AerialVolumeUav.GetDimensions(LutW, LutH, LutD);
+	if (DispatchId.x >= LutW || DispatchId.y >= LutH || DispatchId.z >= LutD)
+	{
+		return;
+	}
+
+	HillaireAtmosphereParams Atmosphere = HillaireMakeAtmosphereParams(
+		BottomRadiusKm, TopRadiusKm,
+		RayleighScatteringKm, RayleighExpScale,
+		MieScatteringKm, MieExtinctionKm, MieAbsorptionKm, MieExpScale,
+		AbsorptionExtinctionKm, AbsorptionWidthKm,
+		AbsorptionLinear0, AbsorptionConstant0,
+		AbsorptionLinear1, AbsorptionConstant1,
+		// GroundAlbedo unused on this path (reference calls with ground=false).
+		float3(0.0f, 0.0f, 0.0f));
+
+	// Reference lines 808-812 (row-vector convention, see header note).
+	float2 pixPos = float2(DispatchId.xy) + 0.5f;
+	float3 ClipSpace = float3(
+		(pixPos / float2((float)LutW, (float)LutH)) * float2(2.0f, -2.0f) - float2(1.0f, -1.0f),
+		0.5f);
+	float4 HViewPos = mul(float4(ClipSpace, 1.0f), InvProjMatrix);
+	float3 WorldDir = normalize(mul(HViewPos.xyz / HViewPos.w, (float3x3)ViewToPlanetLocalRot));
+
+	float3 SunDir = PrimarySunDirLocal;
+
+	// Squared slice distribution (reference lines 820-822 verbatim, with the
+	// slice count derived from the volume descriptor, not a literal).
+	float SliceCount = (float)LutD;
+	float Slice = ((float(DispatchId.z) + 0.5f) / SliceCount);
+	Slice *= Slice; // squared distribution
+	Slice *= SliceCount;
+
+	float3 WorldPos = CameraPlanetLocalKm;
+	float viewHeight;
+
+	// Froxel fragment position (reference lines 829-830).
+	float tMax = Slice * AerialKmPerSlice;
+	float3 newWorldPos = WorldPos + tMax * WorldDir;
+
+	// Under-ground voxel clamp-out (reference lines 834-841 verbatim).
+	viewHeight = length(newWorldPos);
+	if (viewHeight <= (Atmosphere.BottomRadius + PlanetRadiusOffsetKm))
+	{
+		newWorldPos = normalize(newWorldPos)
+			* (Atmosphere.BottomRadius + PlanetRadiusOffsetKm + AerialGroundClampLiftKm);
+		WorldDir = normalize(newWorldPos - CameraPlanetLocalKm);
+		tMax = length(newWorldPos - CameraPlanetLocalKm);
+	}
+	float tMaxMax = tMax;
+
+	// Above-top camera: move the march start to the atmosphere boundary
+	// (reference lines 846-863 verbatim).
+	viewHeight = length(WorldPos);
+	if (viewHeight >= Atmosphere.TopRadius)
+	{
+		float3 prevWorldPos = WorldPos;
+		if (!HillaireMoveToTopAtmosphere(WorldPos, WorldDir, Atmosphere.TopRadius, PlanetRadiusOffsetKm))
+		{
+			// Ray is not intersecting the atmosphere.
+			AerialVolumeUav[DispatchId.xyz] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+			return;
+		}
+		float LengthToAtmosphere = length(prevWorldPos - WorldPos);
+		if (tMaxMax < LengthToAtmosphere)
+		{
+			// tMaxMax for this voxel is not within earth atmosphere.
+			AerialVolumeUav[DispatchId.xyz] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+			return;
+		}
+		tMaxMax = max(0.0f, tMaxMax - LengthToAtmosphere);
+	}
+
+	// March configuration (reference line 866-871 verbatim): ground = false,
+	// fixed per-slice steps, no depth buffer, uniform distribution,
+	// real Mie+Rayleigh phases, MS approximation ON, slice-limited tMaxMax.
+	float SampleCountIni = max(1.0f, float(DispatchId.z + 1) * 2.0f);
+	HillaireSingleScatteringResult ss = HillaireIntegrateScatteredLuminance(
+		Atmosphere, WorldPos, WorldDir, SunDir,
+		TransmittanceLut, LinearClampSampler,
+		false, SampleCountIni, PlanetRadiusOffsetKm,
+		false, float2(0.0f, 0.0f),
+		true, MiePhaseG,
+		true, MultiScatteringLut, MultiScatteringLutRes,
+		tMaxMax);
+
+	// Reference line 874-875 verbatim: inscatter + opacity from transmittance.
+	float Transmittance = dot(ss.Transmittance, float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f));
+	AerialVolumeUav[DispatchId.xyz] = float4(ss.L, 1.0f - Transmittance);
+}

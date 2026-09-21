@@ -1,0 +1,215 @@
+// HILLAIRE ATMOSPHERE - SKY BACKGROUND (P4-SKY, compute).
+// Production sky/background sampling of the Phase-2B SkyView LUT at BeforeDOF
+// (linear HDR, pre-tonemap: the same slot as the Phase-2D aerial composite).
+//
+// Verbatim port of the FASTSKY_ENABLED branch in
+// Resources/RenderSkyRayMarching.hlsl (lines 432-466): per-pixel
+// planet-local ray (UpVector, viewZenithCos, sun-plane lightViewCos,
+// ground intersection), HillaireSkyViewLutParamsToUv sampling of the slot-0
+// primary-baked SkyView transfer, view-ray transmittance lookup, composite
+// (sky + T * background) with unit-white transfer scaled by slot-0
+// ColorAttenuation and the view PreExposure (the same buffer-space convention
+// as the Phase-2D aerial composite).
+//
+// UE5.8 adaptations (math preserved):
+// - Fullscreen compute [8x8x1] over the view rect instead of the reference
+//   fullscreen raster tri: strictly per-pixel math, identical computation.
+// - Opaque pixels (reversed-Z device depth > SkyDepthEpsilon) pass through
+//   IDENTICAL: aerial perspective owns them (no double-scatter, Phase-2D
+//   contract preserved). Only background pixels are composited.
+// - Clip z is fixed at 0.5 (the same z the Phase-2C bake uses for its ray fan),
+//   so sky rays and volume rays agree exactly at the horizon boundary.
+// - No sun disk (task scope: the disk is a composite term, future scope).
+// - No hardcoded gradient: every output texel is a live LUT sample driven by
+//   camera position, planet radii, view direction and the live primary sun.
+
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireSampling.ush"
+// Engine common header: pulls /Engine/Generated/GeneratedUniformBuffers.ush,
+// which declares the View uniform-buffer accessors generated from the C++
+// SHADER_PARAMETER_STRUCT_REF (same mechanism as HillaireAerialComposite.usf).
+#include "/Engine/Private/Common.ush"
+
+// Stellar disk (reference GetSunLuminance, angular-radius overload).
+// Renders the solar disk when the view direction aligns with the sun direction.
+float3 HillaireGetSunLuminance(
+    float3 planetLocalPos, float3 planetLocalDir,
+    float planetRadius, float3 sunLocalDir, float angularRadius)
+{
+    if (angularRadius > 0.0f && dot(planetLocalDir, sunLocalDir) > cos(angularRadius))
+    {
+        float t = HillaireRaySphereIntersectNearest(
+            planetLocalPos, planetLocalDir, float3(0.0f, 0.0f, 0.0f), planetRadius);
+        if (t < 0.0f) // no intersection: ray escapes to the star
+        {
+            return float3(HILLAIRE_SUN_DISK_RADIANCE, HILLAIRE_SUN_DISK_RADIANCE, HILLAIRE_SUN_DISK_RADIANCE); // bounded; scaled by sun throughput at composite
+        }
+    }
+    return float3(0.0f, 0.0f, 0.0f);
+}
+// which declares the View uniform-buffer accessors generated from the C++
+// SHADER_PARAMETER_STRUCT_REF (same mechanism as HillaireAerialComposite.usf).
+#include "/Engine/Private/Common.ush"
+
+// Bound 1:1 from FHillaireSkyBackgroundCS::FParameters (HillaireShaders.h).
+Texture2D<float4> SceneColorInput;
+Texture2D<float> SceneDepthInput;
+Texture2D<float4> SkyViewLut;
+Texture2D<float4> TransmittanceLut;
+SamplerState LinearClampSampler;
+// Inverse projection (snapshot ProjectionMatrix, inverted once on CPU).
+// Row-vector convention: mul(float4(clip,1), InvProjMatrix).
+float4x4 InvProjMatrix;
+// View-to-planet-local rotation only, translation zeroed:
+// transpose(snapshot ViewMatrix rotation) * Qconj (row-vector order:
+// view -> cam-relative world -> planet-local, matching the reference
+// mul(gSkyInvViewMat, HViewPos) followed by the quat-conjugate frame
+// change). Row-vector convention:
+// mul(dir, (float3x3)ViewToPlanetLocalRot).
+float4x4 ViewToPlanetLocalRot;
+// Planet-local camera position, km (snapshot-derived, unnormalized).
+float3 CameraPlanetLocalKm;
+// Slot-0 primary sun, planet-local unit dir TO the sun (GT-resolved).
+float3 PrimarySunDirLocal;
+// Slot-0 sun Color*Intensity (linear), unit-white transfer convention.
+float3 SunColorAttenuation;
+// Sun disk angular radius, radians (0 = no disk).
+float SunAngularRadiusRad;
+// Authoritative planet boundaries, km (profile mirrors).
+float BottomRadiusKm;
+float TopRadiusKm;
+// Camera height over planet center, km, CLAMPED by the CPU into
+// [Bottom + floor, Top - floor] with the same formula the SkyView bake uses
+// (EnsurePlanetLuts): the LUT parameterization is an inside-height mapping,
+// so bake and sample always agree, and an outside camera uses the top
+// boundary height. The actual camera position (CameraPlanetLocalKm) still
+// drives the ray/entry-point geometry.
+float ViewHeightKm;
+// View-rect origin/size in buffer pixels (exact-texel Load mapping).
+float2 ViewRectMin;
+float2 ViewRectSize;
+// Sky/background device-Z threshold (reversed-Z: 0 = far).
+float SkyDepthEpsilon;
+
+RWTexture2D<float4> CompositeOutputUav;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	uint2 ViewSize = uint2((uint)ViewRectSize.x, (uint)ViewRectSize.y);
+	if (DispatchId.x >= ViewSize.x || DispatchId.y >= ViewSize.y)
+	{
+		return;
+	}
+	uint2 BufferPixel = uint2(ViewRectMin) + DispatchId.xy;
+
+	float4 SceneColor = SceneColorInput.Load(int3(BufferPixel, 0));
+	float DeviceZ = SceneDepthInput.Load(int3(BufferPixel, 0));
+
+	// Opaque scene geometry: identity (aerial perspective owns these pixels).
+	if (DeviceZ > SkyDepthEpsilon)
+	{
+		CompositeOutputUav[BufferPixel] = SceneColor;
+		return;
+	}
+
+	// View ray in the planet-local frame (same fan as the aerial bake:
+	// fixed clip z = 0.5, row-vector muls).
+	float2 ViewUv = (float2(DispatchId.xy) + 0.5f) / float2(ViewSize);
+	float3 ClipSpace = float3(ViewUv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.5f);
+	float4 HViewPos = mul(float4(ClipSpace, 1.0f), InvProjMatrix);
+	float3 ViewDirLocal = normalize(mul(HViewPos.xyz / HViewPos.w, (float3x3)ViewToPlanetLocalRot));
+
+	float CamLen = length(CameraPlanetLocalKm);
+	float3 UpVector = CamLen > 1e-6f ? CameraPlanetLocalKm / CamLen : float3(0.0f, 0.0f, 1.0f);
+
+	// SkyView parameterization height: ViewHeightKm is CPU-clamped into
+	// [Bottom + floor, Top - floor] with the SAME formula EnsurePlanetLuts
+	// bakes with, so bake and sample can never disagree. Outside the volume
+	// this is Top - floor: the physical limb is the radiance arriving at the
+	// top boundary (the vacuum path outside contributes no scattering).
+	const float SkyViewHeightKm = ViewHeightKm;
+
+	// DEFENSE-IN-DEPTH: If the camera is outside the atmosphere, test the ray
+	// against the top sphere. A miss is deep space (stars only). A hit samples
+	// the LUT with the ray geometry AT THE BOUNDARY ENTRY POINT: the view
+	// zenith and sun-azimuth angles are measured at the entry point, exactly
+	// where the baked LUT was evaluated, instead of at the distant camera.
+	bool bCameraOutside = CamLen > TopRadiusKm;
+	float3 SampleUp = UpVector;
+	if (bCameraOutside)
+	{
+		float tTop = HillaireRaySphereIntersectNearest(
+			CameraPlanetLocalKm, ViewDirLocal, float3(0.0f, 0.0f, 0.0f), TopRadiusKm);
+		if (tTop < 0.0f)
+		{
+			// Ray misses atmosphere entirely - deep space: return scene color
+			// (stars/background) with only the sun disk (disabled by design).
+			float3 SunDisk = HillaireGetSunLuminance(
+				CameraPlanetLocalKm, ViewDirLocal,
+				BottomRadiusKm, normalize(PrimarySunDirLocal), SunAngularRadiusRad);
+			SunDisk *= SunColorAttenuation * View.PreExposure;
+			CompositeOutputUav[BufferPixel] = float4(SceneColor.rgb + SunDisk, SceneColor.a);
+			return;
+		}
+		const float3 EntryPos = CameraPlanetLocalKm + ViewDirLocal * tTop;
+		const float EntryLen = length(EntryPos);
+		SampleUp = EntryLen > 1e-6f ? EntryPos / EntryLen : UpVector;
+	}
+
+	float ViewZenithCosAngle = clamp(dot(ViewDirLocal, SampleUp), -1.0f, 1.0f);
+
+	// Sun-azimuth coordinate: cosine between the view/sun horizontal
+	// projections (the bake's lightViewCosAngle), evaluated on the SAME up
+	// vector the zenith angle uses. Degenerate projections (zenith view or
+	// zenith sun) make the azimuth undefined; the baked LUT row is
+	// azimuth-symmetric there by construction, so any value samples the same
+	// radiance. 0.0 (mid-LUT) is the representative choice.
+	float3 SunDir = normalize(PrimarySunDirLocal);
+	float SunZenith = dot(SunDir, SampleUp);
+	float3 ViewHoriz = ViewDirLocal - SampleUp * ViewZenithCosAngle;
+	float3 SunHoriz = SunDir - SampleUp * SunZenith;
+	float ViewHorizLen = length(ViewHoriz);
+	float SunHorizLen = length(SunHoriz);
+	float LightViewCosAngle = 0.0f;
+	if (ViewHorizLen > 1e-6f && SunHorizLen > 1e-6f)
+	{
+		LightViewCosAngle = clamp(dot(ViewHoriz / ViewHorizLen, SunHoriz / SunHorizLen), -1.0f, 1.0f);
+	}
+
+	bool bIntersectGround =
+		HillaireRaySphereIntersectNearest(CameraPlanetLocalKm, ViewDirLocal, float3(0.0f, 0.0f, 0.0f), BottomRadiusKm) >= 0.0f;
+
+	float2 SkyUv;
+	HillaireSkyViewLutParamsToUv(
+		BottomRadiusKm, bIntersectGround, ViewZenithCosAngle, LightViewCosAngle,
+		SkyViewHeightKm, SkyUv);
+
+	float3 SkyTransfer = SkyViewLut.SampleLevel(LinearClampSampler, SkyUv, 0).rgb;
+
+	// View-ray transmittance (reference lines 459-462 verbatim): attenuates
+	// previously drawn background content (stars, nebulae, distant geometry)
+	// so the shell-to-surface transition stays physical. Sampled with the same
+	// in-domain height/zenith pair as the SkyView call.
+	float2 TransmittanceUv;
+	HillaireLutTransmittanceParamsToUv(
+		BottomRadiusKm, TopRadiusKm,
+		SkyViewHeightKm, ViewZenithCosAngle, TransmittanceUv);
+	float3 ViewTransmittance =
+		TransmittanceLut.SampleLevel(LinearClampSampler, TransmittanceUv, 0).rgb;
+	float TransmittanceMean = (ViewTransmittance.x + ViewTransmittance.y + ViewTransmittance.z) / 3.0f;
+
+	// Composite (reference lines 463-464, pre-exposed buffer space):
+	// transmit background, add sun-scaled inscatter. Alpha preserved (same
+	// convention as the Phase-2D aerial composite).
+	float3 SkyRadiance = SunColorAttenuation * SkyTransfer * View.PreExposure;
+	
+	// Sun disk (reference RenderSkyRayMarching.hlsl FASTSKY branch).
+	float3 SunDisk = HillaireGetSunLuminance(
+		CameraPlanetLocalKm, ViewDirLocal,
+		BottomRadiusKm, normalize(PrimarySunDirLocal), SunAngularRadiusRad);
+	SunDisk *= SunColorAttenuation * View.PreExposure;
+	
+	float3 OutColor = SceneColor.rgb * TransmittanceMean + SkyRadiance + SunDisk;
+	CompositeOutputUav[BufferPixel] = float4(OutColor, SceneColor.a);
+}

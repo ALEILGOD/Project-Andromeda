@@ -1,0 +1,141 @@
+// HILLAIRE ATMOSPHERE - SKYVIEW LUT PASS (P2, compute).
+// Phase 2B: REAL generation (replaces the Phase-1 stub).
+//
+// Verbatim port of SkyViewLutPS in Resources/RenderSkyRayMarching.hlsl with
+// the MULTISCATAPPROX_ENABLED=1 configuration (selected by the sample
+// whenever MultipleScatteringFactor > 0, i.e. the default): the march reads
+// the Transmittance LUT (t2) AND the MultiScattering LUT (t6).
+//
+// Per-texel structure (reference):
+//   uv = pixPos / (192, 108)
+//   UvToSkyViewLutParams -> (viewZenithCosAngle, lightViewCosAngle)
+//   UpVector = planet-local camera up; sunZenithCos = dot(Up, sunDir)
+//   SunDir = (sqrt(1-c^2), 0, c); WorldPos = (0,0,viewHeight)
+//   WorldDir = (sinV*lightView, sinV*sqrt(1-lightView^2), cosV)
+//   MoveToTopAtmosphere (miss -> black) -> march
+//     (ground = false, variable count, real phases, MS approx)
+//   output L (unit-white transfer; NO sun disk - the disk is a composite
+//   term, added per light at final render, never baked).
+//
+// Pipeline note: the reference bakes with a fullscreen raster tri, but after
+// the WorldPos/WorldDir reconstruction every texel is independent (no vertex
+// interpolation, no derivatives, no blending), so per-texel compute is the
+// exact same computation. Dispatch (W/8, H/8, 1) = (24, 14, 1) at 192x108.
+//
+// Coordinate convention (task section 7, port-spec risk): texel (x, y) maps
+// to uv ((x+0.5)/W, (y+0.5)/H) exactly like the reference pixPos/(W,H); the
+// NONLINEARSKYVIEWLUT mapping, the y<0.5 above-horizon / y>=0.5 below-horizon
+// split and the x = sqrt sun-azimuth mapping all live in HillaireSampling.ush
+// verbatim. UE handedness: the bake runs in the PLANET-LOCAL frame (sun and
+// up converted once on the CPU), so UE world handedness never enters the
+// math; the local frame is right-handed by construction (quat rotation).
+// Generation and future sampling share this convention (self-consistent;
+// DX11 byte-compare must account for row order, not math).
+//
+// Units: km throughout, planet-local frame (center = origin).
+//
+// Light semantics (task sections 12-14): v1 bakes the SLOT-0 registry light
+// direction with UNIT-WHITE transfer (N x M compatible; color x intensity
+// applies at composite). No sun singleton anywhere on this path.
+
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireLutCore.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireSampling.ush"
+
+// Bound 1:1 from FHillaireSkyViewLutCS::FParameters (HillaireShaders.h).
+float BottomRadiusKm;
+float TopRadiusKm;
+float RayleighExpScale;
+float MieExpScale;
+float3 RayleighScatteringKm;
+float AbsorptionWidthKm;
+float3 MieScatteringKm;
+float AbsorptionLinear0;
+float3 MieExtinctionKm;
+float AbsorptionConstant0;
+float3 MieAbsorptionKm;
+float AbsorptionLinear1;
+float3 AbsorptionExtinctionKm;
+float AbsorptionConstant1;
+float3 PrimarySunDirLocal;
+float3 CameraUpLocal;
+float ViewHeightKm;
+float MiePhaseG;
+float2 RayMarchMinMaxSPP;
+float PlanetRadiusOffsetKm;
+float MultiScatteringLutRes;
+
+Texture2D<float4> TransmittanceLut;
+Texture2D<float4> MultiScatteringLut;
+SamplerState LinearClampSampler;
+RWTexture2D<float4> SkyViewUav;
+
+// Reference-passed (dead: overwritten by the variable-count path), kept for
+// traceability: HillaireLimits::SkyViewMarchDeadSampleCountIni = 30.
+#define HILLAIRE_SKYVIEW_SAMPLE_COUNT_INI 30.0f
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	uint LutW;
+	uint LutH;
+	SkyViewUav.GetDimensions(LutW, LutH);
+	if (DispatchId.x >= LutW || DispatchId.y >= LutH)
+	{
+		return;
+	}
+
+	// Reference: float2 uv = pixPos / float2(192.0, 108.0).
+	float2 uv = (float2(DispatchId.xy) + 0.5f) / float2(LutW, LutH);
+
+	HillaireAtmosphereParams Atmosphere = HillaireMakeAtmosphereParams(
+		BottomRadiusKm, TopRadiusKm,
+		RayleighScatteringKm, RayleighExpScale,
+		MieScatteringKm, MieExtinctionKm, MieAbsorptionKm, MieExpScale,
+		AbsorptionExtinctionKm, AbsorptionWidthKm,
+		AbsorptionLinear0, AbsorptionConstant0,
+		AbsorptionLinear1, AbsorptionConstant1,
+		// GroundAlbedo unused on this path (reference calls with ground=false).
+		float3(0.0f, 0.0f, 0.0f));
+
+	float viewZenithCosAngle;
+	float lightViewCosAngle;
+	HillaireUvToSkyViewLutParams(
+		Atmosphere.BottomRadius, viewZenithCosAngle, lightViewCosAngle,
+		ViewHeightKm, uv);
+
+	// Reference: UpVector = WorldPos / viewHeight (planet-local camera up),
+	// sunZenithCosAngle = dot(UpVector, planet-local sun).
+	float3 UpVector = normalize(CameraUpLocal);
+	float sunZenithCosAngle = dot(UpVector, PrimarySunDirLocal);
+	float3 SunDir = normalize(float3(
+		sqrt(saturate(1.0 - sunZenithCosAngle * sunZenithCosAngle)), 0.0, sunZenithCosAngle));
+
+	float3 WorldPos = float3(0.0f, 0.0f, ViewHeightKm);
+
+	float viewZenithSinAngle = sqrt(saturate(1.0 - viewZenithCosAngle * viewZenithCosAngle));
+	float3 WorldDir = float3(
+		viewZenithSinAngle * lightViewCosAngle,
+		viewZenithSinAngle * sqrt(saturate(1.0 - lightViewCosAngle * lightViewCosAngle)),
+		viewZenithCosAngle);
+
+	// Move to top atmosphere (miss -> transparent black, reference verbatim).
+	if (!HillaireMoveToTopAtmosphere(WorldPos, WorldDir, Atmosphere.TopRadius, PlanetRadiusOffsetKm))
+	{
+		SkyViewUav[DispatchId.xy] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+		return;
+	}
+
+	HillaireSingleScatteringResult ss = HillaireIntegrateScatteredLuminance(
+		Atmosphere, WorldPos, WorldDir, SunDir,
+		TransmittanceLut, LinearClampSampler,
+		false, HILLAIRE_SKYVIEW_SAMPLE_COUNT_INI, PlanetRadiusOffsetKm,
+		true, RayMarchMinMaxSPP,
+		true, MiePhaseG,
+		true, MultiScatteringLut, MultiScatteringLutRes,
+		// Reference default (line 27): no-op clamp, keeps Phase-2B output
+		// bit-stable. See HillaireLimits::IntegratorTMaxMaxKm.
+		9000000.0f);
+
+	SkyViewUav[DispatchId.xy] = float4(ss.L, 1.0f);
+}

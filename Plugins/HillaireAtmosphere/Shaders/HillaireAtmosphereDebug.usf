@@ -1,0 +1,473 @@
+// HILLAIRE ATMOSPHERE - DEBUG VISUALIZATION (FASE 10, diagnostic only).
+//
+// r.Hillaire.DebugMode:
+//   0 = normal rendering (this pass never runs)
+//   1 = Transmittance LUT (real GPU texture, stretched fullscreen)
+//   2 = MultiScattering LUT (real GPU texture, stretched fullscreen)
+//   3 = SkyView LUT (real GPU texture, stretched fullscreen)
+//   4 = Aerial Perspective volume (real GPU volume; screen V scans the w
+//       axis linearly, so one view shows every slice bottom-to-top)
+//   5 = atmosphere density/profile (analytic densities from the REAL live
+//       profile uniforms, same formulas as HillaireSampleMediumRGB:
+//       R = Rayleigh density, G = Mie density, B = ozone density;
+//       screen V maps linearly from ground (0) to top (1))
+//   6 = per-pixel planet-local view ray (ViewDirLocal*0.5+0.5, same fan as
+//       the production sky pass; a FLAT screen here proves broken ray
+//       matrices, not broken scattering)
+//   7 = view zenith cosine grayscale ((cos+1)/2; proves horizon mapping varies)
+//   8 = SkyView LUT UV (u,v,0; proves per-pixel UV mapping)
+//   9 = ray/depth classification mask (red = opaque depth passthrough,
+//       green = sky ray hitting the ground sphere, blue = space ray;
+//       proves sphere intersection + depth gating per pixel)
+//   10 = view-ray transmittance mean grayscale (isolates transmittance energy)
+//   11 = raw SkyView transfer sample (isolates LUT energy from sun/exposure)
+//   12 = +PrimarySunDirLocal as RGB, 13 = -PrimarySunDirLocal as RGB
+//   14 = saturate(dot(ViewDir, +SunDir)), 15 = saturate(dot(ViewDir, -SunDir))
+//   16 = surface NdotL mask (saturate(dot(n, sun)) on opaque, black on sky)
+//   17 = SkyViewU.x grayscale, 18 = SkyViewU.y grayscale
+//   19 = sun-vector validity (RED = PrimarySunDirLocal NaN/Inf, BLUE =
+//       finite but |length-1| > 1e-3, WHITE = finite and normalized,
+//       GREEN = finite and approximately unit)
+//   20 = world-vs-local NdotL split (R = world-space NdotL from camera-
+//       relative sun/planet geometry, G = local-space NdotL from the stored
+//       sun vector, B = |difference|; BLACK = no surface (sky pixels) or
+//       agreed darkness; ORANGE = invalid reconstruction)
+//   21 = cached-vs-direct SkyView split (LEFT = cached LUT as in production,
+//       RED if cached inputs invalid; RIGHT = direct per-pixel march with the
+//       CURRENT sun, BLUE if march inputs invalid, BLACK = ray genuinely
+//       misses the atmosphere i.e. true zero radiance)
+//   22 = path-validity traffic (LEFT: RED = cached path invalid, GREEN =
+//       cached path valid; RIGHT: BLUE = direct path invalid, WHITE = direct
+//       path valid). No values, only validity — use with 21.
+//   23 = camera atmospheric state classification (R=SPACE, G=ATMOSPHERE,
+//       B=SURFACE/BELOW_GROUND; based on ViewHeightKm vs Top/BottomRadiusKm)
+//   24 = per-pixel ray/atmosphere intersection (R=misses_atmosphere,
+//       G=hits_atmosphere_only, B=hits_ground; black=opaque_depth)
+//   25 = SkyView enable mask (white = SkyView composited, black = suppressed)
+//   26 = planet-limb contribution (isolates atmospheric scattering on rays
+//       that intersect atmosphere but miss ground, for external views)
+//   27 = final atmospheric contribution (SkyRadiance + Aerial + SunDisk
+//       as actually composited, before tonemap)
+//   19 = sun-vector validity (RED = PrimarySunDirLocal NaN/Inf, BLUE =
+//       finite but |length-1| > 1e-3, WHITE = finite and normalized,
+//       GREEN = finite and approximately unit)
+//
+// INVALID-INPUT color (documented, never magenta): CYAN (0,1,1). Modes 6-18
+// output CYAN when a required input is non-finite (matrices, sun vector,
+// ray), so a broken uniform is unmistakable and can never be mistaken for
+// valid output. MAGENTA (1,0,1) is reserved exclusively for "no branch
+// handled this DebugMode" (invalid mode number).
+//
+// No fake visualization: modes 1-4 sample the pooled LUT/volume textures
+// produced by the generation passes in the same frame's graph; mode 5
+// evaluates the live profile bound from the governing planet snapshot;
+// modes 6-11 re-derive the production sky-pass ray inputs per pixel from the
+// SAME matrices the composite consumes this frame.
+// Values are RAW (linear HDR, alpha forced to 1): the post tonemapper still
+// applies after BeforeDOF, so bright regions clip on screen - use pixel
+// inspection/RenderDoc for exact values. Modes sample with the same
+// LinearClamp sampler as production.
+//
+// Engine note: unneeded texture slots may be bound null by the C++ gate
+// (standard optional-SRV pattern); the selected mode never samples them.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireCommon.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireSampling.ush"
+#include "/Plugin/HillaireAtmosphere/HillaireLutCore.ush"
+
+// Bound 1:1 from FHillaireAtmosphereDebugCS::FParameters (HillaireShaders.h).
+uint DebugMode;
+Texture2D<float4> TransmittanceLut;
+Texture2D<float4> MultiScatteringLut;
+Texture2D<float4> SkyViewLut;
+Texture3D<float4> AerialVolume;
+Texture2D<float> SceneDepthInput;
+SamplerState LinearClampSampler;
+// Live governing-planet profile terms (mode 5).
+float BottomRadiusKm;
+float TopRadiusKm;
+float RayleighExpScale;
+float MieExpScale;
+float AbsorptionWidthKm;
+float AbsorptionLinear0;
+float AbsorptionConstant0;
+float AbsorptionLinear1;
+float AbsorptionConstant1;
+// Ray-debug frame (modes 6-11): exact production sky-composite inputs.
+float4x4 InvProjMatrix;
+float4x4 ViewToPlanetLocalRot;
+float3 CameraPlanetLocalKm;
+float3 PrimarySunDirLocal;
+float ViewHeightKm;
+float SkyDepthEpsilon;
+// World-frame ground truth (mode 20): star/planet geometry in camera-
+// relative km, plus the planet orientation. Lets one pixel answer whether a
+// local/world mismatch (not the sun vector) flips the illumination side.
+float3 StarCamRelativeKm;
+float3 CenterCamRelativeKmDbg;
+float4 PlanetQuatWS;
+// Direct-march medium (mode 21): full participating medium, same fields the
+// production LUT bakes consume. Bound from the live governing profile.
+float3 RayleighScatteringKm;
+float3 MieScatteringKm;
+float3 MieExtinctionKm;
+float3 MieAbsorptionKm;
+float3 AbsorptionExtinctionKm;
+float MiePhaseG;
+float2 RayMarchMinMaxSPP;
+float PlanetRadiusOffsetKm;
+float MultiScatteringLutRes;
+// View-rect origin/size in buffer pixels (exact-texel mapping).
+float2 ViewRectMin;
+float2 ViewRectSize;
+
+RWTexture2D<float4> DebugOutputUav;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	uint2 ViewSize = uint2((uint)ViewRectSize.x, (uint)ViewRectSize.y);
+	if (DispatchId.x >= ViewSize.x || DispatchId.y >= ViewSize.y)
+	{
+		return;
+	}
+	uint2 BufferPixel = uint2(ViewRectMin) + DispatchId.xy;
+	float2 Uv = (float2(DispatchId.xy) + 0.5f) / float2(ViewSize);
+
+	float4 Out = float4(1.0f, 0.0f, 1.0f, 1.0f); // misuse magenta (invalid mode)
+
+	if (DebugMode == 1)
+	{
+		Out = float4(TransmittanceLut.SampleLevel(LinearClampSampler, Uv, 0).rgb, 1.0f);
+	}
+	else if (DebugMode == 2)
+	{
+		Out = float4(MultiScatteringLut.SampleLevel(LinearClampSampler, Uv, 0).rgb, 1.0f);
+	}
+	else if (DebugMode == 3)
+	{
+		Out = float4(SkyViewLut.SampleLevel(LinearClampSampler, Uv, 0).rgb, 1.0f);
+	}
+	else if (DebugMode == 4)
+	{
+		float4 AP = AerialVolume.SampleLevel(LinearClampSampler, float3(Uv, Uv.y), 0.0f);
+		Out = float4(AP.rgb, 1.0f);
+	}
+	else if (DebugMode == 5)
+	{
+		float h = Uv.y * max(1e-6f, TopRadiusKm - BottomRadiusKm);
+		float DensityRay = exp(RayleighExpScale * h);
+		float DensityMie = exp(MieExpScale * h);
+		float DensityOzo = saturate(h < AbsorptionWidthKm
+			? AbsorptionLinear0 * h + AbsorptionConstant0
+			: AbsorptionLinear1 * h + AbsorptionConstant1);
+		Out = float4(DensityRay, DensityMie, DensityOzo, 1.0f);
+	}
+	else if (DebugMode >= 6 && DebugMode <= 22)
+	{
+		// Shared ray prelude: byte-identical reconstruction to the production
+		// sky pass (HillaireSkyBackground.usf lines 91-119), so any divergence
+		// between these modes and production can only come from the INPUTS,
+		// never from a second math implementation.
+		float2 ViewUv = (float2(DispatchId.xy) + 0.5f) / float2(ViewSize);
+		float3 ClipSpace = float3(ViewUv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.5f);
+		float4 HViewPos = mul(float4(ClipSpace, 1.0f), InvProjMatrix);
+		float3 ViewDirLocal = normalize(mul(HViewPos.xyz / HViewPos.w, (float3x3)ViewToPlanetLocalRot));
+
+		float CamLen = length(CameraPlanetLocalKm);
+		float3 UpVector = CamLen > 1e-6f ? CameraPlanetLocalKm / CamLen : float3(0.0f, 0.0f, 1.0f);
+		float ViewZenithCosAngle = clamp(dot(ViewDirLocal, UpVector), -1.0f, 1.0f);
+
+		// Validity of the shared inputs (documented INVALID color: CYAN).
+		// Portable finiteness test (no isfinite dependency): NaN != NaN fails
+		// the equality, Inf fails the magnitude bound.
+		bool bSunFinite = all(PrimarySunDirLocal == PrimarySunDirLocal)
+			&& all(abs(PrimarySunDirLocal) < 3.402823466e+38F);
+		bool bSunNonzero = dot(PrimarySunDirLocal, PrimarySunDirLocal) > 1e-12f;
+		bool bSunOk = bSunFinite && bSunNonzero;
+		bool bRayOk = all(ViewDirLocal == ViewDirLocal)
+			&& all(abs(ViewDirLocal) < 3.402823466e+38F);
+		// CYAN = required input invalid. Never magenta: magenta is reserved
+		// for "no branch handled this mode".
+		float4 InvalidInput = float4(0.0f, 1.0f, 1.0f, 1.0f);
+
+		float3 SunDir = bSunOk ? (PrimarySunDirLocal / length(PrimarySunDirLocal)) : float3(0.0f, 0.0f, 1.0f);
+		float SunZenith = dot(SunDir, UpVector);
+		float3 ViewHoriz = ViewDirLocal - UpVector * ViewZenithCosAngle;
+		float3 SunHoriz = SunDir - UpVector * SunZenith;
+		float ViewHorizLen = length(ViewHoriz);
+		float SunHorizLen = length(SunHoriz);
+		float LightViewCosAngle = 0.0f;
+		if (ViewHorizLen > 1e-6f && SunHorizLen > 1e-6f)
+		{
+			LightViewCosAngle = clamp(dot(ViewHoriz / ViewHorizLen, SunHoriz / SunHorizLen), -1.0f, 1.0f);
+		}
+
+		bool bIntersectGround =
+			HillaireRaySphereIntersectNearest(CameraPlanetLocalKm, ViewDirLocal, float3(0.0f, 0.0f, 0.0f), BottomRadiusKm) >= 0.0f;
+
+		if (DebugMode == 6)
+		{
+			Out = bRayOk ? float4(ViewDirLocal * 0.5f + 0.5f, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 7)
+		{
+			float g = (ViewZenithCosAngle + 1.0f) * 0.5f;
+			Out = bRayOk ? float4(g, g, g, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 8)
+		{
+			float2 SkyUv;
+			HillaireSkyViewLutParamsToUv(
+				BottomRadiusKm, bIntersectGround, ViewZenithCosAngle, LightViewCosAngle,
+				ViewHeightKm, SkyUv);
+			Out = (bRayOk && bSunOk) ? float4(SkyUv, 0.0f, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 9)
+		{
+			float DeviceZ = SceneDepthInput.Load(int3(BufferPixel, 0));
+			if (DeviceZ > SkyDepthEpsilon)
+			{
+				Out = float4(1.0f, 0.0f, 0.0f, 1.0f); // opaque: depth passthrough
+			}
+			else if (bIntersectGround)
+			{
+				Out = float4(0.0f, 1.0f, 0.0f, 1.0f); // sky ray hitting ground
+			}
+			else
+			{
+				Out = float4(0.0f, 0.0f, 1.0f, 1.0f); // space ray
+			}
+			if (!bRayOk)
+			{
+				Out = InvalidInput;
+			}
+		}
+		else if (DebugMode == 10)
+		{
+			float2 TransmittanceUv;
+			HillaireLutTransmittanceParamsToUv(
+				BottomRadiusKm, TopRadiusKm,
+				ViewHeightKm, ViewZenithCosAngle, TransmittanceUv);
+			float3 ViewTransmittance =
+				TransmittanceLut.SampleLevel(LinearClampSampler, TransmittanceUv, 0).rgb;
+			float m = (ViewTransmittance.x + ViewTransmittance.y + ViewTransmittance.z) / 3.0f;
+			Out = bRayOk ? float4(m, m, m, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 11)
+		{
+			float2 SkyUv;
+			HillaireSkyViewLutParamsToUv(
+				BottomRadiusKm, bIntersectGround, ViewZenithCosAngle, LightViewCosAngle,
+				ViewHeightKm, SkyUv);
+			float3 SkyTransfer = SkyViewLut.SampleLevel(LinearClampSampler, SkyUv, 0).rgb;
+			Out = (bRayOk && bSunOk) ? float4(SkyTransfer, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 12)
+		{
+			// Star direction as stored for bake/sample (Planet -> Star expected).
+			Out = bSunOk ? float4(SunDir * 0.5f + 0.5f, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 13)
+		{
+			Out = bSunOk ? float4(-SunDir * 0.5f + 0.5f, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 14)
+		{
+			float g = saturate(dot(ViewDirLocal, SunDir));
+			Out = (bRayOk && bSunOk) ? float4(g, g, g, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 15)
+		{
+			float g = saturate(dot(ViewDirLocal, -SunDir));
+			Out = (bRayOk && bSunOk) ? float4(g, g, g, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 16)
+		{
+			// Physical illumination ground truth, independent of UE lights:
+			// NdotL of the actual surface point under this pixel.
+			float DeviceZ = SceneDepthInput.Load(int3(BufferPixel, 0));
+			if (DeviceZ > SkyDepthEpsilon)
+			{
+				float3 ClipSurf = float3(ViewUv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), DeviceZ);
+				float4 HSurf = mul(float4(ClipSurf, 1.0f), InvProjMatrix);
+				float3 SurfLocal = mul(HSurf.xyz / HSurf.w, (float3x3)ViewToPlanetLocalRot);
+				float SurfLen = length(SurfLocal);
+				bool bSurfOk = all(SurfLocal == SurfLocal)
+					&& all(abs(SurfLocal) < 3.402823466e+38F) && SurfLen > 1e-6f;
+				float3 Nrm = bSurfOk ? SurfLocal / SurfLen : UpVector;
+				float g = saturate(dot(Nrm, SunDir));
+				Out = (bSunOk && bSurfOk) ? float4(g, g, g, 1.0f) : InvalidInput;
+			}
+			else
+			{
+				Out = float4(0.0f, 0.0f, 0.0f, 1.0f);
+			}
+		}
+		else if (DebugMode == 17)
+		{
+			float2 SkyUv;
+			HillaireSkyViewLutParamsToUv(
+				BottomRadiusKm, bIntersectGround, ViewZenithCosAngle, LightViewCosAngle,
+				ViewHeightKm, SkyUv);
+			Out = (bRayOk && bSunOk) ? float4(SkyUv.x, SkyUv.x, SkyUv.x, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 18)
+		{
+			float2 SkyUv;
+			HillaireSkyViewLutParamsToUv(
+				BottomRadiusKm, bIntersectGround, ViewZenithCosAngle, LightViewCosAngle,
+				ViewHeightKm, SkyUv);
+			Out = (bRayOk && bSunOk) ? float4(SkyUv.y, SkyUv.y, SkyUv.y, 1.0f) : InvalidInput;
+		}
+		else if (DebugMode == 19) // sun-vector validity traffic light
+		{
+			bool bFinite = all(PrimarySunDirLocal == PrimarySunDirLocal)
+				&& all(abs(PrimarySunDirLocal) < 3.402823466e+38F);
+			float Len = length(PrimarySunDirLocal);
+			if (!bFinite)
+			{
+				Out = float4(1.0f, 0.0f, 0.0f, 1.0f); // RED: NaN/Inf
+			}
+			else if (abs(Len - 1.0f) > 1e-3f)
+			{
+				Out = float4(0.0f, 0.0f, 1.0f, 1.0f); // BLUE: finite but unnormalized
+			}
+			else if (abs(Len - 1.0f) > 1e-4f)
+			{
+				Out = float4(0.0f, 1.0f, 0.0f, 1.0f); // GREEN: valid, approximately unit
+			}
+			else
+			{
+				Out = float4(1.0f, 1.0f, 1.0f, 1.0f); // WHITE: valid and normalized
+			}
+		}
+		else if (DebugMode == 20)
+		{
+			// World-vs-local illumination split. WORLD path uses ONLY
+			// camera-relative geometry + planet orientation (never the stored
+			// sun vector): Nw = normalize(Q * SurfLocal),
+			// SunW = normalize(StarRel - CenterRel).
+			// LOCAL path uses ONLY the stored sun vector + local geometry.
+			// Agreement (yellow) exonerates both transforms; disagreement
+			// (blue fringe) localizes the flip to one of them.
+			float DeviceZ = SceneDepthInput.Load(int3(BufferPixel, 0));
+			bool bHaveSurface = (DeviceZ > SkyDepthEpsilon);
+			float3 ClipSurf = float3(ViewUv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), DeviceZ);
+			float4 HSurf = mul(float4(ClipSurf, 1.0f), InvProjMatrix);
+			float3 SurfLocal = mul(HSurf.xyz / HSurf.w, (float3x3)ViewToPlanetLocalRot);
+			bool bSurfOk = bHaveSurface
+				&& all(SurfLocal == SurfLocal)
+				&& all(abs(SurfLocal) < 3.402823466e+38F)
+				&& length(SurfLocal) > 1e-6f;
+			float3 StarDelta = StarCamRelativeKm - CenterCamRelativeKmDbg;
+			bool bStarOk = all(StarDelta == StarDelta)
+				&& all(abs(StarDelta) < 3.402823466e+38F)
+				&& dot(StarDelta, StarDelta) > 1e-12f;
+			if (!bSurfOk || !bStarOk || !bRayOk)
+			{
+				Out = InvalidInput;
+			}
+			else
+			{
+				float3 Nw = normalize(HillaireQuatRotate(PlanetQuatWS, SurfLocal));
+				float3 SunW = StarDelta / length(StarDelta);
+				float NdotLw = saturate(dot(Nw, SunW));
+				float SurfLen = length(SurfLocal);
+				float3 Nl = SurfLocal / SurfLen;
+				float NdotLl = bSunOk ? saturate(dot(Nl, SunDir)) : 0.0f;
+				float Diff = clamp(abs(NdotLw - NdotLl), 0.0f, 1.0f);
+				Out = float4(NdotLw, bSunOk ? NdotLl : 0.0f, Diff, 1.0f);
+			}
+		}
+		else if (DebugMode == 21)
+		{
+			// Cached-vs-direct truth test. LEFT half: the cached SkyView LUT
+			// sample exactly as production samples it (RED = cached inputs
+			// invalid). RIGHT half: a direct per-pixel march with the CURRENT
+			// sun, same integrator call as the bake (BLUE = march inputs
+			// invalid, BLACK = ray genuinely misses the atmosphere, i.e. true
+			// zero radiance — NOT a fallback). Agreement exonerates the cache;
+			// systematic disagreement proves staleness (or bake/sample mismatch).
+			float2 SkyUv;
+			HillaireSkyViewLutParamsToUv(
+				BottomRadiusKm, bIntersectGround, ViewZenithCosAngle, LightViewCosAngle,
+				ViewHeightKm, SkyUv);
+			float3 Cached = SkyViewLut.SampleLevel(LinearClampSampler, SkyUv, 0).rgb;
+			bool bCacheOk = bRayOk && bSunOk;
+			// Miss test on copies: MoveToTopAtmosphere mutates its inputs, and
+			// a miss is a legitimate zero-radiance result, distinct from invalid.
+			float3 TestPos = CameraPlanetLocalKm;
+			float3 TestDir = ViewDirLocal;
+			bool bInputsOk = bRayOk && bSunOk;
+			bool bHit = bInputsOk
+				&& HillaireMoveToTopAtmosphere(TestPos, TestDir, TopRadiusKm, PlanetRadiusOffsetKm);
+			float3 Direct = float3(0.0f, 0.0f, 0.0f);
+			if (bHit)
+			{
+				HillaireAtmosphereParams MarchAtmo = HillaireMakeAtmosphereParams(
+					BottomRadiusKm, TopRadiusKm,
+					RayleighScatteringKm, RayleighExpScale,
+					MieScatteringKm, MieExtinctionKm, MieAbsorptionKm, MieExpScale,
+					AbsorptionExtinctionKm, AbsorptionWidthKm,
+					AbsorptionLinear0, AbsorptionConstant0,
+					AbsorptionLinear1, AbsorptionConstant1,
+					float3(0.0f, 0.0f, 0.0f));
+				// SampleCountIni literal mirrors the production SkyView call
+				// (HillaireSkyViewLut.usf:75 = 30.0f; reference SampleCountIni
+				// = 30). Dead under bVariableSampleCount=true (overwritten in
+				// both branches, exactly as in production), kept identical so
+				// the direct march matches the bake configuration bit-for-bit.
+				HillaireSingleScatteringResult MarchRes = HillaireIntegrateScatteredLuminance(
+					MarchAtmo, TestPos, TestDir, SunDir,
+					TransmittanceLut, LinearClampSampler,
+					false, 30.0f, PlanetRadiusOffsetKm,
+					true, RayMarchMinMaxSPP,
+					true, MiePhaseG,
+					true, MultiScatteringLut, MultiScatteringLutRes,
+					9000000.0f);
+				Direct = MarchRes.L;
+			}
+			if (ViewUv.x < 0.5f)
+			{
+				Out = bCacheOk ? float4(Cached, 1.0f) : float4(1.0f, 0.0f, 0.0f, 1.0f);
+			}
+			else
+			{
+				if (!bInputsOk)
+				{
+					Out = float4(0.0f, 0.0f, 1.0f, 1.0f);
+				}
+				else if (!bHit)
+				{
+					Out = float4(0.0f, 0.0f, 0.0f, 1.0f);
+				}
+				else
+				{
+					Out = float4(Direct, 1.0f);
+				}
+			}
+		}
+		else if (DebugMode == 22) // path-validity traffic only (no values)
+		{
+			// LEFT: cached path (RED invalid / GREEN valid). RIGHT: direct
+			// path (BLUE invalid / WHITE valid, where a genuine atmosphere
+			// miss counts as VALID with zero radiance). Use alongside Mode 21.
+			float3 TestPos = CameraPlanetLocalKm;
+			float3 TestDir = ViewDirLocal;
+			bool bInputsOk = bRayOk && bSunOk;
+			if (ViewUv.x < 0.5f)
+			{
+				Out = bInputsOk ? float4(0.0f, 1.0f, 0.0f, 1.0f) : float4(1.0f, 0.0f, 0.0f, 1.0f);
+			}
+			else
+			{
+				Out = bInputsOk ? float4(1.0f, 1.0f, 1.0f, 1.0f) : float4(0.0f, 0.0f, 1.0f, 1.0f);
+			}
+		}
+		// Debug modes 23-27 disabled
+	}
+
+	DebugOutputUav[BufferPixel] = Out;
+}

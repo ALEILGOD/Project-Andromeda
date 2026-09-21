@@ -1,22 +1,19 @@
 #include "Planet/Planet.h"
 
+#include "HillairePlanetLinkComponent.h"
 #include "Planet/PlanetTerrainGenerator.h"
-#include "PlanetAtmosphereComponent.h"
 #include "PlanetaryLightingComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "UObject/ConstructorHelpers.h"
 
 
-namespace
-{
-    constexpr int32 AtmosphereLatitudeSegments = 16;
-    constexpr int32 AtmosphereLongitudeSegments = 32;
-}
-
-
 APlanet::APlanet()
 {
-    PrimaryActorTick.bCanEverTick = false;
+    // Tick enabled so HillairePlanetLinkComponent can push the live
+    // planet position/rotation to the atmosphere feed. Use TG_PostUpdateWork
+    // to run after the StarSystem has updated orbits/rotations.
+    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.TickGroup = TG_PostUpdateWork;
 
     Root =
         CreateDefaultSubobject<USceneComponent>(
@@ -60,44 +57,17 @@ APlanet::APlanet()
         );
     }
 
-    Atmosphere =
-        CreateDefaultSubobject<UPlanetAtmosphereComponent>(
-            TEXT("Atmosphere")
-        );
-
-    Atmosphere->SetupAttachment(Root);
-
-    AtmosphereMesh =
-        CreateDefaultSubobject<UProceduralMeshComponent>(
-            TEXT("AtmosphereMesh")
-        );
-
-    AtmosphereMesh->SetupAttachment(Root);
-
-    AtmosphereMesh->SetCollisionEnabled(
-        ECollisionEnabled::NoCollision
-    );
-
-    AtmosphereMesh->SetGenerateOverlapEvents(
-        false
-    );
-
-    AtmosphereMesh->SetCastShadow(
-        false
-    );
-
-    AtmosphereMesh->SetVisibility(
-        false,
-        true
-    );
-
-    AtmosphereMesh->SetHiddenInGame(
-        true
-    );
-
     PlanetaryLighting =
         CreateDefaultSubobject<UPlanetaryLightingComponent>(
             TEXT("PlanetaryLighting")
+        );
+
+    // HILLAIRE PLANET LINK (ATMOS WIRING): plain ActorComponent owned by
+    // the planet Actor itself, never by PlanetProceduralMesh. Every
+    // generated planet is ATMOS-ready with exactly one link.
+    HillairePlanetLink =
+        CreateDefaultSubobject<UHillairePlanetLinkComponent>(
+            TEXT("HillairePlanetLink")
         );
 }
 
@@ -134,183 +104,7 @@ void APlanet::InitializePlanet()
     PlanetArchetype =
         PlanetProfile.Archetype;
 
-    if (Atmosphere)
-    {
-        Atmosphere->InitializeAtmosphere(
-            PlanetRadius,
-            TerrainHeight,
-            PlanetSeed
-        );
-    }
-
-    GenerateAtmosphereMesh();
     GeneratePlanetMesh();
-}
-
-
-void APlanet::GenerateAtmosphereMesh()
-{
-    if (!AtmosphereMesh ||
-        !Atmosphere)
-    {
-        return;
-    }
-
-    const int32 LatitudeSegments =
-        AtmosphereLatitudeSegments;
-
-    const int32 LongitudeSegments =
-        AtmosphereLongitudeSegments;
-
-    const int32 VertexCount =
-        (LatitudeSegments + 1) *
-        (LongitudeSegments + 1);
-
-    TArray<FVector> Vertices;
-    TArray<int32> Triangles;
-    TArray<FVector> Normals;
-    TArray<FVector2D> UVs;
-    TArray<FColor> VertexColors;
-    TArray<FProcMeshTangent> Tangents;
-
-    Vertices.Reserve(VertexCount);
-    Normals.Reserve(VertexCount);
-    UVs.Reserve(VertexCount);
-    VertexColors.Reserve(VertexCount);
-    Tangents.Reserve(VertexCount);
-
-    for (int32 Latitude = 0;
-        Latitude <= LatitudeSegments;
-        ++Latitude)
-    {
-        const float V =
-            static_cast<float>(Latitude)
-            / static_cast<float>(LatitudeSegments);
-
-        const float Theta =
-            V * PI;
-
-        const float SinTheta =
-            FMath::Sin(Theta);
-
-        const float CosTheta =
-            FMath::Cos(Theta);
-
-        for (int32 Longitude = 0;
-            Longitude <= LongitudeSegments;
-            ++Longitude)
-        {
-            const float U =
-                static_cast<float>(Longitude)
-                / static_cast<float>(LongitudeSegments);
-
-            const float Phi =
-                U * 2.0f * PI;
-
-            const float SinPhi =
-                FMath::Sin(Phi);
-
-            const float CosPhi =
-                FMath::Cos(Phi);
-
-            const FVector Direction(
-                SinTheta * CosPhi,
-                SinTheta * SinPhi,
-                CosTheta
-            );
-
-            Vertices.Add(
-                Direction *
-                Atmosphere->Parameters.AtmosphereRadius
-            );
-
-            Normals.Add(
-                Direction
-            );
-
-            UVs.Add(
-                FVector2D(U, V)
-            );
-
-            VertexColors.Add(
-                FColor::White
-            );
-
-            Tangents.Add(
-                FProcMeshTangent(
-                    -SinPhi,
-                    CosPhi,
-                    0.0f
-                )
-            );
-        }
-    }
-
-    const int32 RowSize =
-        LongitudeSegments + 1;
-
-    for (int32 Latitude = 0;
-        Latitude < LatitudeSegments;
-        ++Latitude)
-    {
-        for (int32 Longitude = 0;
-            Longitude < LongitudeSegments;
-            ++Longitude)
-        {
-            const int32 A =
-                Latitude *
-                RowSize +
-                Longitude;
-
-            const int32 B =
-                A + 1;
-
-            const int32 C =
-                A +
-                RowSize;
-
-            const int32 D =
-                C + 1;
-
-            Triangles.Add(A);
-            Triangles.Add(C);
-            Triangles.Add(B);
-
-            Triangles.Add(B);
-            Triangles.Add(C);
-            Triangles.Add(D);
-        }
-    }
-
-    AtmosphereMesh->ClearAllMeshSections();
-
-    AtmosphereMesh->CreateMeshSection(
-        0,
-        Vertices,
-        Triangles,
-        Normals,
-        UVs,
-        VertexColors,
-        Tangents,
-        false
-    );
-
-    if (Atmosphere->AtmosphereMaterial)
-    {
-        AtmosphereMesh->SetMaterial(
-            0,
-            Atmosphere->AtmosphereMaterial
-        );
-    }
-
-    AtmosphereMesh->SetVisibility(
-        false,
-        true
-    );
-
-    AtmosphereMesh->SetHiddenInGame(
-        true
-    );
 }
 
 

@@ -1,0 +1,14 @@
+// HILLAIRE ATMOSPHERE - FINAL COMPOSITE (P4, over-opaque, linear HDR).
+// DEPRECATED (FASE 12): unreferenced stub, superseded by the production
+// compute passes HillaireSkyBackground.usf (P4-SKY) and
+// HillaireAerialComposite.usf (P4-COMP). No C++ shader class binds this
+// file anymore; it is kept on disk only for history and is NOT compiled.
+// The single ATMOS pipeline is: T -> MS -> SkyView -> (Aerial) -> composite.
+
+#include "/Plugin/HillaireAtmosphere/HillaireSampling.ush"
+
+float4 MainPS(float4 SvPosition : SV_Position) : SV_Target0
+{
+	// Transparent miss: preserves the composite contract even as a stub.
+	return float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
