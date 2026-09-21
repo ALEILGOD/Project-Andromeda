@@ -111,7 +111,7 @@ namespace
 		return true;
 	}
 
-	float SkyLuminance(const FLinearColor& C) { return 0.2126f * C.R + 0.7152f * C.G + 0.0722f * C.B; }
+	float SkyBgLuminance(const FLinearColor& C) { return 0.2126f * C.R + 0.7152f * C.G + 0.0722f * C.B; }
 
 	// UE row-vector map (out_j = sum_i V_i * M[i][j]), independent of the code
 	// under test: mirrors FMatrix::TransformVector4 / VectorTransformVector.
@@ -181,7 +181,7 @@ bool FHillaireSkyBackgroundCpuResponseTest::RunTest(const FString& Parameters)
 	const FLinearColor Zenith = Noon.RunSky(BgIn, 0.0f, 0.5f, 0.5f);
 	TestTrue(TEXT("Sky finite + alpha"), SkyAllFinite({ Zenith }) && Zenith.A == 1.0f);
 	TestTrue(TEXT("Sky alters background"), Zenith != BgIn);
-	TestTrue(TEXT("Sky is lit (positive)"), SkyLuminance(Zenith) > 1e-6f);
+	TestTrue(TEXT("Sky is lit (positive)"), SkyBgLuminance(Zenith) > 1e-6f);
 
 	// Pixel dependence: different view rays sample different sky.
 	const FLinearColor Corner = Noon.RunSky(BgIn, 0.0f, 0.05f, 0.05f);
@@ -193,7 +193,7 @@ bool FHillaireSkyBackgroundCpuResponseTest::RunTest(const FString& Parameters)
 	const FLinearColor ZenithHigh = High.RunSky(BgIn, 0.0f, 0.5f, 0.5f);
 	TestTrue(TEXT("Height changes sky"), ZenithHigh != Zenith);
 	AddInfo(FString::Printf(TEXT("L surface=%.6f high=%.6f corner=%.6f"),
-		SkyLuminance(Zenith), SkyLuminance(ZenithHigh), SkyLuminance(Corner)));
+		SkyBgLuminance(Zenith), SkyBgLuminance(ZenithHigh), SkyBgLuminance(Corner)));
 
 	// Sun dependence: same observer, LUT baked under a 2-deg-elevation sun.
 	FSkyFixture Sunset;
@@ -204,7 +204,7 @@ bool FHillaireSkyBackgroundCpuResponseTest::RunTest(const FString& Parameters)
 	const FLinearColor ZenithSunset = Sunset.RunSky(BgIn, 0.0f, 0.5f, 0.5f);
 	TestTrue(TEXT("Sun changes sky"), ZenithSunset != Zenith);
 	AddInfo(FString::Printf(TEXT("L noon=%.6f sunset=%.6f"),
-		SkyLuminance(Zenith), SkyLuminance(ZenithSunset)));
+		SkyBgLuminance(Zenith), SkyBgLuminance(ZenithSunset)));
 	return true;
 }
 
@@ -234,7 +234,7 @@ bool FHillaireSkyBackgroundCompositeEquationTest::RunTest(const FString& Paramet
 		const float TG = (OutGray.G - OutBlack.G) / 0.4f;
 		const float TB = (OutGray.B - OutBlack.B) / 0.4f;
 		AddInfo(FString::Printf(TEXT("V=%.2f T=(%.4f,%.4f,%.4f) skyL=%.6f"),
-			V, TR, TG, TB, SkyLuminance(OutBlack)));
+			V, TR, TG, TB, SkyBgLuminance(OutBlack)));
 		if (TR < -1e-4f || TR > 1.0f + 1e-4f
 			|| TG < -1e-4f || TG > 1.0f + 1e-4f
 			|| TB < -1e-4f || TB > 1.0f + 1e-4f)
@@ -243,7 +243,7 @@ bool FHillaireSkyBackgroundCompositeEquationTest::RunTest(const FString& Paramet
 			break;
 		}
 		// Sky term present on black (the LUT actually feeds the output).
-		if (!(SkyLuminance(OutBlack) > 1e-6f)) { bOk = false; break; }
+		if (!(SkyBgLuminance(OutBlack) > 1e-6f)) { bOk = false; break; }
 	}
 	TestTrue(TEXT("Sky + T*Bg with T in [0,1]"), bOk);
 	return true;
@@ -380,7 +380,7 @@ bool FHillaireSkyBackgroundRealPerspectiveTest::RunTest(const FString& Parameter
 	const FLinearColor Zenith = RunForView(ZenithView);
 	TestTrue(TEXT("Both finite + alpha"), SkyAllFinite({ Nadir, Zenith }) && Nadir.A == 1.0f && Zenith.A == 1.0f);
 	TestTrue(TEXT("Nadir (ground branch) differs from zenith"), Nadir != Zenith);
-	AddInfo(FString::Printf(TEXT("L nadir=%.6f zenith=%.6f"), SkyLuminance(Nadir), SkyLuminance(Zenith)));
+	AddInfo(FString::Printf(TEXT("L nadir=%.6f zenith=%.6f"), SkyBgLuminance(Nadir), SkyBgLuminance(Zenith)));
 	return true;
 }
 
@@ -589,8 +589,10 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FHillaireSkyBackgroundHorizonBandScanTest,
 bool FHillaireSkyBackgroundHorizonBandScanTest::RunTest(const FString& Parameters)
 {
 	const float GroundKm = 8.835f;
-	const float ThickKm = 100.0f;
-	const float ViewHeightKm = GroundKm + 2.0f;
+	// Volumetric planetary model: T = Ground * PlanetaryAtmosphereThicknessRatio
+	// (AtmosphereTop = 1.10x Ground). The old 100 km Earth envelope is gone.
+	const float ThickKm = GroundKm * HillaireLimits::PlanetaryAtmosphereThicknessRatio;
+	const float ViewHeightKm = GroundKm + 0.002f;
 	FHillairePlanetState Planet = HillaireMakeExternalPlanetState(
 		0, FGuid(0xBA9D001, 0, 0, 0), FName(TEXT("BandScanPlanet")),
 		FVector::ZeroVector, FQuat::Identity,
@@ -598,7 +600,10 @@ bool FHillaireSkyBackgroundHorizonBandScanTest::RunTest(const FString& Parameter
 		FHillaireAtmosphereProfile::MakeReferenceProfile());
 	const FHillaireAtmosphereProfile& Profile = Planet.Profile;
 
-	const FVector3f SunLocal(0.0f, 0.0f, 1.0f);
+	// Low sun (2 deg above the horizon) so the bright limb band forms at the
+	// geometric horizon dip, which is what this scan asserts. A zenith sun
+	// would (correctly) put the peak at the zenith instead.
+	const FVector3f SunLocal(0.99939f, 0.0f, 0.03490f);
 	const FVector3f CamLocal(0.0f, 0.0f, ViewHeightKm);
 	const FVector3f UpLocal(0.0f, 0.0f, 1.0f);
 
@@ -669,7 +674,7 @@ bool FHillaireSkyBackgroundHorizonBandScanTest::RunTest(const FString& Parameter
 		{
 			bFin = false;
 		}
-		const float Lum = SkyLuminance(Out);
+		const float Lum = SkyBgLuminance(Out);
 		AddInfo(FString::Printf(TEXT("viewZenith %5.1f deg -> L=%.6f (%.4f,%.4f,%.4f)"),
 			Deg, Lum, Out.R, Out.G, Out.B));
 		if (Lum > SweepMax) { SweepMax = Lum; SweepMaxAng = Deg; }
@@ -727,7 +732,7 @@ bool FHillaireSkyBackgroundHorizonBandScanTest::RunTest(const FString& Parameter
 				InvProj, Rot, ECam, SunLocal, SunAtten,
 				EP.BottomRadiusKm, EP.TopRadiusKm, EH,
 				ES, SVW, SVH, ET, TW, TH, 1.0f);
-			const float Lum = SkyLuminance(Out);
+			const float Lum = SkyBgLuminance(Out);
 			AddInfo(FString::Printf(TEXT("Earth viewZenith %5.1f deg -> L=%.6f"), Deg, Lum));
 			if (Lum > EMax) { EMax = Lum; EMaxAng = Deg; }
 		}
@@ -755,8 +760,10 @@ bool FHillaireSkyBackgroundRealPlanetFrameTest::RunTest(const FString& Parameter
 {
 	// ---- GT: link-style planet + PIE-like horizontal sun + spinning planet ----
 	const float GroundKm = 8.835f;
-	const float ThickKm = 100.0f;
-	const float CamOverKm = 2.0f;
+	// Volumetric planetary model: T = Ground * PlanetaryAtmosphereThicknessRatio
+	// (AtmosphereTop = 1.10x Ground); surface camera 2 m over the ground.
+	const float ThickKm = GroundKm * HillaireLimits::PlanetaryAtmosphereThicknessRatio;
+	const float CamOverKm = 0.002f;
 	const float ViewHeightKm = GroundKm + CamOverKm;
 	FHillairePlanetState Planet = HillaireMakeExternalPlanetState(
 		0, FGuid(0xA11CE001, 0, 0, 0), FName(TEXT("RealPlanetFrame")),
@@ -864,7 +871,7 @@ bool FHillaireSkyBackgroundRealPlanetFrameTest::RunTest(const FString& Parameter
 				{
 					Fin = false;
 				}
-				const float Lum = SkyLuminance(Out);
+				const float Lum = SkyBgLuminance(Out);
 				Mn = FMath::Min(Mn, Lum);
 				Mx = FMath::Max(Mx, Lum);
 				OutFrame.Add(Out);
@@ -902,6 +909,14 @@ bool FHillaireSkyBackgroundRealPlanetFrameTest::RunTest(const FString& Parameter
 	}
 
 	// ---- GPU: production LUT gen + full-frame composite + readbacks ----
+	// NullRHI/commandlet: no render device, RDG cannot run. The CPU mirror
+	// above already validated the sky math; skip the GPU half explicitly
+	// instead of crashing the suite.
+	if (!FApp::CanEverRender())
+	{
+		AddInfo(TEXT("GPU section skipped (no render device / NullRHI)."));
+		return true;
+	}
 	TSharedPtr<FHillaireLutManager> Mgr = MakeShared<FHillaireLutManager>();
 	struct FGpuFrameResult
 	{

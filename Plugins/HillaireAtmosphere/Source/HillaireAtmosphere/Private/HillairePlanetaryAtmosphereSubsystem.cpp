@@ -10,7 +10,7 @@
 #include "HillairePlanetAtmosphereState.h"
 #include "SceneViewExtension.h"
 
-static TAutoConsoleVariable<int32> CVarHillaireEnable(
+static TAutoConsoleVariable<int32> CVarHillairePlanetaryEnable(
 	TEXT("r.Hillaire.Enable"),
 	1,
 	TEXT("Master switch for the Hillaire planetary atmosphere system (0 disables)."),
@@ -18,7 +18,7 @@ static TAutoConsoleVariable<int32> CVarHillaireEnable(
 
 bool UHillairePlanetaryAtmosphereSubsystem::IsEnabledByCVar()
 {
-	return CVarHillaireEnable.GetValueOnGameThread() != 0;
+	return CVarHillairePlanetaryEnable.GetValueOnGameThread() != 0;
 }
 
 UHillairePlanetaryAtmosphereSubsystem::~UHillairePlanetaryAtmosphereSubsystem() = default;

@@ -49,22 +49,25 @@ static TAutoConsoleVariable<int32> CVarHillaireDebugMode(
 	ECVF_RenderThreadSafe);
 
 // Reference sun-illuminance knob (mirrors the DX11 sample mSunIlluminanceScale
-// slider, range 0.1-100). Default 10.0 = the validated end-to-end gain: the
+// slider, range 0.1-100). Default 30.0 = the validated end-to-end gain: the
 // reference renders unit-sun transfer through a FIXED demo tonemap exposure
 // of 10 (Resources/PostProcess.hlsl:64-65), while UE uses the project
 // exposure (~1) + ACES. The baked transfer is unit-white by architecture
 // (proven: live zenith OD matches Earth 0.99x, GPU==CPU); the game sun
 // intensity (~1.0, an authoring value that does not physically light the
-// scene) therefore under-delivers the validated daylight level ~10x through
-// UE's chain (measured: noon zenith transfer lum 0.0055 -> black sky; only
-// the 10x-brighter limb band survived visibly). The whole chain is linear in
-// sun throughput, so this default is radiometrically identical to baking the
-// scale into the LUTs: it alters no gradients, limb shape, or contrast.
+// scene) therefore under-delivers the validated daylight level through UE's
+// chain (measured: noon zenith transfer lum 0.0055 -> black sky; only the
+// limb band survived visibly). The whole chain is linear in sun throughput,
+// so this default is radiometrically identical to baking the scale into the
+// LUTs: it alters no gradients, limb shape, or contrast. 30 lifts the whole
+// sky dome into a properly illuminated blue (the 10x default still left the
+// high-elevation dome near black on the thin 1.10x envelopes) and carries the
+// warm sunset inscatter onto both the sky and the visible surface.
 // Tunable live 0.1-100 like the reference slider; NOT a per-scene gain hack.
 static TAutoConsoleVariable<float> CVarHillaireSunScale(
 	TEXT("r.Hillaire.SunScale"),
-	10.0f,
-	TEXT("Linear sun throughput scale at composite (reference mSunIlluminanceScale; default 10 ports the demo exposure-10 calibration into UE's exposure chain)."),
+	30.0f,
+	TEXT("Linear sun throughput scale at composite (reference mSunIlluminanceScale; default 30 ports the demo exposure calibration into UE's exposure chain)."),
 	ECVF_RenderThreadSafe);
 
 bool FHillairePlanetaryViewExtension::ShouldHandleView(const FSceneViewFamily& InViewFamily) const
