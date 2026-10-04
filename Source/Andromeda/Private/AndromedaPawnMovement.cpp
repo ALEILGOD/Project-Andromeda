@@ -376,11 +376,16 @@ void UAndromedaPawnMovement::MoveWithMovingBodyCollision(double Dt,
         const bool bWalkable = Field.OrientationInfluence > 0.0 &&
             (Hit.Normal | Field.LocalUp) > FMath::Cos(FMath::DegreesToRadians(WalkableSlopeDegrees));
         bGrounded |= bWalkable;
-        if (bWalkable && EndInwardSpeed < 0.0)
+        // Coulomb friction applies on ANY solid contact, not just walkable
+        // ground: steep walls and light grazes otherwise preserve slide energy
+        // losslessly (normal projection alone never touches the tangential
+        // channel) and re-loft the pawn into long suborbital hops. The impulse
+        // stays bounded by the normal force times tan(slope), so a brief
+        // diagonal touch keeps most tangential momentum while sustained
+        // sliding converges. Grounded state below remains walkable-gated, and
+        // a high-speed arrival is never clamped to walking speed.
+        if (EndInwardSpeed < 0.0)
         {
-            // Physical contact friction only. It supports slopes / removes
-            // downhill free-fall drift, with an impulse bounded by the normal
-            // force; a high-speed arrival is not clamped to walking speed.
             const FVector Drift = FVector::VectorPlaneProject(EndVelocity - ContactVelocity - ControlledVelocity, Hit.Normal);
             const FVector Friction = (-Drift).GetClampedToMaxSize(-EndInwardSpeed * FMath::Tan(FMath::DegreesToRadians(WalkableSlopeDegrees)));
             EndVelocity += Friction;
