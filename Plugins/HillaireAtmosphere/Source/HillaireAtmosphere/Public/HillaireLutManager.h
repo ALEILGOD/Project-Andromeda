@@ -382,6 +382,8 @@ public:
 		const FMatrix& InvProjMatrix,
 		const FVector3f& SunColorAttenuation,
 		float AerialKmPerSlice,
+		float AerialAltitude01,
+		float AerialSunElevCos,
 		FRDGTextureRef RdgAerialVolume,
 		const FIntRect& ViewRect,
 		FRDGTextureRef& OutColor);

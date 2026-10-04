@@ -5,6 +5,7 @@
 #include "HillaireAtmosphereLog.h"
 #include "HillaireHash.h"
 #include "HillaireLimits.h"
+#include "HillaireLutCpu.h"
 #include "HillaireLutManager.h"
 #include "HillairePlanetaryViewExtension.h"
 #include "HillairePlanetAtmosphereState.h"
@@ -718,8 +719,60 @@ void UHillairePlanetaryAtmosphereSubsystem::BuildNextFrameSnapshot(
 			AppliedCount,
 			this);
 	}
+
+	// Sky-ambient cache refresh (terrain fill, GameThread): recompute the
+	// hemisphere transfer only on governing/profile change or sun-elevation
+	// drift past the SkyView threshold (same key the LUT bake uses), so the
+	// steady-state per-frame cost is zero. The resolved sun color is kept
+	// current every frame (distance illumination drifts without geometry).
+	{
+		const FPlanetAtmosphereState* Gov = CurrentFrameSnapshot.IsValid()
+			? CurrentFrameSnapshot->GetGoverningPlanet() : nullptr;
+		if (Gov && Gov->ResolvedLights.Count > 0)
+		{
+			const FVector3f UpLocal = HillairePlanetMath::CameraUpLocal(Gov->CenterCamRelativeKm, Gov->RotationWS);
+			const float Elev = HillairePlanetMath::SunElevationCos(Gov->StarDirectionLocal, UpLocal);
+			const bool bSamePlanet = SkyAmbientCache.bValid && SkyAmbientCache.PlanetId == Gov->PlanetId;
+			const bool bSameProfile = bSamePlanet && SkyAmbientCache.ProfileHash == Gov->ProfileHash;
+			const bool bFreshSun = bSameProfile
+				&& FMath::Abs(Elev - SkyAmbientCache.SunElevCos) <= HillaireLimits::SkyViewSunElevationCosDelta;
+			if (!bFreshSun)
+			{
+				SkyAmbientCache.PlanetId = Gov->PlanetId;
+				SkyAmbientCache.ProfileHash = Gov->ProfileHash;
+				SkyAmbientCache.SunElevCos = Elev;
+				SkyAmbientCache.Transfer = HillaireLutCpu::ComputeSkyAmbientTransfer(
+					Gov->Profile, Gov->StarDirectionLocal, UpLocal,
+					Gov->Profile.BottomRadiusKm + HillaireLimits::PlanetRadiusOffsetKm);
+				SkyAmbientCache.SunIrradiance = Gov->StarIrradiance;
+				SkyAmbientCache.bValid = true;
+			}
+			else
+			{
+				SkyAmbientCache.SunIrradiance = Gov->StarIrradiance;
+			}
+		}
+		else
+		{
+			SkyAmbientCache.bValid = false;
+		}
+	}
 }
 
+bool UHillairePlanetaryAtmosphereSubsystem::GetGoverningSkyAmbientTransfer(
+	FVector3f& OutTransferUnitWhite,
+	float& OutSunElevCos,
+	FVector3f& OutSunIrradiance) const
+{
+	if (!SkyAmbientCache.bValid)
+	{
+		return false;
+	}
+	OutTransferUnitWhite = SkyAmbientCache.Transfer;
+	OutSunElevCos = SkyAmbientCache.SunElevCos;
+	OutSunIrradiance = SkyAmbientCache.SunIrradiance;
+	return true;
+}
 TSharedPtr<const FHillaireAtmosphereFrameState> UHillairePlanetaryAtmosphereSubsystem::GetCurrentFrameSnapshot() const
 {
 	return CurrentFrameSnapshot;

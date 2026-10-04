@@ -244,6 +244,47 @@ namespace
 		TEXT("Readback pooled GPU LUTs for a planet slot and write PNG previews. Usage: Hillaire.DumpGpuLuts <Slot>."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&DumpGpuLuts));
 
+	// On-demand sky-ambient readout (terrain-fill diagnostic): logs the
+	// governing planet's cached hemisphere transfer, sun state, and the
+	// resulting skylight color/intensity at a reference scale. No rendering,
+	// no side effects; proves the ambient driver tracks the live sun.
+	void DumpSkyAmbient(const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World)
+		{
+			UE_LOG(LogHillaireAtmosphere, Warning, TEXT("Hillaire.DumpSkyAmbient: no world."));
+			return;
+		}
+		UHillairePlanetaryAtmosphereSubsystem* Sub =
+			World->GetSubsystem<UHillairePlanetaryAtmosphereSubsystem>();
+		if (!Sub)
+		{
+			UE_LOG(LogHillaireAtmosphere, Warning, TEXT("Hillaire.DumpSkyAmbient: no subsystem."));
+			return;
+		}
+		FVector3f Transfer = FVector3f::ZeroVector;
+		float SunElevCos = -3.0f;
+		FVector3f SunIrradiance = FVector3f::ZeroVector;
+		if (!Sub->GetGoverningSkyAmbientTransfer(Transfer, SunElevCos, SunIrradiance))
+		{
+			UE_LOG(LogHillaireAtmosphere, Warning, TEXT("Hillaire.DumpSkyAmbient: no cached ambient (no governing planet yet)."));
+			return;
+		}
+		const HillaireLimits::FSkyAmbientLightState State =
+			HillaireLimits::SkyAmbientLightState(Transfer, SunElevCos, SunIrradiance,
+				HillaireLimits::SkyAmbientPresentationScale);
+		UE_LOG(LogHillaireAtmosphere, Log,
+			TEXT("Hillaire.DumpSkyAmbient: elev=%.5f transfer=(%.6f,%.6f,%.6f) sunIrr=(%.4f,%.4f,%.4f) -> color=(%.4f,%.4f,%.4f) intensity=%.6f"),
+			SunElevCos, Transfer.X, Transfer.Y, Transfer.Z,
+			SunIrradiance.X, SunIrradiance.Y, SunIrradiance.Z,
+			State.Color.X, State.Color.Y, State.Color.Z, State.Intensity);
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs GDumpSkyAmbientCmd(
+		TEXT("Hillaire.DumpSkyAmbient"),
+		TEXT("Log the governing planet sky-ambient transfer and mapped skylight state. Usage: Hillaire.DumpSkyAmbient."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&DumpSkyAmbient));
+
 	// ---- Phase 2C: aerial perspective validation ----
 
 	FString GetAerialValidationDir()

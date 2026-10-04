@@ -150,6 +150,20 @@ public:
 	/** Invalidate LUTs for a specific planet (profile change). */
 	void InvalidatePlanetLuts(const FGuid& PlanetId);
 
+	// ---- Sky ambient (terrain fill from the atmosphere) ----
+	//
+	// GameThread-only cache of the governing planet's hemisphere-integrated
+	// sky transfer (HillaireLutCpu::ComputeSkyAmbientTransfer: same
+	// scattering core as the LUTs, no GPU readback). Refreshed only when the
+	// governing planet/profile changes or the sun elevation drifts past the
+	// SkyView threshold, so the steady-state per-frame cost is zero. The
+	// consumer (ASun tick) maps the unit-white transfer to the existing
+	// skylight via HillaireLimits::SkyAmbientLightState; no probes, no GI.
+	bool GetGoverningSkyAmbientTransfer(
+		FVector3f& OutTransferUnitWhite,
+		float& OutSunElevCos,
+		FVector3f& OutSunIrradiance) const;
+
 	// ---- Render Knobs (bake into LUT keys, never hidden globals) ----
 
 	UPROPERTY(EditAnywhere, Category = "Hillaire")
@@ -237,6 +251,23 @@ private:
 	// Per-view snapshot stash (GT->RT matching via shared view state)
 	mutable FCriticalSection StashLock;
 	TMap<const FSceneViewStateInterface*, FFrameSnapshotEntry> SnapshotStash;
+
+	/**
+	 * Governing-planet sky-ambient cache (GT only, like the registries).
+	 * Transfer is unit-white (LUT convention); the consumer applies the
+	 * resolved sun color and the presentation scale.
+	 */
+	struct FSkyAmbientCache
+	{
+		FGuid PlanetId;
+		uint64 ProfileHash = 0;
+		float SunElevCos = -3.0f;
+		FVector3f Transfer = FVector3f::ZeroVector;
+		FVector3f SunIrradiance = FVector3f::ZeroVector;
+		bool bValid = false;
+	};
+	/** Mutable for the const GT getter (same convention as LastDiag*). */
+	mutable FSkyAmbientCache SkyAmbientCache;
 
 	// LUT manager (owned)
 	TUniquePtr<FHillaireLutManager> LutManager;

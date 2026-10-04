@@ -70,8 +70,12 @@ RWTexture2D<float4> CompositeOutputUav;
 // twilight, 1 at full day, smooth in between. Evaluated at the ray's
 // atmosphere point below so the terminator stays continuous and the planet's
 // night side contributes nothing regardless of where the camera stands.
-#define ZEPHYR_TWILIGHT_BEGIN_ELEV_COS (-0.12)
-#define ZEPHYR_FULL_DAY_ELEV_COS (0.25)
+// VISUAL CALIBRATION (broad NMS-style sunset): widened from (-0.12, 0.25)
+// which collapsed the warm band (~0.27 at the horizon). Now ~0.74 at elev 0
+// (broad sunset survives), ~0.25 at -6 deg (gradual twilight), 0 at ~-11.5
+// deg (night extinct). Must match HillaireLimits Terminator + ZephyrTypes.
+#define ZEPHYR_TWILIGHT_BEGIN_ELEV_COS (-0.20)
+#define ZEPHYR_FULL_DAY_ELEV_COS (0.10)
 
 float ZephyrDaylightCurve(float SunElevCos)
 {

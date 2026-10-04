@@ -1,6 +1,7 @@
 #include "AndromedaGameMode.h"
 
 #include "AndromedaPawn.h"
+#include "AndromedaPlayerController.h"
 
 
 AAndromedaGameMode::AAndromedaGameMode(
@@ -8,9 +9,8 @@ AAndromedaGameMode::AAndromedaGameMode(
 )
     : Super(ObjectInitializer)
 {
-    // Il Default Pawn del progetto e' AAndromedaPawn: mantiene il movimento
-    // del DefaultPawn di Unreal e aggiunge la gravita' planetaria.
     DefaultPawnClass = AAndromedaPawn::StaticClass();
+    PlayerControllerClass = AAndromedaPlayerController::StaticClass();
 }
 
 

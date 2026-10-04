@@ -62,6 +62,10 @@ struct FPlanetGenerationData
     UPROPERTY(BlueprintReadOnly)
     float TerrainHeight = 0.0f;
 
+    /** Generated uniform-density gameplay gravity at the reference radius (cm/s^2). */
+    UPROPERTY(BlueprintReadOnly)
+    double SurfaceGravity = 980.0;
+
 
     // =========================================================
     // TERRAIN

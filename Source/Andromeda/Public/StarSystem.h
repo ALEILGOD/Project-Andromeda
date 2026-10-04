@@ -7,6 +7,15 @@
 
 class ASun;
 
+/** Surface locomotion accepts planets only. Stellar gravity is a separate future field. */
+UENUM(BlueprintType)
+enum class ECelestialBodyType : uint8
+{
+    Unknown,
+    Star,
+    Planet
+};
+
 
 USTRUCT()
 struct FSpawnedPlanetData
@@ -25,8 +34,8 @@ struct FSpawnedPlanetData
 // PLANET RUNTIME DATA
 //
 // Snapshot read-only di un pianeta spawnato, utilizzato dal
-// PlanetaryGravitySystem e dal futuro sistema di reference
-// frame. E' un puro blocco di dati: non contiene logica.
+// Planetary gravity/reference-frame snapshot. Orbital derivatives and pose
+// are evaluated from this star system's authoritative double-precision clocks.
 // =========================================================
 
 USTRUCT(BlueprintType)
@@ -36,6 +45,26 @@ struct FPlanetRuntimeData
 
     UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
     bool bValid = false;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
+    ECelestialBodyType BodyType = ECelestialBodyType::Unknown;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
+    double SurfaceGravity = 0.0;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
+    double AtmosphereTopRadius = 0.0;
+
+    /** Orbital shell clearance bound: cannot include the star or another planet's surface. */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
+    double MaxInfluenceRadius = 0.0;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
+    FVector OrbitalAcceleration = FVector::ZeroVector;
+
+    /** World radians/second; sign already included exactly once. */
+    UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
+    FVector AngularVelocity = FVector::ZeroVector;
 
     /** Riferimento runtime all'actor del pianeta (l'APlanet/BP_Planet spawnato). */
     UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
@@ -67,7 +96,7 @@ struct FPlanetRuntimeData
      * Velocità orbitale EFFETTIVA del pianeta (cm/s, tempo mondiale).
      *
      * Deriva dalla stessa formula e dalla stessa scala temporale usate da
-     * UpdatePlanetOrbits (SystemSimulationTime * OrbitTimeScale), quindi
+     * UpdatePlanetOrbits (accumulated OrbitalSimulationTime), quindi
      * rappresenta il movimento che il pianeta ha DAVVERO nel mondo.
      */
     UPROPERTY(BlueprintReadOnly, Category = "Andromeda|Star System|Planet")
@@ -109,6 +138,8 @@ public:
 protected:
 
     virtual void BeginPlay() override;
+
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
     virtual void Tick(
         float DeltaTime
@@ -230,6 +261,10 @@ public:
     UFUNCTION(BlueprintPure, Category = "Andromeda|Star System")
     ASun* GetSunActor() const;
 
+    /** Append read-only orbital samples at an offset from this frame's system time.
+     * Called by movement substeps; no actor movement or alternate clock/model. */
+    void AppendPlanetRuntimeSamples(double WorldTimeOffset, TArray<FPlanetRuntimeData>& OutPlanets) const;
+
     /**
      * Returns a stable, deterministic FGuid for this star system's star.
      * Derived from UniverseSeed + SystemCoordinate so it's stable across
@@ -269,7 +304,7 @@ private:
 
     FVector CalculateOrbitPosition(
         const FPlanetGenerationData& PlanetData,
-        float SimulationTime
+        double SimulationTime
     ) const;
 
 
@@ -279,7 +314,7 @@ private:
 
     FRotator CalculatePlanetRotation(
         const FPlanetGenerationData& PlanetData,
-        float SimulationTime
+        double SimulationTime
     ) const;
 
     float CalculateRotationPeriod(
@@ -308,8 +343,12 @@ private:
     ) const;
 
     FPlanetRuntimeData BuildPlanetRuntimeData(
-        const FSpawnedPlanetData& SpawnedPlanet
+        const FSpawnedPlanetData& SpawnedPlanet,
+        double WorldTimeOffset = 0.0
     ) const;
+
+    void UpdateRuntimeSnapshot();
+    void SampleRuntimeMotion(const FSpawnedPlanetData& Planet, double WorldTimeOffset, FPlanetRuntimeData& Out) const;
 
 
     // =========================================================
@@ -339,10 +378,15 @@ private:
     UPROPERTY(Transient)
     TArray<FSpawnedPlanetData> SpawnedPlanets;
 
+    /** Shared body metadata rebuilt once per orbital tick, not once per player/substep. */
+    UPROPERTY(Transient)
+    TArray<FPlanetRuntimeData> RuntimeSnapshot;
+
 
     // =========================================================
     // SIMULATION TIME
     // =========================================================
 
-    float SystemSimulationTime = 0.0f;
+    double SystemSimulationTime = 0.0;
+    double OrbitalSimulationTime = 0.0;
 };

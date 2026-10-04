@@ -7,12 +7,20 @@
 // tests for the NEW render hook/sampling only:
 //   1. gating truth table (pure, no GPU);
 //   2. CPU-mirror response (height / sun / pixel dependence, opaque identity);
+//   2b. terminator gate (shared solar-elevation curve, day/night response,
+//       transmittance never gated, broad sunset, aerial scale bounds);
+//   2c. continuous sunset response (five overlapping elevation bands:
+//       exact day/night identity, elevation continuity with no jumps,
+//       sun-direction dependence, horizon localization, sunrise/sunset path
+//       symmetry, sun-chromaticity planet variation);
+//   2d. aerial presentation scales (distance ramp near->far, entry altitude
+//       scale, transmittance linearity, warm terrain integration at sunset);
 //   3. composite equation (background attenuated by view transmittance);
 //   4. view-input rotation order with a spinning (non-identity) planet;
 //   5. end-to-end sky with real perspective matrices (nadir vs zenith);
 //   6. GPU execution proof (production EnsurePlanetLuts + CompositeSkyBackground).
-// Phase 2A-2F suites must keep passing untouched: the aerial path, LUT
-// generation math and the CPU aerial mirror are not modified here.
+// Phase 2A-2F suites must keep passing untouched: LUT generation math and the
+// aerial volume bake are not modified here (presentation lives at composite).
 
 #include "Misc/AutomationTest.h"
 
@@ -209,6 +217,560 @@ bool FHillaireSkyBackgroundCpuResponseTest::RunTest(const FString& Parameters)
 }
 
 // ---------------------------------------------------------------------------
+// Test 2b - Terminator gate (sky composite).
+//
+// The normalized volumetric density fills the full 1.10x envelope, so the
+// optically significant atmosphere reaches a large height and the geometric
+// earth shadow keeps the upper limb illuminated far past civil twilight. The
+// composite enforces the terminator with the same smooth solar-elevation curve
+// the ZEPHYR presentation layer uses (ZephyrTypes.h
+// ZephyrPresentation::DaylightFactor), evaluated at the ray's atmosphere point.
+// This test locks: (a) the shared curve; (b) day preserved; (c) night
+// extinguished; (d) the gate applies ONLY to the sun-scaled inscatter, never to
+// the view-ray transmittance (background stars stay attenuated); (e) broad
+// NMS-style sunset (horizon stays bright, twilight contracts gradually);
+// (f) aerial presentation scale bounds (terrain/sky separation).
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FHillaireSkyBackgroundTerminatorGateTest,
+	"Hillaire.SkyBackground.TerminatorGate",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FHillaireSkyBackgroundTerminatorGateTest::RunTest(const FString& Parameters)
+{
+	// (a) Shared curve: same constants/smoothstep as the ZEPHYR presentation
+	// curve (ZEPHYR_TWILIGHT_BEGIN_ELEV_COS / ZEPHYR_FULL_DAY_ELEV_COS).
+	TestEqual(TEXT("Zenith sun = full day"),
+		HillaireLimits::TerminatorFactor(1.0f), 1.0f);
+	TestEqual(TEXT("Deep night extinct"),
+		HillaireLimits::TerminatorFactor(-1.0f), 0.0f);
+	TestEqual(TEXT("Nautical twilight extinct"),
+		HillaireLimits::TerminatorFactor(HillaireLimits::TerminatorBeginElevCos), 0.0f);
+	TestEqual(TEXT("Full day at threshold"),
+		HillaireLimits::TerminatorFactor(HillaireLimits::TerminatorFullElevCos), 1.0f);
+	const float MidTwilight = HillaireLimits::TerminatorFactor(
+		0.5f * (HillaireLimits::TerminatorBeginElevCos + HillaireLimits::TerminatorFullElevCos));
+	TestTrue(TEXT("Mid twilight strictly between day and night"),
+		MidTwilight > 0.0f && MidTwilight < 1.0f);
+	TestTrue(TEXT("Curve monotonic"),
+		HillaireLimits::TerminatorFactor(0.10f) > HillaireLimits::TerminatorFactor(-0.05f));
+	// (e) Broad sunset: horizon stays bright (no thin-line collapse), -6 deg
+	// twilight contracts gradually but persists, nautical depth extinct.
+	TestTrue(TEXT("Sunset horizon bright (broad band)"),
+		HillaireLimits::TerminatorFactor(0.0f) > 0.6f);
+	TestTrue(TEXT("Twilight -6deg contracts but persists"),
+		HillaireLimits::TerminatorFactor(-0.105f) > 0.1f
+		&& HillaireLimits::TerminatorFactor(-0.105f) < 0.5f);
+	TestTrue(TEXT("Nautical depth extinct"),
+		HillaireLimits::TerminatorFactor(-0.30f) == 0.0f);
+	// (f) Aerial presentation scale: isolated, sub-unity, sky untouched.
+	TestTrue(TEXT("Aerial scale in (0,1)"),
+		HillaireLimits::AerialInscatterPresentationScale > 0.0f
+		&& HillaireLimits::AerialInscatterPresentationScale < 1.0f);
+
+	// (b/c) Composite response: day lit, night extinguished, twilight present.
+	FSkyFixture Day;
+	Day.Bake(FVector3f(0.0f, 0.0f, 1.0f), 1.0f);
+	FSkyFixture Night;
+	Night.Bake(FVector3f(0.5f, 0.0f, -0.866f), 1.0f); // sun ~ -60 deg
+	FSkyFixture Sunset;
+	Sunset.Bake(FVector3f(0.99985f, 0.0f, 0.01745f), 1.0f); // sun +1 deg
+
+	const FLinearColor Black(0.0f, 0.0f, 0.0f, 1.0f);
+	const FLinearColor DaySky = Day.RunSky(Black, 0.0f, 0.5f, 0.5f);
+	const FLinearColor NightSky = Night.RunSky(Black, 0.0f, 0.5f, 0.5f);
+	const FLinearColor SunsetSky = Sunset.RunSky(Black, 0.0f, 0.5f, 0.5f);
+
+	TestTrue(TEXT("Day sky lit"), SkyBgLuminance(DaySky) > 1e-4f);
+	TestTrue(TEXT("Night sky extinguished"), SkyBgLuminance(NightSky) < 1e-6f);
+	TestTrue(TEXT("Day >> night"), SkyBgLuminance(DaySky) > 100.0f * SkyBgLuminance(NightSky));
+	TestTrue(TEXT("Twilight present (not instant black)"), SkyBgLuminance(SunsetSky) > 0.0f);
+
+	// (d) Night output equals background * view transmittance: the sun-scaled
+	// term is exactly zero, the transmittance is NOT gated.
+	float TU = 0.0f, TV = 0.0f;
+	HillaireLutCpu::TransmittanceParamsToUv(
+		Night.Profile.BottomRadiusKm, Night.Profile.TopRadiusKm,
+		Night.ViewHeightKm, 1.0f, TU, TV);
+	const FVector3f T = HillaireLutCpu::SampleLutBilinear(
+		Night.TransLut, Night.TW, Night.TH, TU, TV);
+	const float TMean = (T.X + T.Y + T.Z) / 3.0f;
+	const FLinearColor Bg(0.02f, 0.03f, 0.05f, 1.0f);
+	const FLinearColor NightBg = Night.RunSky(Bg, 0.0f, 0.5f, 0.5f);
+	TestTrue(TEXT("Night = background * view transmittance"),
+		FMath::Abs(NightBg.R - Bg.R * TMean) < 1e-5f
+		&& FMath::Abs(NightBg.G - Bg.G * TMean) < 1e-5f
+		&& FMath::Abs(NightBg.B - Bg.B * TMean) < 1e-5f);
+
+	AddInfo(FString::Printf(TEXT("Terminator: dayL=%.6f sunsetL=%.6f nightL=%.8f Tmean=%.4f"),
+		SkyBgLuminance(DaySky), SkyBgLuminance(SunsetSky), SkyBgLuminance(NightSky), TMean));
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 2c - Continuous sunset response (five overlapping elevation bands).
+//
+// The single-scalar terminator reads as DAY -> factor -> warm band -> dark
+// ("a blocchi"). The pass-2 response re-balances the existing LUT transfer
+// with five overlapping smooth elevation bands (violet/pink/gold/orange/red)
+// masked by sun-direction and horizon proximity, applied to the atmospheric
+// contribution only. This test locks: exact day/night identity (no residual),
+// elevation continuity (no discrete jumps), sun-direction dependence (warmest
+// toward the sun, cooler anti-sun), horizon localization (red low), orange
+// visibility at the horizon, sunrise/sunset family symmetry at composite
+// level, and sun-chromaticity planet variation. All pure-function checks run
+// on HillaireLimits (the CPU mirror of HillaireCommon.ush); the composite
+// checks reuse the baked fixture path.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FHillaireSkyBackgroundSunsetResponseTest,
+	"Hillaire.SkyBackground.SunsetResponse",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+namespace
+{
+	// Hand-built rotation sending the view-center ray to planet-local D
+	// (row-vector convention: row 2 = ray dir; same rig as HorizonBandScan).
+	FMatrix SunsetCenterRayRot(const FVector3f& D)
+	{
+		FVector3f R0 = FVector3f::CrossProduct(FVector3f(0.0f, 1.0f, 0.0f), D).GetSafeNormal();
+		if (R0.SizeSquared() < 0.5f)
+		{
+			R0 = FVector3f(1.0f, 0.0f, 0.0f);
+		}
+		const FVector3f R1 = FVector3f::CrossProduct(D, R0).GetSafeNormal();
+		FMatrix Rot(EForceInit::ForceInitToZero);
+		Rot.M[0][0] = R0.X; Rot.M[0][1] = R0.Y; Rot.M[0][2] = R0.Z;
+		Rot.M[1][0] = R1.X; Rot.M[1][1] = R1.Y; Rot.M[1][2] = R1.Z;
+		Rot.M[2][0] = D.X;  Rot.M[2][1] = D.Y;  Rot.M[2][2] = D.Z;
+		Rot.M[3][3] = 1.0f;
+		return Rot;
+	}
+}
+
+bool FHillaireSkyBackgroundSunsetResponseTest::RunTest(const FString& Parameters)
+{
+	const FVector3f WhiteChroma = HillaireLimits::SunsetSunChroma(FVector3f(1.0f, 1.0f, 1.0f));
+
+	// (a) Exact day/night identity: every band weight is exactly 0 at day and
+	// below nautical twilight, so the multiplier is
+	// exactly (1,1,1): day stays native blue, night stays extinct, no warm
+	// residual, no cool wash.
+	{
+		const float Windows[5][4] = {
+			{ -0.04f, 0.00f, 0.08f, 0.20f }, { -0.11f, -0.05f, 0.02f, 0.10f },
+			{ -0.07f, -0.02f, 0.04f, 0.12f }, { -0.14f, -0.07f, -0.01f, 0.06f },
+			{ -0.20f, -0.14f, -0.08f, -0.02f } };
+		bool bDayZero = true, bNightZero = true, bHighDayZero = true;
+		for (const auto& W : Windows)
+		{
+			bDayZero &= HillaireLimits::SunsetBandWeight(1.0f, W[0], W[1], W[2], W[3]) == 0.0f;
+			bNightZero &= HillaireLimits::SunsetBandWeight(-0.5f, W[0], W[1], W[2], W[3]) == 0.0f;
+			bHighDayZero &= HillaireLimits::SunsetBandWeight(0.2f, W[0], W[1], W[2], W[3]) == 0.0f;
+		}
+		TestTrue(TEXT("All bands exact 0 at day"), bDayZero);
+		TestTrue(TEXT("All bands exact 0 at night"), bNightZero);
+		TestTrue(TEXT("All bands exact 0 above +11 deg"), bHighDayZero);
+		const FVector3f DayM = HillaireLimits::SunsetSkyMultiplier(1.0f, 1.0f, 0.0f, WhiteChroma);
+		const FVector3f NightM = HillaireLimits::SunsetSkyMultiplier(-0.5f, 1.0f, 0.0f, WhiteChroma);
+		const FVector3f DayA = HillaireLimits::SunsetAerialMultiplier(1.0f, WhiteChroma);
+		const FVector3f NightA = HillaireLimits::SunsetAerialMultiplier(-0.5f, WhiteChroma);
+		TestTrue(TEXT("Sky mult exact identity at day"),
+			DayM.X == 1.0f && DayM.Y == 1.0f && DayM.Z == 1.0f);
+		TestTrue(TEXT("Sky mult exact identity at night"),
+			NightM.X == 1.0f && NightM.Y == 1.0f && NightM.Z == 1.0f);
+		TestTrue(TEXT("Aerial mult exact identity at day"),
+			DayA.X == 1.0f && DayA.Y == 1.0f && DayA.Z == 1.0f);
+		TestTrue(TEXT("Aerial mult exact identity at night"),
+			NightA.X == 1.0f && NightA.Y == 1.0f && NightA.Z == 1.0f);
+	}
+
+	// (b) Orange/gold must be fully present AT the horizon (the missing-orange
+	// report): gold plateaus at 1.0, orange > 0.85 at elev 0.
+	TestTrue(TEXT("Gold full at horizon"),
+		HillaireLimits::SunsetBandWeight(0.0f, -0.07f, -0.02f, 0.04f, 0.12f) == 1.0f);
+	TestTrue(TEXT("Orange strong at horizon"),
+		HillaireLimits::SunsetBandWeight(0.0f, -0.14f, -0.07f, -0.01f, 0.06f) > 0.85f);
+
+	// (c) Elevation continuity: sweep day -> twilight -> night at fixed
+	// toward-sun horizon geometry. A hard-band model would jump ~0.3+ between
+	// adjacent samples; the overlapping smoothstep response stays far below.
+	// The reverse traversal recomputes the identical elevation list, so it
+	// must match bit-exactly (pure function: sunrise traverses the identical
+	// progression, no hysteresis, no sign branches).
+	{
+		TArray<float> Elevs;
+		for (int32 K = 0; K <= 275; ++K)
+		{
+			Elevs.Add(0.25f - (float)K * 0.002f);
+		}
+		TArray<FVector3f> Forward;
+		Forward.Reserve(Elevs.Num());
+		float MaxStep = 0.0f;
+		FVector3f Prev = HillaireLimits::SunsetSkyMultiplier(Elevs[0], 1.0f, 0.0f, WhiteChroma);
+		Forward.Add(Prev);
+		for (int32 K = 1; K < Elevs.Num(); ++K)
+		{
+			const FVector3f M = HillaireLimits::SunsetSkyMultiplier(Elevs[K], 1.0f, 0.0f, WhiteChroma);
+			MaxStep = FMath::Max(MaxStep, FMath::Abs(M.X - Prev.X));
+			MaxStep = FMath::Max(MaxStep, FMath::Abs(M.Y - Prev.Y));
+			MaxStep = FMath::Max(MaxStep, FMath::Abs(M.Z - Prev.Z));
+			Forward.Add(M);
+			Prev = M;
+		}
+		TestTrue(TEXT("Sunset elevation response continuous (no blocks)"), MaxStep < 0.15f);
+		AddInfo(FString::Printf(TEXT("Sunset sweep max adjacent delta=%.5f"), MaxStep));
+		bool bMirror = true;
+		for (int32 K = Elevs.Num() - 1; K >= 0; --K)
+		{
+			const FVector3f M = HillaireLimits::SunsetSkyMultiplier(Elevs[K], 1.0f, 0.0f, WhiteChroma);
+			const FVector3f& F = Forward[K];
+			bMirror &= (M.X == F.X && M.Y == F.Y && M.Z == F.Z);
+		}
+		TestTrue(TEXT("Sunrise traverses the identical response (symmetric)"), bMirror);
+
+		// Directional sweep at fixed sunset elevation: also continuous, and
+		// the pow() sun lobes stay smooth through anti-sun (derivative 0).
+		float MaxDirStep = 0.0f;
+		FVector3f PrevD = HillaireLimits::SunsetSkyMultiplier(-0.02f, -1.0f, 0.0f, WhiteChroma);
+		for (float L = -1.0f + 0.02f; L <= 1.0f; L += 0.02f)
+		{
+			const FVector3f M = HillaireLimits::SunsetSkyMultiplier(-0.02f, L, 0.0f, WhiteChroma);
+			MaxDirStep = FMath::Max(MaxDirStep, FMath::Abs(M.X - PrevD.X));
+			MaxDirStep = FMath::Max(MaxDirStep, FMath::Abs(M.Y - PrevD.Y));
+			MaxDirStep = FMath::Max(MaxDirStep, FMath::Abs(M.Z - PrevD.Z));
+			PrevD = M;
+		}
+		TestTrue(TEXT("Sun-direction response continuous"), MaxDirStep < 0.10f);
+	}
+
+	// (d) Sun-direction dependence at sunset: warmest toward the sun, cooler
+	// (but non-identical) anti-sun twilight. Hand-verified anchors at
+	// e=-0.02, horizon, white sun: toward R ~1.85, anti R ~1.09.
+	{
+		const FVector3f Toward = HillaireLimits::SunsetSkyMultiplier(-0.02f, 1.0f, 0.0f, WhiteChroma);
+		const FVector3f Anti = HillaireLimits::SunsetSkyMultiplier(-0.02f, -1.0f, 0.0f, WhiteChroma);
+		TestTrue(TEXT("Toward-sun R in warm band"), Toward.X > 1.78f && Toward.X < 1.93f);
+		TestTrue(TEXT("Toward much warmer than anti"), Toward.X > 1.5f * Anti.X);
+		TestTrue(TEXT("Anti-sun twilight present but cooler"),
+			FMath::Abs(Anti.X - 1.0f) > 0.02f && Anti.X < Toward.X);
+		AddInfo(FString::Printf(TEXT("Sunset toward R=%.4f anti R=%.4f"), Toward.X, Anti.X));
+	}
+
+	// (e) Horizon localization: at twilight red the horizon warms far more
+	// than the zenith (red stays low, zenith goes deep blue).
+	{
+		const FVector3f Hor = HillaireLimits::SunsetSkyMultiplier(-0.10f, 1.0f, 0.0f, WhiteChroma);
+		const FVector3f Zen = HillaireLimits::SunsetSkyMultiplier(-0.10f, 1.0f, 1.0f, WhiteChroma);
+		TestTrue(TEXT("Red localized to horizon"), Hor.X > Zen.X + 0.15f);
+	}
+
+	// (f) Warming progression + aerial anchors (hand-verified: aerial R ~1.43,
+	// B ~0.88 at e=-0.02, white sun).
+	{
+		const FVector3f Early = HillaireLimits::SunsetSkyMultiplier(0.10f, 1.0f, 0.0f, WhiteChroma);
+		const FVector3f Late = HillaireLimits::SunsetSkyMultiplier(-0.02f, 1.0f, 0.0f, WhiteChroma);
+		TestTrue(TEXT("R strengthens toward sunset"), Late.X > Early.X);
+		const float EarlyRB = Early.X / FMath::Max(Early.Z, 1e-6f);
+		const float LateRB = Late.X / FMath::Max(Late.Z, 1e-6f);
+		TestTrue(TEXT("Reddening progresses (R/B rises)"), LateRB > EarlyRB);
+		const FVector3f Aer = HillaireLimits::SunsetAerialMultiplier(-0.02f, WhiteChroma);
+		TestTrue(TEXT("Aerial R anchor"), Aer.X > 1.36f && Aer.X < 1.50f);
+		TestTrue(TEXT("Aerial B anchor"), Aer.Z > 0.81f && Aer.Z < 0.94f);
+	}
+
+	// (g) Planet variation: a red star shifts the response (sun-chromaticity
+	// coupling), white sun stays reference (1-ulp tolerance: the luma
+	// weights sum to 1.0 within float rounding).
+	TestTrue(TEXT("White sun chroma is identity"),
+		FMath::Abs(WhiteChroma.X - 1.0f) < 1e-6f
+		&& FMath::Abs(WhiteChroma.Y - 1.0f) < 1e-6f
+		&& FMath::Abs(WhiteChroma.Z - 1.0f) < 1e-6f);
+	{
+		const FVector3f RedChroma = HillaireLimits::SunsetSunChroma(FVector3f(1.0f, 0.35f, 0.15f));
+		const FVector3f RedM = HillaireLimits::SunsetSkyMultiplier(-0.02f, 1.0f, 0.0f, RedChroma);
+		const FVector3f RefM = HillaireLimits::SunsetSkyMultiplier(-0.02f, 1.0f, 0.0f, WhiteChroma);
+		TestTrue(TEXT("Red star shifts sunset (profile-driven variation)"),
+			FMath::Abs(RedM.X - RefM.X) > 0.02f && SkyAllFinite({ FLinearColor(RedM.X, RedM.Y, RedM.Z, 1.0f) }));
+	}
+
+	// (h) Composite level: horizontal-sun fixture, toward vs anti horizon rays
+	// (diag-100 rig) plus a mirrored below-horizon (sunrise) fixture. Sunset
+	// must be strongly asymmetric and warm; sunrise must belong to the same
+	// warm family (not black, not a different effect).
+	{
+		FSkyFixture Sunset, Sunrise;
+		Sunset.Bake(FVector3f(1.0f, 0.0f, 0.0f), 1.0f);
+		Sunrise.Bake(FVector3f(0.99985f, 0.0f, -0.01745f).GetSafeNormal(), 1.0f);
+		const FLinearColor BgBlack(0.0f, 0.0f, 0.0f, 1.0f);
+		const FVector3f WhiteSun(1.0f, 1.0f, 1.0f);
+		auto RunDir = [&](const FSkyFixture& F, const FVector3f& D) -> FLinearColor
+		{
+			return HillaireLutCpu::SampleSkyBackgroundPixel(BgBlack, 0.0f, 0.5f, 0.5f,
+				F.InvProj, SunsetCenterRayRot(D), F.CamLocal, F.SunDir, WhiteSun,
+				F.Profile.BottomRadiusKm, F.Profile.TopRadiusKm, F.ViewHeightKm,
+				F.SkyLut, F.SVW, F.SVH, F.TransLut, F.TW, F.TH, 1.0f);
+		};
+		const FLinearColor SetToward = RunDir(Sunset, FVector3f(1.0f, 0.0f, 0.0f));
+		const FLinearColor SetAnti = RunDir(Sunset, FVector3f(-1.0f, 0.0f, 0.0f));
+		const FLinearColor RiseToward = RunDir(Sunrise, FVector3f(1.0f, 0.0f, 0.0f));
+		TestTrue(TEXT("Sunset rays finite"),
+			SkyAllFinite({ SetToward, SetAnti, RiseToward }));
+		const float LumT = SkyBgLuminance(SetToward), LumA = SkyBgLuminance(SetAnti);
+		const float LumR = SkyBgLuminance(RiseToward);
+		TestTrue(TEXT("Sunset strongly asymmetric toward>>anti"), LumT > 2.0f * LumA);
+		const float RBT = SetToward.R / FMath::Max(SetToward.B, 1e-9f);
+		const float RBA = SetAnti.R / FMath::Max(SetAnti.B, 1e-9f);
+		TestTrue(TEXT("Sunset toward warm absolute (R/B>1)"), RBT > 1.0f);
+		TestTrue(TEXT("Sunset toward redder than anti"), RBT > RBA);
+		const float RBR = RiseToward.R / FMath::Max(RiseToward.B, 1e-9f);
+		TestTrue(TEXT("Sunrise warm too (symmetric family)"), RBR > 1.0f && LumR > 1e-6f);
+		TestTrue(TEXT("Sunrise comparable to sunset (same effect, reversed)"),
+			LumR > 0.2f * LumT && LumR < 5.0f * LumT);
+		AddInfo(FString::Printf(TEXT("Sunset toward L=%.6f R/B=%.3f anti L=%.6f R/B=%.3f sunrise L=%.6f R/B=%.3f"),
+			LumT, RBT, LumA, RBA, LumR, RBR));
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 2d - Aerial presentation scales (distance ramp + entry altitude).
+//
+// Root causes locked here:
+// - Mountain darkness: the flat 0.35 in-scatter scale kept full physical
+//   extinction (1-AP.a) while paying only 35% of the compensating in-scatter,
+//   so far terrain crushed toward black. The distance ramp (0.35 near, 1.0
+//   far, smooth in the slice coordinate) restores the energy balance at
+//   distance while the validated near behavior is bit-preserved.
+// - Entry blue wash: high-altitude columns rendered full in-scatter over the
+//   terrain (surface treated as volume). The altitude scale (1.0 surface,
+//   0.35 top, smooth) keeps entry subtle and restores continuously on descent.
+// Transmittance is never scaled (linearity check); sunset warms (not blues)
+// distant terrain.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FHillaireAerialPresentationScalesTest,
+	"Hillaire.Aerial.PresentationScales",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FHillaireAerialPresentationScalesTest::RunTest(const FString& Parameters)
+{
+	// (a) Pure-function endpoints: near == validated 0.35 (held flat through
+	// the mid range by the knee), far == physical 1.0.
+	// (1-ulp tolerance: FMath::Lerp endpoint arithmetic rounds, e.g.
+	// Lerp(1, 0.35, 1) lands one ulp from 0.35; the composite checks below
+	// lock the wired values to 1e-4.)
+	TestTrue(TEXT("Near endpoint is the validated 0.35"),
+		FMath::Abs(HillaireLimits::AerialDistanceScale(0.125f) - 0.35f) < 1e-6f
+		&& FMath::Abs(HillaireLimits::AerialDistanceScale(0.6f) - 0.35f) < 1e-6f);
+	TestTrue(TEXT("Far endpoint is physical 1.0"),
+		FMath::Abs(HillaireLimits::AerialDistanceScale(1.0f) - 1.0f) < 1e-6f);
+	TestTrue(TEXT("Beyond-range eases toward the haze asymptote"),
+		FMath::Abs(HillaireLimits::AerialDistanceScale(1.5f) - 0.775f) < 1e-4f
+		&& FMath::Abs(HillaireLimits::AerialDistanceScale(2.0f) - 0.55f) < 1e-3f
+		&& FMath::Abs(HillaireLimits::AerialDistanceScale(5.0f) - 0.55f) < 1e-6f);
+	TestTrue(TEXT("Surface altitude is 1.0"), HillaireLimits::AerialAltitudeScale(0.0f) == 1.0f);
+	TestTrue(TEXT("Top altitude is entry-min 0.25"),
+		FMath::Abs(HillaireLimits::AerialAltitudeScale(1.0f) - 0.25f) < 1e-6f);
+	TestTrue(TEXT("Altitude clamps outside [0,1]"),
+		HillaireLimits::AerialAltitudeScale(-1.0f) == 1.0f
+		&& FMath::Abs(HillaireLimits::AerialAltitudeScale(2.0f) - 0.25f) < 1e-6f);
+
+	// (b) Shape: non-decreasing out to full coverage (w = 1), then a smooth
+	// C1 ease down to the beyond-range haze asymptote (no steps anywhere).
+	{
+		float PrevD = HillaireLimits::AerialDistanceScale(0.0f);
+		float MaxStepD = 0.0f;
+		bool bMonoUp = true;
+		for (float W = 0.01f; W <= 1.0f; W += 0.01f)
+		{
+			const float V = HillaireLimits::AerialDistanceScale(W);
+			bMonoUp &= V >= PrevD;
+			MaxStepD = FMath::Max(MaxStepD, V - PrevD);
+			PrevD = V;
+		}
+		TestTrue(TEXT("Distance ramp monotonic non-decreasing to w=1"), bMonoUp);
+		TestTrue(TEXT("Distance ramp continuous to w=1"), MaxStepD < 0.05f);
+		TestTrue(TEXT("Distance ramp peaks at full coverage"),
+			FMath::Abs(HillaireLimits::AerialDistanceScale(1.0f) - 1.0f) < 1e-6f);
+		float PrevB = HillaireLimits::AerialDistanceScale(1.0f);
+		float MaxStepB = 0.0f;
+		bool bMonoDown = true;
+		for (float W = 1.01f; W <= 3.0f; W += 0.01f)
+		{
+			const float V = HillaireLimits::AerialDistanceScale(W);
+			bMonoDown &= V <= PrevB + 1e-6f;
+			MaxStepB = FMath::Max(MaxStepB, PrevB - V);
+			PrevB = V;
+		}
+		TestTrue(TEXT("Beyond-range ease monotonic non-increasing"), bMonoDown);
+		TestTrue(TEXT("Beyond-range ease continuous"), MaxStepB < 0.05f);
+		TestTrue(TEXT("Beyond-range settles on the asymptote"),
+			HillaireLimits::AerialDistanceScale(3.0f) >= 0.54f);
+		float PrevA = HillaireLimits::AerialAltitudeScale(0.0f);
+		float MaxStepA = 0.0f;
+		bool bMonoA = true;
+		for (float H = 0.01f; H <= 1.0f; H += 0.01f)
+		{
+			const float V = HillaireLimits::AerialAltitudeScale(H);
+			bMonoA &= V <= PrevA;
+			MaxStepA = FMath::Max(MaxStepA, PrevA - V);
+			PrevA = V;
+		}
+		TestTrue(TEXT("Altitude ramp monotonic non-increasing"), bMonoA);
+		TestTrue(TEXT("Altitude ramp continuous"), MaxStepA < 0.10f);
+	}
+
+	// (c) Composite with a synthetic constant volume (32^3, transfer + opacity
+	// known exactly): near identity, far physical, entry attenuated, sunset
+	// reddened, transmittance linear, sky passthrough.
+	const int32 VW = HillaireLimits::AerialVolumeSize;
+	TArray<FLinearColor> Volume;
+	Volume.Init(FLinearColor(0.02f, 0.03f, 0.05f, 0.4f), VW * VW * VW);
+	const FLinearColor Scene(0.4f, 0.3f, 0.2f, 1.0f);
+	const FVector3f WhiteSun(1.0f, 1.0f, 1.0f);
+	const float KmPerSlice = 0.04f; // 1.0 km envelope / 25
+
+	FMatrix NearInvProj(EForceInit::ForceInitToZero);
+	NearInvProj.M[0][0] = 100.0; NearInvProj.M[1][1] = 100.0; NearInvProj.M[2][2] = 100.0; NearInvProj.M[3][3] = 1.0;
+	// Far: center-pixel path 1.28 km = Slice 32 on a 0.04 slice (w = 1.0
+	// exactly: full-coverage endpoint, scale exactly 1.0).
+	FMatrix FarInvProj(EForceInit::ForceInitToZero);
+	FarInvProj.M[0][0] = 256000.0; FarInvProj.M[1][1] = 256000.0; FarInvProj.M[2][2] = 256000.0; FarInvProj.M[3][3] = 1.0;
+	// Beyond coverage: w = 1.5 (2.88 km, scale 0.775) and w = 2.0 (5.12 km,
+	// scale 0.55): the clamped deepest slice must not compound the full x30
+	// veil on unrepresentative marches.
+	FMatrix Beyond15InvProj(EForceInit::ForceInitToZero);
+	Beyond15InvProj.M[0][0] = 576000.0; Beyond15InvProj.M[1][1] = 576000.0; Beyond15InvProj.M[2][2] = 576000.0; Beyond15InvProj.M[3][3] = 1.0;
+	FMatrix Beyond20InvProj(EForceInit::ForceInitToZero);
+	Beyond20InvProj.M[0][0] = 1024000.0; Beyond20InvProj.M[1][1] = 1024000.0; Beyond20InvProj.M[2][2] = 1024000.0; Beyond20InvProj.M[3][3] = 1.0;
+
+	// Sky pixels pass through identical (no aerial on background).
+	{
+		const FLinearColor SkyOut = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.0f, 0.5f, 0.5f, NearInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, 1.0f);
+		TestTrue(TEXT("Sky pixel identity"),
+			SkyOut.R == Scene.R && SkyOut.G == Scene.G && SkyOut.B == Scene.B && SkyOut.A == Scene.A);
+	}
+
+	// Near terrain keeps native identity (validated behavior preserved).
+	{
+		const FLinearColor NearOut = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, NearInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, 1.0f);
+		TestTrue(TEXT("Near terrain native (<5% deviation)"),
+			FMath::Abs(NearOut.R - Scene.R) / Scene.R < 0.05f
+			&& FMath::Abs(NearOut.G - Scene.G) / Scene.G < 0.05f
+			&& FMath::Abs(NearOut.B - Scene.B) / Scene.B < 0.05f);
+		AddInfo(FString::Printf(TEXT("Near out=(%.6f,%.6f,%.6f)"), NearOut.R, NearOut.G, NearOut.B));
+	}
+
+	// Far terrain at the surface restores the full physical composite
+	// (Out = Scene*(1-A) + Sun*AP): the mountain-darkness fix. w = 1.0
+	// exactly here, so the beyond-range ease does not participate.
+	{
+		const FLinearColor FarOut = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, FarInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, 1.0f);
+		TestTrue(TEXT("Far terrain full physical composite"),
+			FMath::Abs(FarOut.R - (0.4f * 0.6f + 0.02f)) < 1e-4f
+			&& FMath::Abs(FarOut.G - (0.3f * 0.6f + 0.03f)) < 1e-4f
+			&& FMath::Abs(FarOut.B - (0.2f * 0.6f + 0.05f)) < 1e-4f);
+		AddInfo(FString::Printf(TEXT("Far out=(%.6f,%.6f,%.6f)"), FarOut.R, FarOut.G, FarOut.B));
+	}
+
+	// Beyond coverage (w = 1.5/2.0): the ease trims the veil on stale
+	// clamped samples (0.775/0.55) while transmittance stays untouched.
+	{
+		const FLinearColor B15 = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, Beyond15InvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, 1.0f);
+		TestTrue(TEXT("Beyond-range w=1.5 eased veil"),
+			FMath::Abs(B15.R - (0.4f * 0.6f + 0.02f * 0.775f)) < 1e-4f
+			&& FMath::Abs(B15.G - (0.3f * 0.6f + 0.03f * 0.775f)) < 1e-4f
+			&& FMath::Abs(B15.B - (0.2f * 0.6f + 0.05f * 0.775f)) < 1e-4f);
+		const FLinearColor B20 = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, Beyond20InvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, 1.0f);
+		TestTrue(TEXT("Beyond-range w=2.0 at asymptote"),
+			FMath::Abs(B20.R - (0.4f * 0.6f + 0.02f * 0.55f)) < 1e-4f
+			&& FMath::Abs(B20.G - (0.3f * 0.6f + 0.03f * 0.55f)) < 1e-4f
+			&& FMath::Abs(B20.B - (0.2f * 0.6f + 0.05f * 0.55f)) < 1e-4f);
+		AddInfo(FString::Printf(TEXT("Beyond w=1.5 (%.6f,%.6f,%.6f) w=2.0 (%.6f,%.6f,%.6f)"),
+			B15.R, B15.G, B15.B, B20.R, B20.G, B20.B));
+	}
+
+	// Entry (just inside the top, alt 0.98): subtle in-scatter over the
+	// physical transmittance (surface stays a surface, no blue volume).
+	// The boundary fade is exactly 1.0 here (full just inside, 0 at the
+	// boundary for continuity with the outside gate).
+	{
+		TestTrue(TEXT("Boundary fade full just inside"),
+			FMath::Abs(HillaireLimits::AerialBoundaryFade(0.98f) - 1.0f) < 1e-6f);
+		TestTrue(TEXT("Boundary fade half at mid-blend"),
+			FMath::Abs(HillaireLimits::AerialBoundaryFade(0.995f) - 0.5f) < 1e-6f);
+		TestTrue(TEXT("Boundary fade zero at the top"),
+			HillaireLimits::AerialBoundaryFade(1.0f) == 0.0f);
+		const FLinearColor EntryOut = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, FarInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.98f, 1.0f);
+		TestTrue(TEXT("Entry attenuates in-scatter only"),
+			FMath::Abs(EntryOut.R - (0.4f * 0.6f + 0.02f * 0.25f)) < 1e-3f
+			&& FMath::Abs(EntryOut.G - (0.3f * 0.6f + 0.03f * 0.25f)) < 1e-3f
+			&& FMath::Abs(EntryOut.B - (0.2f * 0.6f + 0.05f * 0.25f)) < 1e-3f);
+		const FLinearColor FarOut = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, FarInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, 1.0f);
+		TestTrue(TEXT("Entry subtler than surface (continuous descent restores)"),
+			SkyBgLuminance(EntryOut) < SkyBgLuminance(FarOut));
+	}
+
+	// Exact boundary (alt 1.0): inscatter fully faded, transmittance intact
+	// (bit-continuous with the outside identity path).
+	{
+		const FLinearColor EdgeOut = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, FarInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 1.0f, 1.0f);
+		TestTrue(TEXT("Boundary passes transmittance only"),
+			FMath::Abs(EdgeOut.R - 0.4f * 0.6f) < 1e-4f
+			&& FMath::Abs(EdgeOut.G - 0.3f * 0.6f) < 1e-4f
+			&& FMath::Abs(EdgeOut.B - 0.2f * 0.6f) < 1e-4f);
+	}
+
+	// Sunset warms (reddens) distant terrain instead of bluing it.
+	{
+		const FLinearColor DayOut = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, FarInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, 1.0f);
+		const FLinearColor SetOut = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, FarInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, -0.02f);
+		const float DayAddR = DayOut.R - Scene.R * 0.6f, DayAddB = DayOut.B - Scene.B * 0.6f;
+		const float SetAddR = SetOut.R - Scene.R * 0.6f, SetAddB = SetOut.B - Scene.B * 0.6f;
+		TestTrue(TEXT("Sunset adds warm (not blue) in-scatter"),
+			SetAddR / FMath::Max(SetAddB, 1e-9f) > 0.02f / 0.05f);
+		TestTrue(TEXT("Sunset R in-scatter exceeds day"), SetAddR > DayAddR);
+		AddInfo(FString::Printf(TEXT("Aerial added R/B day=%.3f sunset=%.3f"),
+			DayAddR / FMath::Max(DayAddB, 1e-9f), SetAddR / FMath::Max(SetAddB, 1e-9f)));
+	}
+
+	// Transmittance path is never presentation-scaled: doubling the scene
+	// doubles exactly the transmitted part, in-scatter unchanged.
+	{
+		const FLinearColor O1 = HillaireLutCpu::CompositeAerialPixel(
+			Scene, 0.5f, 0.5f, 0.5f, FarInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, -0.02f);
+		const FLinearColor O2 = HillaireLutCpu::CompositeAerialPixel(
+			FLinearColor(Scene.R * 2.0f, Scene.G * 2.0f, Scene.B * 2.0f, 1.0f),
+			0.5f, 0.5f, 0.5f, FarInvProj, Volume, VW, VW, VW,
+			WhiteSun, 1.0f, KmPerSlice, 0.0f, -0.02f);
+		TestTrue(TEXT("Transmittance linear (presentation never touches it)"),
+			FMath::Abs((O2.R - O1.R) - Scene.R * 0.6f) < 1e-4f
+			&& FMath::Abs((O2.G - O1.G) - Scene.G * 0.6f) < 1e-4f
+			&& FMath::Abs((O2.B - O1.B) - Scene.B * 0.6f) < 1e-4f);
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Test 3 - Composite equation (reference: sky + T * background).
 // ---------------------------------------------------------------------------
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FHillaireSkyBackgroundCompositeEquationTest,
@@ -393,6 +955,13 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FHillaireSkyBackgroundGpuExecutionTest,
 
 bool FHillaireSkyBackgroundGpuExecutionTest::RunTest(const FString& Parameters)
 {
+	// NullRHI/commandlet: no render device, RDG cannot run (same guard as
+	// RealPlanetFrame: skip the GPU half explicitly instead of crashing).
+	if (!FApp::CanEverRender())
+	{
+		AddInfo(TEXT("GPU execution skipped (no render device / NullRHI)."));
+		return true;
+	}
 	// ---- GT: planet + overhead sun -> snapshot (mirrors Phase-2D GPU test) ----
 	FHillaireAtmosphereProfile Profile = FHillaireAtmosphereProfile::MakeReferenceProfile();
 

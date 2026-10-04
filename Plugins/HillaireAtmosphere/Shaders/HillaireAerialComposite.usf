@@ -63,6 +63,13 @@ float2 ViewRectSize;
 // Slice depth: tDepth / AerialKmPerSlice (per-planet: envelope / 25, so the
 // volume resolution and the near fade are atmosphere-relative; see HillaireLimits).
 float AerialKmPerSlice;
+// Camera height fraction inside the envelope (0 = surface, 1 = top): drives
+// the entry/high-altitude presentation scale (subtle in-scatter over the full
+// column, continuous with descent). Computed on the CPU from ViewHeightKm.
+float AerialAltitude01;
+// Sun elevation cosine at the camera up (drives the elevation-only sunset
+// response on distant terrain; no per-pixel sun frame exists here).
+float AerialSunElevCos;
 // Sky/background device-Z threshold (reversed-Z: 0 = far).
 float SkyDepthEpsilon;
 
@@ -94,7 +101,8 @@ void MainCS(uint3 DispatchId : SV_DispatchThreadID)
 	float3 ClipSpace = float3(ViewUv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), DeviceZ);
 	float4 HViewPos = mul(float4(ClipSpace, 1.0f), InvProjMatrix);
 	float3 ViewPos = HViewPos.xyz / HViewPos.w;
-	float tDepth = length(ViewPos);
+	// View space is cm (UE); AerialKmPerSlice is km. Convert once.
+	float tDepth = length(ViewPos) * HILLAIRE_KM_PER_CM;
 
 	// Slice mapping + near fade (reference lines 489-497 verbatim).
 	float Slice = tDepth / AerialKmPerSlice;
@@ -114,7 +122,26 @@ void MainCS(uint3 DispatchId : SV_DispatchThreadID)
 
 	// Composite (reference lines 500-510, pre-exposed buffer space):
 	// transmit background, add sun-scaled inscatter. Alpha preserved.
+	// VISUAL CALIBRATION PASS 2 (NMS-style depth + sunset response):
+	// - distance ramp: near terrain keeps the validated 0.35 (native
+	//   albedo/lighting), far terrain regains the full physical in-scatter so
+	//   mountains integrate into haze instead of crushing to black; past the
+	//   volume coverage the presentation eases toward a haze asymptote (pass
+	//   3: clamped deepest slices are stale corner-cutting marches and must
+	//   not compound the full x30 veil with distance);
+	// - altitude scale: high-altitude/entry columns render subtle in-scatter
+	//   over transmittance-attenuated terrain (surface stays a surface),
+	//   descending restores the full response continuously;
+	// - elevation bands: distant terrain picks up the continuous
+	//   violet->pink->gold->orange->red progression with solar elevation.
+	// ALL presentation applies ONLY to the in-scatter term: transmittance is
+	// untouched (physical), the sky dome is untouched (own SunScale path).
 	float3 Transmitted = SceneColor.rgb * (1.0f - AP.a);
-	float3 Inscatter = SunColorAttenuation * AP.rgb * View.PreExposure;
+	float AerialPresentation = HillaireAerialDistanceScale(w) * HillaireAerialAltitudeScale(AerialAltitude01)
+		* HillaireAerialBoundaryFade(AerialAltitude01);
+	float SunLuma = dot(SunColorAttenuation, float3(0.2126f, 0.7152f, 0.0722f));
+	float3 SunChroma = clamp(SunColorAttenuation / max(SunLuma, 1e-6f), 0.3f, 2.0f);
+	float3 SunsetMult = HillaireSunsetAerialMultiplier(AerialSunElevCos, SunChroma);
+	float3 Inscatter = SunColorAttenuation * AP.rgb * View.PreExposure * AerialPresentation * SunsetMult;
 	CompositeOutputUav[BufferPixel] = float4(Transmitted + Inscatter, SceneColor.a);
 }

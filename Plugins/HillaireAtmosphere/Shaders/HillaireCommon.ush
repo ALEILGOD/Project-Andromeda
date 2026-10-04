@@ -18,6 +18,285 @@
 
 #define HILLAIRE_PI 3.1415926535897932384626433832795f
 
+// UE view/projection matrices are in cm; the atmosphere march, planet radii
+// and the atmosphere-relative aerial slice depth (AerialKmPerSlice) are in km.
+// The aerial composite reconstructs a view-space position from the projection
+// inverse (cm) and MUST convert it to km before dividing by AerialKmPerSlice.
+// Without this the depth quotient is ~1e5x too large, w saturates to 1, and
+// every opaque pixel samples the deepest (full-column) froxel - a uniform
+// atmospheric wash over the whole planetary surface.
+#define HILLAIRE_KM_PER_CM 1e-5f
+
+// ---------------------------------------------------------------------------
+// Space-limb presentation scale.
+//
+// The atmosphere viewed from OUTSIDE the volume (camera beyond TopRadius) is a
+// thin grazing shell whose unit-transfer radiance, multiplied by the sky's
+// SunScale, reads slightly too strong against the black background. This is an
+// ISOLATED presentation/radiance scale applied ONLY to the outside-limb path
+// (never to the inside sky dome, never to the physical atmosphere): the
+// illuminated limb stays clearly visible, the twilight limb is preserved, and
+// there is no cutoff. 1.0 = unmodified.
+// ---------------------------------------------------------------------------
+#define HILLAIRE_LIMB_RADIANCE_SCALE 0.80f
+
+// ---------------------------------------------------------------------------
+// Aerial inscatter presentation scale (VISUAL CALIBRATION ONLY).
+//
+// The aerial volume + composite are physically correct (cm->km depth,
+// envelope-relative slices, distance-dependent Weight), and the sky needs
+// SunScale = 30 to lift the thin 1.10x dome into daylight. That same x30 on
+// the SHORT near-surface aerial paths (envelope-normalized density preserves
+// vertical OD, so volumetric sigma is high on 0.25-1.2 km envelopes) makes
+// even a 10 m path add a visible blue veil (~20% on albedo 0.2) and drives
+// the "planet too blue" report. This ISOLATED scale applies ONLY to the
+// aerial inscatter term (never to transmittance, never to the sky dome,
+// never to the physical LUTs). 1.0 = unmodified.
+//
+// CALIBRATION PASS 2 (NMS-style depth response): the flat value below is now
+// the NEAR endpoint of a distance ramp (HillaireAerialDistanceScale), not a
+// global multiplier. A flat 0.35 keeps near terrain native but starves FAR
+// terrain: the physical extinction (1-AP.a) stays full while only 35% of the
+// compensating in-scatter remains, so distant mountains crush toward black
+// instead of integrating into haze. The ramp restores the full physical
+// in-scatter with distance (0.35 near -> 1.0 far, smooth in the slice
+// coordinate w), preserving the validated near behavior exactly while the
+// far field regains its energy balance. Transmittance is still untouched.
+// ---------------------------------------------------------------------------
+#define HILLAIRE_AERIAL_INSCATTER_SCALE 0.35f
+
+// Far endpoint of the aerial distance ramp: full physical in-scatter, so the
+// transmittance/in-scatter energy balance of the reference composite is
+// restored at distance (distant haze, readable mountains, warm sunset
+// integration instead of black silhouettes).
+#define HILLAIRE_AERIAL_FAR_SCALE 1.0f
+
+// Beyond-range haze asymptote (CALIBRATION PASS 3, measured).
+//
+// Past the volume coverage (w > 1, i.e. paths longer than ~1.28 envelopes)
+// the composite clamps to the deepest slice, whose under-ground clamp-out
+// bends the march toward a nearer ground point that then truncates at first
+// ground contact: the sample is a SHORT-path march presented as a LONG path,
+// so paying the full x30 veil on it over-fogs distant vistas (measured far
+// veil ~57% of terrain luminance, blue-shifted). The presentation therefore
+// eases 1.0 -> 0.55 over w in [1, 2] (C1 at w = 1, constant beyond): far
+// terrain keeps its (readable) transmittance and a mild haze instead of a
+// compounding blue wash. w <= 1 is bit-identical to the validated ramp.
+#define HILLAIRE_AERIAL_BEYOND_ASYMPTOTE 0.55f
+
+// Knee of the distance ramp: the near value holds for w <= 0.7 (near fade
+// point sqrt(0.5/32) = 0.125 lies deep inside the flat), full release at
+// w = 1.0. Must match HILLAIRE_AERIAL_RAMP_KNEE_W.
+#define HILLAIRE_AERIAL_RAMP_KNEE_W 0.70f
+
+// Distance-dependent aerial presentation (control 1: normal inside-atmosphere
+// aerial perspective). w is the composite slice coordinate
+// (sqrt(Slice/VolumeDepth)): 0.125 at the near-fade point, 1.0 at the deepest
+// slice, beyond for longer paths. Pure smoothstep ramps, C1 everywhere, no
+// thresholds.
+//
+// CALIBRATION PASS 3 (measured): the envelope-normalized density preserves
+// the VERTICAL optical depth but makes ground-level air ~30-50x denser than
+// terrestrial sea-level air, so mid-range paths through low dense air
+// (w ~0.4-0.7, e.g. 0.5 km at 0.6/km) carry transfers whose x30 veil exceeds
+// 2x terrain luminance, blue-shifted. The ramp therefore HOLDS the near value
+// through the mid range and releases only toward true far paths (knee at
+// w = 0.7, full at w = 1 for horizon continuity): near stays native, mid
+// stays subtle, far integrates. Endpoints bit-preserved (0.35 near, 1.0 far).
+float HillaireAerialDistanceScale(float SliceW)
+{
+	float Knee = saturate((SliceW - HILLAIRE_AERIAL_RAMP_KNEE_W) / (1.0f - HILLAIRE_AERIAL_RAMP_KNEE_W));
+	float S = Knee * Knee * (3.0f - 2.0f * Knee);
+	float NearFar = lerp(HILLAIRE_AERIAL_INSCATTER_SCALE, HILLAIRE_AERIAL_FAR_SCALE, S);
+	float B = saturate(SliceW - 1.0f);
+	float BS = B * B * (3.0f - 2.0f * B);
+	return NearFar * lerp(1.0f, HILLAIRE_AERIAL_BEYOND_ASYMPTOTE, BS);
+}
+
+// ---------------------------------------------------------------------------
+// Atmosphere-entry / high-altitude aerial presentation (control 2).
+//
+// From high altitude the camera-to-surface column carries a large optical
+// depth whose physical in-scatter (x30 sun) dominates the terrain: the planet
+// reads as a blue atmospheric volume instead of a surface seen THROUGH air.
+// This ISOLATED composite-time scale makes the entry transition continuous:
+// high altitude renders subtle in-scatter over transmittance-attenuated
+// terrain (identity preserved), descending restores the full distance-ramped
+// response smoothly. Applied ONLY to the aerial in-scatter term (never to
+// transmittance, never to LUTs, never to the sky dome). Input is the camera
+// height fraction inside the envelope (0 = surface, 1 = top).
+// ---------------------------------------------------------------------------
+// High-altitude endpoint of the entry scale (CALIBRATION PASS 3: measured
+// full-column entry veil +26% luminance, blue-shifted, at 0.35; 0.25 brings
+// it to ~+18% while the descent curve shape is unchanged).
+#define HILLAIRE_AERIAL_ENTRY_MIN_SCALE 0.25f
+
+float HillaireAerialAltitudeScale(float Altitude01)
+{
+	float T = saturate(Altitude01);
+	float S = T * T * (3.0f - 2.0f * T);
+	return lerp(1.0f, HILLAIRE_AERIAL_ENTRY_MIN_SCALE, S);
+}
+
+// ---------------------------------------------------------------------------
+// Atmosphere-boundary continuity (CALIBRATION PASS 4, Issue C).
+//
+// The aerial composite is gated to the inside volume while the outside gets
+// limb scattering: without a blend, crossing the top steps aerial 0 -> full
+// (up to 0.25 x full-veil on the full column) and the limb 0.80 -> 1.0 in one
+// frame, reading as two separate atmospheres. This fade eases the INSIDE
+// aerial presentation 0 -> 1 over the top 1% of the envelope (C1, no
+// threshold): exactly 0 at the boundary (continuous with the outside gate),
+// full just inside. Altitude input is the same camera fraction the altitude
+// scale uses (0 = surface, 1 = top).
+// ---------------------------------------------------------------------------
+#define HILLAIRE_AERIAL_BOUNDARY_FADE_WIDTH 0.01f
+
+float HillaireAerialBoundaryFade(float Altitude01)
+{
+	float T = saturate((1.0f - Altitude01) / HILLAIRE_AERIAL_BOUNDARY_FADE_WIDTH);
+	float S = T * T * (3.0f - 2.0f * T);
+	return S;
+}
+
+// ---------------------------------------------------------------------------
+// Continuous solar-elevation sunset response (CALIBRATION PASS 2).
+//
+// The previous terminator smoothstep is a single scalar luminance gate: DAY
+// -> factor -> warm band -> dark, i.e. the "a blocchi" look. The SkyView LUT
+// already carries the physical solar-elevation response (long-path reddening,
+// Mie forward lobe, violet 90-degree scatter, earth shadow), but the single
+// gate plus the narrow forward lobe collapse the visible progression. These
+// FIVE OVERLAPPING smooth elevation bands re-balance the LUT radiance per
+// channel so the physical stages read as a broad continuous progression
+// (violet -> pink -> gold -> orange -> red) instead of one thin line.
+//
+// This is NOT a hard color-band post-process:
+// - every band is a smoothstep rise x smoothstep fall in sun-elevation
+//   cosine (C1, no thresholds, heavy overlap: several bands are partially
+//   active at every twilight elevation);
+// - every band is further masked by smooth sun-direction proximity (warmest
+//   toward the sun, cooler anti-sun twilight) and smooth horizon proximity
+//   (warmest low, zenith stays blue);
+// - the response MULTIPLIES the existing LUT transfer (never SceneColor,
+//   never the full frame, never exposure/ACES): hue stages emerge from the
+//   scattering structure, presentation only re-balances them;
+// - it is a pure function of (SunElevCos, sun-view geometry, sun chromaticity)
+//   with no sign branches, so sunrise traverses the identical progression in
+//   reverse (symmetric by construction);
+// - planet variation is preserved: band hues mix toward the resolved sun
+//   chromaticity (white sun = reference hues, red/blue stars shift dawn/dusk),
+//   and the underlying LUT stays profile-driven (Rayleigh/Mie/ozone).
+// The terminator gate below is RETAINED UNCHANGED as the safety/visibility
+// control (night extinction); the bands shape the color INSIDE its window.
+// ---------------------------------------------------------------------------
+
+// One overlapping band: smooth rise [Rise0,Rise1], plateau, smooth fall
+// [Fall0,Fall1]. Exact 0 outside (day clean, night extinct), exact plateau
+// handling, C1 at every edge.
+float HillaireSunsetBand(float SunElevCos, float Rise0, float Rise1, float Fall0, float Fall1)
+{
+	return smoothstep(Rise0, Rise1, SunElevCos) * (1.0f - smoothstep(Fall0, Fall1, SunElevCos));
+}
+
+// Band hues are scattering-physics anchors (violet/pink/gold/orange/red);
+// SunChroma (resolved sun color / its luma, ~1 for a white sun) lets the
+// governing star shift dawn/dusk without new uniforms or planet palettes.
+float3 HillaireSunsetTint(float3 BaseTint, float3 SunChroma)
+{
+	return lerp(BaseTint, BaseTint * SunChroma, 0.5f);
+}
+
+// Full directional sky response: elevation bands x sun proximity x horizon
+// proximity. LightViewCos: -1 (anti-sun) .. +1 (toward sun). ViewZenithCos:
+// -1 (nadir) .. 0 (horizon) .. +1 (zenith); the horizon mask uses 1-z^2
+// (parabolic: C1 everywhere, 1 at the horizon, 0 at zenith AND nadir, no
+// abs() cusp on the horizon row).
+float3 HillaireSunsetSkyMultiplier(float SunElevCos, float LightViewCos, float ViewZenithCos, float3 SunChroma)
+{
+	float SunProx = saturate(LightViewCos * 0.5f + 0.5f);
+	float Horizon = saturate(1.0f - ViewZenithCos * ViewZenithCos);
+
+	float WViol = HillaireSunsetBand(SunElevCos, -0.04f, 0.00f, 0.08f, 0.20f);
+	float WPink = HillaireSunsetBand(SunElevCos, -0.11f, -0.05f, 0.02f, 0.10f);
+	float WGold = HillaireSunsetBand(SunElevCos, -0.07f, -0.02f, 0.04f, 0.12f);
+	float WOran = HillaireSunsetBand(SunElevCos, -0.14f, -0.07f, -0.01f, 0.06f);
+	float WRed  = HillaireSunsetBand(SunElevCos, -0.20f, -0.14f, -0.08f, -0.02f);
+
+	// Directional masks: violet/pink/red stay broad (visible 90 deg off-sun,
+	// cooler anti-sun twilight); gold/orange concentrate around the sun with
+	// LOW powers (broad halo, not a pinhole lobe). Red binds tightest to the
+	// low horizon; violet reaches highest.
+	float MV = lerp(0.55f, 1.0f, SunProx) * lerp(0.45f, 1.0f, Horizon);
+	float MP = lerp(0.45f, 1.0f, SunProx) * lerp(0.30f, 1.0f, Horizon);
+	float MG = SunProx * lerp(0.15f, 1.0f, Horizon);
+	float MO = SunProx * SunProx * lerp(0.10f, 1.0f, Horizon);
+	float MR = lerp(0.35f, 1.0f, SunProx) * lerp(0.05f, 1.0f, Horizon);
+
+	float3 Mult = float3(1.0f, 1.0f, 1.0f);
+	Mult += (HillaireSunsetTint(float3(1.10f, 0.85f, 1.30f), SunChroma) - 1.0f) * (WViol * MV * 0.40f);
+	Mult += (HillaireSunsetTint(float3(1.35f, 0.80f, 1.25f), SunChroma) - 1.0f) * (WPink * MP * 0.52f);
+	Mult += (HillaireSunsetTint(float3(1.45f, 1.15f, 0.75f), SunChroma) - 1.0f) * (WGold * MG * 0.58f);
+	Mult += (HillaireSunsetTint(float3(1.60f, 0.95f, 0.55f), SunChroma) - 1.0f) * (WOran * MO * 0.65f);
+	Mult += (HillaireSunsetTint(float3(1.50f, 0.70f, 0.60f), SunChroma) - 1.0f) * (WRed * MR * 0.58f);
+	return Mult;
+}
+
+// Elevation-only aerial response: distant terrain integrates the warm
+// atmosphere uniformly (no per-pixel sun frame exists in the aerial composite,
+// and uniform warm integration is the desired terrain behavior). Half
+// strength preserves albedo identity while the mountains pick up the
+// pink/gold/orange progression with solar elevation.
+float3 HillaireSunsetAerialMultiplier(float SunElevCos, float3 SunChroma)
+{
+	float WViol = HillaireSunsetBand(SunElevCos, -0.04f, 0.00f, 0.08f, 0.20f);
+	float WPink = HillaireSunsetBand(SunElevCos, -0.11f, -0.05f, 0.02f, 0.10f);
+	float WGold = HillaireSunsetBand(SunElevCos, -0.07f, -0.02f, 0.04f, 0.12f);
+	float WOran = HillaireSunsetBand(SunElevCos, -0.14f, -0.07f, -0.01f, 0.06f);
+	float WRed  = HillaireSunsetBand(SunElevCos, -0.20f, -0.14f, -0.08f, -0.02f);
+
+	float3 Mult = float3(1.0f, 1.0f, 1.0f);
+	Mult += (HillaireSunsetTint(float3(1.10f, 0.85f, 1.30f), SunChroma) - 1.0f) * (WViol * 0.20f);
+	Mult += (HillaireSunsetTint(float3(1.35f, 0.80f, 1.25f), SunChroma) - 1.0f) * (WPink * 0.26f);
+	Mult += (HillaireSunsetTint(float3(1.45f, 1.15f, 0.75f), SunChroma) - 1.0f) * (WGold * 0.29f);
+	Mult += (HillaireSunsetTint(float3(1.60f, 0.95f, 0.55f), SunChroma) - 1.0f) * (WOran * 0.325f);
+	Mult += (HillaireSunsetTint(float3(1.50f, 0.70f, 0.60f), SunChroma) - 1.0f) * (WRed * 0.29f);
+	return Mult;
+}
+
+// ---------------------------------------------------------------------------
+// Terminator / solar-elevation gate.
+//
+// The normalized volumetric density fills the full 1.10x envelope, so the
+// optically significant atmosphere reaches a large height and the geometric
+// earth shadow keeps the upper limb illuminated far past civil twilight (the
+// top of this envelope is still lit with the sun ~25 deg below the horizon).
+// The LUT content is physically correct for that atmosphere; the terminator is
+// enforced at COMPOSITE time with the same smooth solar-elevation curve the
+// ZEPHYR presentation layer already uses (ZephyrTypes.h
+// ZephyrPresentation::DaylightFactor), evaluated at the ray's atmosphere point
+// (entry point outside, camera up inside). It is a scalar luminance gate on
+// the geometric terminator, not a color overlay: it preserves the LUT's warm
+// sunset/reddened in-scatter and only removes the over-driven
+// (tonemap-desaturating) and night-side energy.
+//
+// VISUAL CALIBRATION: the previous (-0.12, 0.25) window gated the sunset
+// itself (factor ~0.27 at elev 0, ~0.32 at +1 deg), collapsing the warm band
+// into a thin weak line and dropping to black too fast. The widened
+// (-0.20, 0.10) window keeps factor ~0.74 at the horizon (broad warm
+// region survives), ~0.25 at -6 deg (twilight contracts gradually),
+// 0 at ~-11.5 deg (night still extinct), 1 above ~+5.7 deg (day preserved).
+// ---------------------------------------------------------------------------
+#define HILLAIRE_TERMINATOR_BEGIN_ELEV_COS (-0.20f) // nautical twilight (~-11.5 deg)
+#define HILLAIRE_TERMINATOR_FULL_ELEV_COS (0.10f)   // full day (~5.7 deg)
+
+float HillaireTerminatorFactor(float SunElevationCos)
+{
+	float T = saturate((SunElevationCos - HILLAIRE_TERMINATOR_BEGIN_ELEV_COS)
+		/ (HILLAIRE_TERMINATOR_FULL_ELEV_COS - HILLAIRE_TERMINATOR_BEGIN_ELEV_COS));
+	return T * T * (3.0f - 2.0f * T);
+}
+
 // Stellar disk radiance, relative to the resolved sun throughput (disk
 // luminance = HILLAIRE_SUN_DISK_RADIANCE * SunColorAttenuation * PreExposure).
 // The DX11 reference used an arbitrary 1e6 for a bloom-free, tonemap-clamped

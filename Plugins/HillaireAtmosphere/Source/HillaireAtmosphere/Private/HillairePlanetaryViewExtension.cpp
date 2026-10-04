@@ -550,6 +550,20 @@ FScreenPassTexture FHillairePlanetaryViewExtension::PlanetaryCompositePass(
 					ScaledSunAttenuation,
 					HillaireLimits::AerialKmPerSliceForEnvelope(
 						GoverningPlanet->Profile.TopRadiusKm - GoverningPlanet->Profile.BottomRadiusKm),
+					// CALIBRATION PASS 2 presentation inputs: camera altitude
+					// fraction in the envelope (entry continuity) + sun
+					// elevation at the camera up (terrain sunset response).
+					// Transmittance stays physical; only the in-scatter term
+					// is presentation-scaled, in the shader and its CPU mirror.
+					FMath::Clamp(
+						(GoverningPlanet->ViewHeightKm - GoverningPlanet->Profile.BottomRadiusKm)
+							/ FMath::Max(GoverningPlanet->Profile.TopRadiusKm - GoverningPlanet->Profile.BottomRadiusKm, 1e-6f),
+						0.0f, 1.0f),
+					CompositeFrame.bValid ? CompositeFrame.SunElevationCos
+						: HillairePlanetMath::SunElevationCos(
+							GoverningPlanet->StarDirectionLocal,
+							HillairePlanetMath::CameraUpLocal(
+								GoverningPlanet->CenterCamRelativeKm, GoverningPlanet->RotationWS)),
 					RdgVolume,
 					ViewRect,
 					OutTex) && OutTex)

@@ -202,14 +202,49 @@ void MainCS(uint3 DispatchId : SV_DispatchThreadID)
 	// Composite (reference lines 463-464, pre-exposed buffer space):
 	// transmit background, add sun-scaled inscatter. Alpha preserved (same
 	// convention as the Phase-2D aerial composite).
-	float3 SkyRadiance = SunColorAttenuation * SkyTransfer * View.PreExposure;
+	//
+	// Terminator gate at the ray's atmosphere point (entry point outside,
+	// camera up inside): the LUT transfer already carries the warm
+	// reddened sunset in-scatter; the gate only removes the over-driven
+	// (ACES-desaturating) low-sun energy and extinguishes the night-side
+	// limb/glow. Applied to the sun-scaled inscatter/disk, NEVER to the
+	// view-ray transmittance (background stars stay atmospherically
+	// attenuated).
+	//
+	// VISUAL CALIBRATION PASS 2 (continuous NMS-style sunset): the LUT
+	// radiance is re-balanced by five overlapping solar-elevation bands
+	// (violet->pink->gold->orange->red) masked by smooth sun-direction and
+	// horizon proximity. The multiplier applies ONLY to the atmospheric
+	// transfer (never to SceneColor, never fullscreen): stages emerge from
+	// the scattering structure, sunrise reverses automatically (pure function
+	// of elevation, no sign branches), the sun disk is untouched (white core
+	// preserved, warm halo comes from the surrounding scatter).
+	float SunLuma = dot(SunColorAttenuation, float3(0.2126f, 0.7152f, 0.0722f));
+	float3 SunChroma = clamp(SunColorAttenuation / max(SunLuma, 1e-6f), 0.3f, 2.0f);
+	float3 SunsetMult = HillaireSunsetSkyMultiplier(SunZenith, LightViewCosAngle, ViewZenithCosAngle, SunChroma);
+	float3 SkyRadiance = SunColorAttenuation * SkyTransfer * View.PreExposure * SunsetMult;
 	
 	// Sun disk (reference RenderSkyRayMarching.hlsl FASTSKY branch).
 	float3 SunDisk = HillaireGetSunLuminance(
 		CameraPlanetLocalKm, ViewDirLocal,
 		BottomRadiusKm, normalize(PrimarySunDirLocal), SunAngularRadiusRad);
 	SunDisk *= SunColorAttenuation * View.PreExposure;
+
+	const float TerminatorFactor = HillaireTerminatorFactor(SunZenith);
+	// Continuous outside->inside limb handoff (Pass 4, Issue C): at the top
+	// boundary the outside limb meets the inside dome at gain 1.0; with
+	// distance it eases to the validated 0.80 deep-space limb. C1 in
+	// normalized excess altitude (uniforms already bound), no threshold, and
+	// the inside sky dome path is untouched (own gain 1.0).
+	float LimbScale = 1.0f;
+	if (bCameraOutside)
+	{
+		float Excess = saturate((CamLen - TopRadiusKm) / max(TopRadiusKm - BottomRadiusKm, 1e-6f));
+		float LS = Excess * Excess * (3.0f - 2.0f * Excess);
+		LimbScale = lerp(1.0f, HILLAIRE_LIMB_RADIANCE_SCALE, LS);
+	}
 	
-	float3 OutColor = SceneColor.rgb * TransmittanceMean + SkyRadiance + SunDisk;
+	float3 OutColor = SceneColor.rgb * TransmittanceMean
+		+ (SkyRadiance + SunDisk) * TerminatorFactor * LimbScale;
 	CompositeOutputUav[BufferPixel] = float4(OutColor, SceneColor.a);
 }

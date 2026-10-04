@@ -47,14 +47,30 @@ namespace
 		float HeightKm = 0.05f;  // over the surface (space shot overrides)
 		float ShellMult = 0.0f;  // when >0: h = ShellMult * thickness
 		int32 LookMode = 0;      // 0 horizontal, 1 horizon-to-sun, 2 zenith, 3 planet center
+		int32 DawnSide = 0;      // 0 = +perp terminator side, 1 = opposite (-perp) side
 	};
 
 	const FSkyProbeShot GSkyProbeShots[] = {
-		{ TEXT("day"),      90.0f, 0.005f, 0.0f, 0 },
-		{ TEXT("sunset"),    0.0f, 0.005f, 0.0f, 1 },
-		{ TEXT("twilight"), -6.0f, 0.005f, 0.0f, 1 },
-		{ TEXT("night"),   -40.0f, 0.005f, 0.0f, 2 },
-		{ TEXT("space"),    45.0f, 0.000f, 25.0f, 3 },
+		{ TEXT("day"),      90.0f, 0.005f, 0.0f, 0, 0 },
+		{ TEXT("sunset"),    0.0f, 0.005f, 0.0f, 1, 0 },
+		{ TEXT("twilight"), -6.0f, 0.005f, 0.0f, 1, 0 },
+		{ TEXT("night"),   -40.0f, 0.005f, 0.0f, 2, 0 },
+		{ TEXT("space"),    45.0f, 0.000f, 25.0f, 3, 0 },
+		// Calibration-pass vistas (unobstructed horizon + terrain in frame,
+		// and the above-top entry boundary): 0.30 km altitude clears local
+		// ridges that occluded the 5 m sunset shot; ShellMult 2.0 sits just
+		// outside the top sphere looking at the disk center.
+		{ TEXT("vistasunset"), 0.0f, 0.300f, 0.0f, 1, 0 },
+		{ TEXT("entry"),      45.0f, 0.000f, 2.0f, 3, 0 },
+		// Terrain-framing twilight (validates atmospheric ambient on the
+		// surface): low altitude looking at the planet center, sun just
+		// below the horizon. Terrain must read faintly warm, never black.
+		{ TEXT("groundtwilight"), -6.0f, 0.050f, 0.0f, 3, 0 },
+		// Mirrored sunrise case (dawn/dusk symmetry proof): identical solar
+		// elevation to vistasunset but posed on the OPPOSITE terminator
+		// side. The response is a pure function of elevation, so this must
+		// reproduce the sunset staging.
+		{ TEXT("sunrise"), 0.0f, 0.300f, 0.0f, 1, 1 },
 	};
 	constexpr int32 GSkyProbeShotCount = UE_ARRAY_COUNT(GSkyProbeShots);
 	constexpr int32 GSkyProbeSettleFrames = 150;
@@ -173,9 +189,13 @@ namespace
 		{
 			const FVector SunDir = Planet.StarDirectionWorld.GetSafeNormal();
 			const FVector Perp = SkyProbePerp(SunDir);
+			// Dawn/dusk side selection (mirrored terminator posing): the
+			// elevation construction below is ambiguous in azimuth, so the
+			// shot explicitly picks +perp (dusk) or -perp (dawn).
+			const FVector Side = (Shot.DawnSide != 0) ? -Perp : Perp;
 			const float ElevRad = FMath::DegreesToRadians(Shot.SunElevDeg);
 			const FVector CamUp =
-				(SunDir * FMath::Sin(ElevRad) + Perp * FMath::Cos(ElevRad)).GetSafeNormal();
+				(SunDir * FMath::Sin(ElevRad) + Side * FMath::Cos(ElevRad)).GetSafeNormal();
 			const float ThicknessKm =
 				FMath::Max(0.05f, Planet.AtmosphereTopRadiusKm - Planet.GroundRadiusKm);
 			// CORRECTED VOLUME MODEL: the atmosphere bottom is the planetary
@@ -293,19 +313,26 @@ namespace
 			const AActor* VT = PC->GetViewTarget();
 			const FVector CamLoc = P.ProbeCam ? P.ProbeCam->GetActorLocation() : FVector::ZeroVector;
 			FVector ActualCamCm = FVector::ZeroVector;
+			FRotator ActualCamRot = FRotator::ZeroRotator;
 			if (const APawn* Pawn = PC->GetPawn())
 			{
 				ActualCamCm = Pawn->GetActorLocation();
+				ActualCamRot = Pawn->GetActorRotation();
 			}
 			const double ActualDistKm =
 				(ActualCamCm - Planet.CenterWS).Size() * HillaireLimits::KmPerCm;
+			// Pose-attributed capture log: pawn location + facing at capture
+			// time disambiguates screenshot<->shot mapping even if file
+			// writes complete out of order.
 			UE_LOG(LogZephyr, Log,
-				TEXT("[SkyProbe] shot '%s' captured (inside=%d viewTarget=%s probeCam=%s camLoc=(%.0f,%.0f,%.0f) actualDistKm=%.3f topKm=%.3f)."),
+				TEXT("[SkyProbe] shot '%s' captured (inside=%d viewTarget=%s probeCam=%s camLoc=(%.0f,%.0f,%.0f) actualDistKm=%.3f topKm=%.3f pawn=(%.0f,%.0f,%.0f) pawnRot=(%.1f,%.1f,%.1f))."),
 				Shot.Name, Planet.bCameraInside ? 1 : 0,
 				VT ? *VT->GetName() : TEXT("<null>"),
 				P.ProbeCam ? TEXT("yes") : TEXT("null"),
 				CamLoc.X, CamLoc.Y, CamLoc.Z,
-				ActualDistKm, Planet.AtmosphereTopRadiusKm);
+				ActualDistKm, Planet.AtmosphereTopRadiusKm,
+				ActualCamCm.X, ActualCamCm.Y, ActualCamCm.Z,
+				ActualCamRot.Pitch, ActualCamRot.Yaw, ActualCamRot.Roll);
 			FScreenshotRequest::RequestScreenshot(false);
 			// Diagnostic: read back the real GPU SkyView LUT at this shot's
 			// camera height and log deterministic probes (zenith/horizon/sun).

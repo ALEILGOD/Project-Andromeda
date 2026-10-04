@@ -1,13 +1,19 @@
 #include "StarSystem.h"
 
 #include "Engine/World.h"
+#include "Components/SceneComponent.h"
 #include "Sun.h"
 #include "UObject/UnrealType.h"
 #include "PlanetaryLightingComponent.h"
+#include "Planet/Planet.h"
+#include "HillairePlanetLinkComponent.h"
+#include "PlanetaryOrbitMath.h"
+#include "PlanetaryWorldSubsystem.h"
 
 
 AStarSystem::AStarSystem()
 {
+    SetRootComponent(CreateDefaultSubobject<USceneComponent>(TEXT("SystemOrigin")));
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
 }
@@ -18,6 +24,7 @@ void AStarSystem::BeginPlay()
     Super::BeginPlay();
 
     SystemSimulationTime = 0.0f;
+    OrbitalSimulationTime = 0.0;
 
     SystemData =
         UStarSystemGenerator::GenerateSystem(
@@ -28,6 +35,32 @@ void AStarSystem::BeginPlay()
     SpawnSun();
 
     SpawnPlanets();
+    UpdateRuntimeSnapshot();
+
+    GetWorld()->GetSubsystem<UPlanetaryWorldSubsystem>()->RegisterSystem(this);
+}
+
+void AStarSystem::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (UPlanetaryWorldSubsystem* Registry = GetWorld()->GetSubsystem<UPlanetaryWorldSubsystem>())
+    {
+        Registry->UnregisterSystem(this);
+    }
+    if (EndPlayReason == EEndPlayReason::Destroyed)
+    {
+        for (const FSpawnedPlanetData& Planet : SpawnedPlanets)
+        {
+            if (IsValid(Planet.PlanetActor))
+            {
+                Planet.PlanetActor->Destroy();
+            }
+        }
+        if (IsValid(SpawnedSun))
+        {
+            SpawnedSun->Destroy();
+        }
+    }
+    Super::EndPlay(EndPlayReason);
 }
 
 
@@ -55,6 +88,7 @@ void AStarSystem::Tick(
 
     SystemSimulationTime +=
         SimulationDeltaTime;
+    OrbitalSimulationTime += double(SimulationDeltaTime) * FMath::Max(double(OrbitTimeScale), 0.0);
 
     UpdatePlanetOrbits(
         SimulationDeltaTime
@@ -63,6 +97,7 @@ void AStarSystem::Tick(
     UpdatePlanetRotations(
         SimulationDeltaTime
     );
+    UpdateRuntimeSnapshot();
 }
 
 
@@ -147,12 +182,12 @@ void AStarSystem::SpawnSun()
 
 void AStarSystem::SpawnPlanets()
 {
-    if (!PlanetClass)
+    if (!PlanetClass || !PlanetClass->IsChildOf(APlanet::StaticClass()))
     {
         UE_LOG(
             LogTemp,
             Error,
-            TEXT("StarSystem: PlanetClass non impostata.")
+            TEXT("StarSystem: PlanetClass must derive from APlanet (surface bodies only).")
         );
 
         return;
@@ -378,15 +413,7 @@ void AStarSystem::UpdatePlanetOrbits(
     }
 
 
-    const float SafeOrbitTimeScale =
-        FMath::Max(
-            OrbitTimeScale,
-            0.0f
-        );
-
-    const float OrbitSimulationTime =
-        SystemSimulationTime *
-        SafeOrbitTimeScale;
+    const double OrbitSimulationTime = OrbitalSimulationTime;
 
 
     for (
@@ -483,17 +510,20 @@ const FSpawnedPlanetData* AStarSystem::FindSpawnedPlanet(
 
 
 FPlanetRuntimeData AStarSystem::BuildPlanetRuntimeData(
-    const FSpawnedPlanetData& SpawnedPlanet
+    const FSpawnedPlanetData& SpawnedPlanet,
+    double WorldTimeOffset
 ) const
 {
     FPlanetRuntimeData Out;
 
-    if (!SpawnedPlanet.PlanetActor)
+    const APlanet* Planet = Cast<APlanet>(SpawnedPlanet.PlanetActor);
+    if (!IsValid(Planet))
     {
         return Out;
     }
 
     Out.bValid = true;
+    Out.BodyType = ECelestialBodyType::Planet;
 
     Out.PlanetActor = SpawnedPlanet.PlanetActor;
 
@@ -503,30 +533,36 @@ FPlanetRuntimeData AStarSystem::BuildPlanetRuntimeData(
     Out.PlanetSeed =
         SpawnedPlanet.GenerationData.PlanetSeed;
 
-    Out.PlanetRadius =
-        SpawnedPlanet.GenerationData.PlanetRadius;
+    const FVector Scale = Planet->GetActorScale3D();
+    if (!Scale.AllComponentsEqual(1.e-6) || Scale.X <= 0.0)
+    {
+        // The surface gravity model is spherical, not an ellipsoid model.
+        Out.bValid = false;
+        return Out;
+    }
+    Out.PlanetRadius = float(Planet->PlanetRadius * Scale.X);
 
-    Out.TerrainHeight =
-        SpawnedPlanet.GenerationData.TerrainHeight;
-
-    Out.OrbitDistance =
-        SpawnedPlanet.GenerationData.OrbitDistance;
+    Out.TerrainHeight = float(Planet->TerrainHeight * Scale.X);
+    Out.OrbitDistance = SpawnedPlanet.GenerationData.OrbitDistance;
+    Out.SurfaceGravity = Planet->SurfaceGravity > 0.0 ? Planet->SurfaceGravity : SpawnedPlanet.GenerationData.SurfaceGravity * Scale.X;
+    // Read the frozen atmosphere's geometry contract, never its camera/body selection.
+    Out.AtmosphereTopRadius = UHillairePlanetLinkComponent::ComputeAtmosphereTopRadiusCm(Out.PlanetRadius, Out.TerrainHeight);
+    const double Envelope = Out.PlanetRadius + Out.TerrainHeight;
+    const ASun* Star = GetSunActor();
+    Out.MaxInfluenceRadius = Out.OrbitDistance > 0.0 ? Out.OrbitDistance - (Star ? Star->LightSourceRadius : 0.0) : Envelope;
+    for (const FSpawnedPlanetData& Other : SpawnedPlanets)
+    {
+        const APlanet* OtherActor = Cast<APlanet>(Other.PlanetActor);
+        if (IsValid(OtherActor) && Other.GenerationData.PlanetID != Out.PlanetID)
+        {
+            Out.MaxInfluenceRadius = FMath::Min(Out.MaxInfluenceRadius,
+                FMath::Abs(double(Other.GenerationData.OrbitDistance) - Out.OrbitDistance) -
+                (OtherActor->PlanetRadius + OtherActor->TerrainHeight) * OtherActor->GetActorScale3D().GetAbsMax());
+        }
+    }
 
     Out.OrbitalPeriod =
         SpawnedPlanet.GenerationData.OrbitalPeriod;
-
-    Out.WorldPosition =
-        SpawnedPlanet.PlanetActor->GetActorLocation();
-
-    Out.OrbitalVelocity =
-        GetPlanetOrbitalVelocity(
-            Out.PlanetID
-        );
-
-    Out.CurrentRotation =
-        GetPlanetRotation(
-            Out.PlanetID
-        );
 
     Out.RotationRateDegreesPerSecond =
         GetPlanetRotationRateDegreesPerSecond(
@@ -538,7 +574,34 @@ FPlanetRuntimeData AStarSystem::BuildPlanetRuntimeData(
             Out.PlanetID
         );
 
+    Out.AngularVelocity = Out.RotationAxis * FMath::DegreesToRadians(double(Out.RotationRateDegreesPerSecond));
+    SampleRuntimeMotion(SpawnedPlanet, WorldTimeOffset, Out);
+
     return Out;
+}
+
+void AStarSystem::SampleRuntimeMotion(const FSpawnedPlanetData& Planet, double WorldTimeOffset, FPlanetRuntimeData& Out) const
+{
+    const double WorldRate = FMath::Max(double(SimulationTimeScale), 0.0) * CustomTimeDilation;
+    const double OrbitWorldRate = WorldRate * FMath::Max(double(OrbitTimeScale), 0.0);
+    const FAndromedaOrbitState Orbit = AndromedaOrbit::Evaluate(Planet.GenerationData,
+        OrbitalSimulationTime + WorldTimeOffset * OrbitWorldRate, 1.0, OrbitWorldRate);
+    // The orbit solution is system-local; the system origin is a rigid world
+    // transform, not a camera/planet reference frame inherited a second time.
+    Out.WorldPosition = GetActorLocation() + GetActorQuat().RotateVector(Orbit.Position);
+    Out.OrbitalVelocity = GetActorQuat().RotateVector(Orbit.Velocity);
+    Out.OrbitalAcceleration = GetActorQuat().RotateVector(Orbit.Acceleration);
+    Out.CurrentRotation = CalculatePlanetRotation(Planet.GenerationData, SystemSimulationTime + WorldTimeOffset * WorldRate);
+}
+
+void AStarSystem::UpdateRuntimeSnapshot()
+{
+    RuntimeSnapshot.Reset();
+    RuntimeSnapshot.Reserve(SpawnedPlanets.Num());
+    for (const FSpawnedPlanetData& Planet : SpawnedPlanets)
+    {
+        RuntimeSnapshot.Add(BuildPlanetRuntimeData(Planet));
+    }
 }
 
 
@@ -546,19 +609,14 @@ FPlanetRuntimeData AStarSystem::GetPlanetRuntimeData(
     int64 PlanetID
 ) const
 {
-    const FSpawnedPlanetData* SpawnedPlanet =
-        FindSpawnedPlanet(
-            PlanetID
-        );
-
-    if (!SpawnedPlanet)
+    for (const FPlanetRuntimeData& Planet : RuntimeSnapshot)
     {
-        return FPlanetRuntimeData();
+        if (Planet.PlanetID == PlanetID && Planet.bValid)
+        {
+            return Planet;
+        }
     }
-
-    return BuildPlanetRuntimeData(
-        *SpawnedPlanet
-    );
+    return FPlanetRuntimeData();
 }
 
 
@@ -566,25 +624,25 @@ int32 AStarSystem::GetAllPlanetRuntimeData(
     TArray<FPlanetRuntimeData>& OutPlanets
 ) const
 {
-    OutPlanets.Empty();
-
-    OutPlanets.Reserve(
-        SpawnedPlanets.Num()
-    );
-
-    for (
-        const FSpawnedPlanetData& SpawnedPlanet :
-        SpawnedPlanets
-        )
-    {
-        OutPlanets.Add(
-            BuildPlanetRuntimeData(
-                SpawnedPlanet
-            )
-        );
-    }
+    OutPlanets = RuntimeSnapshot;
 
     return OutPlanets.Num();
+}
+
+void AStarSystem::AppendPlanetRuntimeSamples(double WorldTimeOffset, TArray<FPlanetRuntimeData>& OutPlanets) const
+{
+    for (int32 Index = 0; Index < RuntimeSnapshot.Num(); ++Index)
+    {
+        FPlanetRuntimeData Sample = RuntimeSnapshot[Index];
+        if (Sample.bValid && IsValid(Sample.PlanetActor))
+        {
+            if (WorldTimeOffset != 0.0)
+            {
+                SampleRuntimeMotion(SpawnedPlanets[Index], WorldTimeOffset, Sample);
+            }
+            OutPlanets.Add(Sample);
+        }
+    }
 }
 
 
@@ -620,52 +678,8 @@ FVector AStarSystem::GetPlanetOrbitalVelocity(
         return FVector::ZeroVector;
     }
 
-    const float SafeOrbitTimeScale =
-        FMath::Max(
-            OrbitTimeScale,
-            0.0f
-        );
-
-    if (SafeOrbitTimeScale <= 0.0f)
-    {
-        return FVector::ZeroVector;
-    }
-
-    // Tempo orbitale simulato ESATTAMENTE come in UpdatePlanetOrbits:
-    //     OrbitSimulationTime = SystemSimulationTime * OrbitTimeScale
-    const float OrbitSimulationTime =
-        SystemSimulationTime *
-        SafeOrbitTimeScale;
-
-    // Derivata simmetrica della posizione orbitale rispetto al tempo di
-    // simulazione orbitale, poi scalata da OrbitTimeScale per ottenere la
-    // velocita' nel tempo MONDIALE (cm/s) con cui il pianeta viene davvero
-    // mosso da SetActorLocation. NON e' la velocita' teorica 2*PI*R/T.
-    constexpr float VelocitySampleHalfStep = 0.001f;
-
-    const FVector PastPosition =
-        CalculateOrbitPosition(
-            SpawnedPlanet->GenerationData,
-            OrbitSimulationTime -
-            VelocitySampleHalfStep
-        );
-
-    const FVector FuturePosition =
-        CalculateOrbitPosition(
-            SpawnedPlanet->GenerationData,
-            OrbitSimulationTime +
-            VelocitySampleHalfStep
-        );
-
-    const float HalfSampleSpan =
-        2.0f * VelocitySampleHalfStep;
-
-    const FVector OrbitSimVelocity =
-        (FuturePosition - PastPosition) /
-        HalfSampleSpan;
-
-    return OrbitSimVelocity *
-        SafeOrbitTimeScale;
+    return GetActorQuat().RotateVector(AndromedaOrbit::Evaluate(SpawnedPlanet->GenerationData, OrbitalSimulationTime, 1.0,
+        FMath::Max(double(SimulationTimeScale), 0.0) * CustomTimeDilation * FMath::Max(double(OrbitTimeScale), 0.0)).Velocity);
 }
 
 
@@ -725,7 +739,7 @@ float AStarSystem::GetPlanetRotationRateDegreesPerSecond(
         );
 
     return (360.0f / RotationPeriod) *
-        SafeTimeScale;
+        SafeTimeScale * CustomTimeDilation;
 }
 
 
@@ -762,9 +776,7 @@ FVector AStarSystem::GetPlanetRotationAxis(
         )
     );
 
-    return TiltQuat.RotateVector(
-        FVector::UpVector
-    ) * RotationDirection;
+    return GetActorQuat().RotateVector(TiltQuat.RotateVector(FVector::UpVector)) * RotationDirection;
 }
 
 
@@ -816,68 +828,11 @@ FGuid AStarSystem::GetStableStarId() const
 
 FVector AStarSystem::CalculateOrbitPosition(
     const FPlanetGenerationData& PlanetData,
-    float SimulationTime
+    double SimulationTime
 ) const
 {
-    if (PlanetData.OrbitalPeriod <= KINDA_SMALL_NUMBER)
-    {
-        return FVector::ZeroVector;
-    }
-
-
-    const float OrbitalCycles =
-        SimulationTime
-        / PlanetData.OrbitalPeriod;
-
-
-    const float CurrentOrbitAngle =
-        PlanetData.OrbitAngle
-        + OrbitalCycles * 360.0f;
-
-
-    const float OrbitAngleRadians =
-        FMath::DegreesToRadians(
-            CurrentOrbitAngle
-        );
-
-
-    const float InclinationRadians =
-        FMath::DegreesToRadians(
-            PlanetData.OrbitInclination
-        );
-
-
-    FVector OrbitPosition;
-
-
-    OrbitPosition.X =
-        FMath::Cos(
-            OrbitAngleRadians
-        )
-        * PlanetData.OrbitDistance;
-
-
-    OrbitPosition.Y =
-        FMath::Sin(
-            OrbitAngleRadians
-        )
-        * PlanetData.OrbitDistance
-        * FMath::Cos(
-            InclinationRadians
-        );
-
-
-    OrbitPosition.Z =
-        FMath::Sin(
-            OrbitAngleRadians
-        )
-        * PlanetData.OrbitDistance
-        * FMath::Sin(
-            InclinationRadians
-        );
-
-
-    return OrbitPosition;
+    // Same solution as velocity/acceleration; the caller already scales orbit time.
+    return GetActorQuat().RotateVector(AndromedaOrbit::Evaluate(PlanetData, SimulationTime, 1.0, 1.0).Position);
 }
 
 
@@ -1018,7 +973,7 @@ float AStarSystem::CalculateRotationDirection(
 
 FRotator AStarSystem::CalculatePlanetRotation(
     const FPlanetGenerationData& PlanetData,
-    float SimulationTime
+    double SimulationTime
 ) const
 {
     const float RotationPeriod =
@@ -1051,16 +1006,16 @@ FRotator AStarSystem::CalculatePlanetRotation(
         );
 
 
-    const float RotationCycles =
+    const double RotationCycles =
         SimulationTime
         / RotationPeriod;
 
 
-    const float SpinAngle =
+    const double SpinAngle = FMath::Fmod(
         InitialRotation
         + RotationCycles
         * 360.0f
-        * RotationDirection;
+        * RotationDirection, 360.0);
 
 
     const FQuat TiltQuat =
@@ -1082,7 +1037,7 @@ FRotator AStarSystem::CalculatePlanetRotation(
 
 
     const FQuat FinalQuat =
-        TiltQuat * SpinQuat;
+        GetActorQuat() * TiltQuat * SpinQuat;
 
 
     return FinalQuat.Rotator();

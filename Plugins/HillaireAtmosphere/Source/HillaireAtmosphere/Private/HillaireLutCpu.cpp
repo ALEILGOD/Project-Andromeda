@@ -792,7 +792,9 @@ namespace HillaireLutCpu
 		const TArray<FLinearColor>& Volume, int32 VW, int32 VH, int32 VD,
 		const FVector3f& SunColor,
 		float PreExposure,
-		float AerialKmPerSlice)
+		float AerialKmPerSlice,
+		float AerialAltitude01,
+		float SunElevCos)
 	{
 		// Sky/background: identity (reversed-Z far == 0).
 		if (DeviceZ <= HillaireLimits::CompositeSkyDepthEpsilon)
@@ -810,7 +812,11 @@ namespace HillaireLutCpu
 			InvProjMatrix.M[2][0] * ClipSpace.X + InvProjMatrix.M[2][1] * ClipSpace.Y + InvProjMatrix.M[2][2] * ClipSpace.Z + InvProjMatrix.M[2][3],
 			InvProjMatrix.M[3][0] * ClipSpace.X + InvProjMatrix.M[3][1] * ClipSpace.Y + InvProjMatrix.M[3][2] * ClipSpace.Z + InvProjMatrix.M[3][3]);
 		const FVector ViewPos = FVector(HViewPos.X, HViewPos.Y, HViewPos.Z) / HViewPos.W;
-		const float TDepth = ViewPos.Size();
+		// Mirror HillaireAerialComposite.usf: the projection inverse yields view
+		// space in cm (UE); AerialKmPerSlice is km. Without this conversion the
+		// depth quotient saturates and every opaque pixel samples the deepest
+		// froxel (uniform full-column wash).
+		const float TDepth = ViewPos.Size() * HillaireLimits::KmPerCm;
 
 		// Slice mapping + near fade (reference lines 489-497), atmosphere-relative.
 		float Slice = TDepth / AerialKmPerSlice;
@@ -847,8 +853,21 @@ namespace HillaireLutCpu
 
 		const FVector3f AP = SampleVolumeTrilinear(Volume, VW, VH, VD, ViewU, ViewV, Wgt) * Weight;
 		const FVector3f InC(SceneColor.R, SceneColor.G, SceneColor.B);
+		// CPU mirror of HillaireAerialComposite.usf (CALIBRATION PASS 2):
+		// distance ramp (near native, far full haze) x entry altitude scale
+		// (subtle high columns, continuous descent) x boundary fade (Pass 4:
+		// 0 at the top boundary, continuous with the outside gate) x
+		// elevation-only sunset response. Presentation applies ONLY to the
+		// inscatter; transmittance (1-Opacity) is untouched and physical.
+		const float AerialPresentation =
+			HillaireLimits::AerialDistanceScale(Wgt) * HillaireLimits::AerialAltitudeScale(AerialAltitude01)
+			* HillaireLimits::AerialBoundaryFade(AerialAltitude01);
+		const FVector3f SunChroma = HillaireLimits::SunsetSunChroma(SunColor);
+		const FVector3f SunsetMult = HillaireLimits::SunsetAerialMultiplier(SunElevCos, SunChroma);
+		const FVector3f SunAP(SunColor.X * AP.X, SunColor.Y * AP.Y, SunColor.Z * AP.Z);
 		const FVector3f OutC = InC * (1.0f - Opacity)
-			+ FVector3f(SunColor.X * AP.X, SunColor.Y * AP.Y, SunColor.Z * AP.Z) * PreExposure;
+			+ FVector3f(SunAP.X * SunsetMult.X, SunAP.Y * SunsetMult.Y, SunAP.Z * SunsetMult.Z)
+				* PreExposure * AerialPresentation;
 		return FLinearColor(OutC.X, OutC.Y, OutC.Z, SceneColor.A);
 	}
 
@@ -1027,10 +1046,23 @@ namespace HillaireLutCpu
 		const FVector3f ViewTransmittance = SampleLutBilinear(TransmittanceLut, TransW, TransH, TU, TV);
 		const float TransmittanceMean =
 			(ViewTransmittance.X + ViewTransmittance.Y + ViewTransmittance.Z) / 3.0f;
+		// Terminator gate (CPU mirror of HillaireSkyBackground.usf /
+		// HillaireTerminatorFactor): scalar luminance gate on the geometric
+		// terminator, applied to the sun-scaled inscatter only (never to the
+		// view-ray transmittance). SunZenith is the sun elevation cosine at
+		// the ray's atmosphere point (camera up for the inside mirror).
+		// CALIBRATION PASS 2: the gated transfer is re-balanced by the
+		// continuous sunset response (five overlapping elevation bands x sun
+		// proximity x horizon proximity, sun-chromaticity aware). The
+		// multiplier touches ONLY the atmospheric transfer, never SceneColor.
+		const float TerminatorFactor = HillaireLimits::TerminatorFactor(SunZenith);
+		const FVector3f SunChroma = HillaireLimits::SunsetSunChroma(SunColor);
+		const FVector3f SunsetMult =
+			HillaireLimits::SunsetSkyMultiplier(SunZenith, LightViewCos, ViewZenithCos, SunChroma);
 		const FVector3f OutC(
-			SceneColor.R * TransmittanceMean + SunColor.X * SkyTransfer.X * PreExposure,
-			SceneColor.G * TransmittanceMean + SunColor.Y * SkyTransfer.Y * PreExposure,
-			SceneColor.B * TransmittanceMean + SunColor.Z * SkyTransfer.Z * PreExposure);
+			SceneColor.R * TransmittanceMean + SunColor.X * SkyTransfer.X * PreExposure * TerminatorFactor * SunsetMult.X,
+			SceneColor.G * TransmittanceMean + SunColor.Y * SkyTransfer.Y * PreExposure * TerminatorFactor * SunsetMult.Y,
+			SceneColor.B * TransmittanceMean + SunColor.Z * SkyTransfer.Z * PreExposure * TerminatorFactor * SunsetMult.Z);
 		return FLinearColor(OutC.X, OutC.Y, OutC.Z, SceneColor.A);
 	}
 
@@ -1049,5 +1081,137 @@ namespace HillaireLutCpu
 		const float DMax = Rho + H;
 		OutU = (DMax > DMin) ? (D - DMin) / (DMax - DMin) : 0.0f;
 		OutV = (H > 0.0f) ? Rho / H : 0.0f;
+	}
+
+	// Hemisphere quadrature for ComputeSkyAmbientTransfer: zenith cap
+	// [0,25 deg] + ring bands [25,55] and [55,80] deg, 8 dirs each (ring0
+	// faces the sun azimuth). The [80,90] band is omitted (cosine weight
+	// ~0.09, ~1% of the integral: absorbed in the presentation calibration).
+	namespace SkyAmbientDetail
+	{
+		constexpr int32 DirCount = 17;
+		constexpr int32 ViewSteps = 12;
+		constexpr int32 SunSteps = 8;
+
+		float BandWeight(float Cos0, float Cos1, int32 Dirs)
+		{
+			return 2.0f * PI * (Cos0 - Cos1) / (float)Dirs;
+		}
+	}
+
+	FVector3f ComputeSkyAmbientTransfer(
+		const FHillaireAtmosphereProfile& Profile,
+		const FVector3f& SunDirLocal,
+		const FVector3f& SurfaceUpLocal,
+		float SurfaceHeightKm)
+	{
+		const FVector3f Up = SurfaceUpLocal.GetSafeNormal();
+		const FVector3f SunN = SunDirLocal.GetSafeNormal();
+		if (Up.SizeSquared() < 0.5f || SunN.SizeSquared() < 0.5f)
+		{
+			return FVector3f::ZeroVector;
+		}
+		const FVector3f P0 = Up * SurfaceHeightKm;
+
+		// Tangent frame: T0 faces the sun azimuth (forward-lobe capture),
+		// T1 completes the right-handed basis. Degenerate (zenith sun) falls
+		// back to an arbitrary but stable tangent.
+		FVector3f SunHoriz = SunN - Up * (SunN | Up);
+		FVector3f T0;
+		if (SunHoriz.SizeSquared() > 1e-12f)
+		{
+			T0 = SunHoriz.GetSafeNormal();
+		}
+		else
+		{
+			const FVector3f Ref = FMath::Abs(Up.Z) < 0.99f ? FVector3f(0.0f, 0.0f, 1.0f) : FVector3f(1.0f, 0.0f, 0.0f);
+			T0 = FVector3f::CrossProduct(Up, Ref).GetSafeNormal();
+		}
+		const FVector3f T1 = FVector3f::CrossProduct(Up, T0).GetSafeNormal();
+
+		struct FAmbientDir { FVector3f Dir; float CosZen; float Weight; };
+		FAmbientDir Dirs[SkyAmbientDetail::DirCount];
+		Dirs[0] = { Up, 1.0f, SkyAmbientDetail::BandWeight(1.0f, FMath::Cos(25.0f * PI / 180.0f), 1) };
+		int32 Di = 1;
+		const float RingZen[2] = { 40.0f * PI / 180.0f, 70.0f * PI / 180.0f };
+		const float RingCos[2] = { FMath::Cos(RingZen[0]), FMath::Cos(RingZen[1]) };
+		const float RingW[2] = {
+			SkyAmbientDetail::BandWeight(FMath::Cos(25.0f * PI / 180.0f), FMath::Cos(55.0f * PI / 180.0f), 8),
+			SkyAmbientDetail::BandWeight(FMath::Cos(55.0f * PI / 180.0f), FMath::Cos(80.0f * PI / 180.0f), 8) };
+		for (int32 R = 0; R < 2; ++R)
+		{
+			const float SinZ = FMath::Sqrt(FMath::Max(0.0f, 1.0f - RingCos[R] * RingCos[R]));
+			for (int32 J = 0; J < 8; ++J)
+			{
+				const float Az = (float)J * PI / 4.0f;
+				Dirs[Di++] = { Up * RingCos[R] + (T0 * FMath::Cos(Az) + T1 * FMath::Sin(Az)) * SinZ,
+					RingCos[R], RingW[R] };
+			}
+		}
+
+		const float MieG = Profile.MiePhaseG;
+		FVector3f E = FVector3f::ZeroVector;
+		for (int32 D = 0; D < SkyAmbientDetail::DirCount; ++D)
+		{
+			const FVector3f& Dir = Dirs[D].Dir;
+			float TTop;
+			if (!RaySphereNearest(P0, Dir, Profile.TopRadiusKm, TTop) || TTop <= 0.0f)
+			{
+				continue;
+			}
+			const float TMax = TTop;
+			FVector3f L = FVector3f::ZeroVector;
+			FVector3f Throughput(1.0f, 1.0f, 1.0f);
+			float T = 0.0f;
+			for (int32 S = 0; S < SkyAmbientDetail::ViewSteps; ++S)
+			{
+				const float NewT = TMax * ((float)S + 0.3f) / (float)SkyAmbientDetail::ViewSteps;
+				const float Dt = NewT - T;
+				T = NewT;
+				const FVector3f P = P0 + T * Dir;
+				const FMediumSample Medium = SampleMedium(Profile, P);
+				const FVector3f SampleOD = Medium.Extinction * Dt;
+				const FVector3f SampleT(
+					FMath::Exp(-SampleOD.X), FMath::Exp(-SampleOD.Y), FMath::Exp(-SampleOD.Z));
+
+				// Earth shadow (reference-verbatim idiom, same as the LUT
+				// integrator: lifted-center sphere, t >= 0 -> shadowed).
+				const float PHeight = P.Size();
+				const FVector3f PUp = P / PHeight;
+				float TEarthLifted;
+				const bool bShadowed = RaySphereNearestCenter(P, SunN,
+					PUp * HillaireLimits::PlanetRadiusOffsetKm, Profile.BottomRadiusKm, TEarthLifted)
+					&& TEarthLifted >= 0.0f;
+				const float EarthShadow = bShadowed ? 0.0f : 1.0f;
+
+				// Analytic sun leg (optical-depth march, no LUT): valid
+				// exactly when unshadowed (shadowed rays terminate in the
+				// planet, whose contribution is already zeroed above).
+				FVector3f TransToSun(1.0f, 1.0f, 1.0f);
+				if (EarthShadow > 0.0f)
+				{
+					const FVector3f SunOD = IntegrateOpticalDepth(Profile, P, SunN, SkyAmbientDetail::SunSteps);
+					TransToSun = FVector3f(FMath::Exp(-SunOD.X), FMath::Exp(-SunOD.Y), FMath::Exp(-SunOD.Z));
+				}
+
+				const float CosTheta = SunN | Dir;
+				const float MiePhase = CornetteShanksMiePhase(MieG, -CosTheta);
+				const float RayPhase = RayleighPhase(CosTheta);
+				// Unit-white sun (globalL = 1, LUT convention), single
+				// scattering only (documented fill approximation).
+				const FVector3f Sv(
+					EarthShadow * TransToSun.X * (Medium.ScatteringMie.X * MiePhase + Medium.ScatteringRay.X * RayPhase),
+					EarthShadow * TransToSun.Y * (Medium.ScatteringMie.Y * MiePhase + Medium.ScatteringRay.Y * RayPhase),
+					EarthShadow * TransToSun.Z * (Medium.ScatteringMie.Z * MiePhase + Medium.ScatteringRay.Z * RayPhase));
+				const FVector3f Sint(
+					Medium.Extinction.X > 0.0f ? (Sv.X - Sv.X * SampleT.X) / Medium.Extinction.X : 0.0f,
+					Medium.Extinction.Y > 0.0f ? (Sv.Y - Sv.Y * SampleT.Y) / Medium.Extinction.Y : 0.0f,
+					Medium.Extinction.Z > 0.0f ? (Sv.Z - Sv.Z * SampleT.Z) / Medium.Extinction.Z : 0.0f);
+				L += FVector3f(Throughput.X * Sint.X, Throughput.Y * Sint.Y, Throughput.Z * Sint.Z);
+				Throughput = FVector3f(Throughput.X * SampleT.X, Throughput.Y * SampleT.Y, Throughput.Z * SampleT.Z);
+			}
+			E += L * (Dirs[D].CosZen * Dirs[D].Weight);
+		}
+		return E;
 	}
 }

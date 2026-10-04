@@ -198,6 +198,238 @@ namespace HillaireLimits
 	constexpr int32 CompositeThreadGroupX = 8;
 	constexpr int32 CompositeThreadGroupY = 8;
 
+	// ---- Aerial inscatter presentation scale (sky/terrain separation) ----
+	// The aerial composite is physically correct, but it shares the sky's
+	// SunScale = 30. On thin 1.10x envelopes the normalized density makes
+	// short near-surface paths visibly blue at x30. This isolated scale
+	// applies ONLY to the aerial inscatter term (never to transmittance,
+	// never to the sky, never to LUTs). Must match HILLAIRE_AERIAL_INSCATTER_SCALE.
+	// CALIBRATION PASS 2: this is now the NEAR endpoint of the distance ramp
+	// (AerialDistanceScale): the validated near-terrain value, unchanged.
+	constexpr float AerialInscatterPresentationScale = 0.35f;
+	/** Far endpoint of the aerial distance ramp: full physical in-scatter. Must match HILLAIRE_AERIAL_FAR_SCALE. */
+	constexpr float AerialFarPresentationScale = 1.0f;
+	/**
+	 * Beyond-range haze asymptote (w > 1 easing 1.0 -> asymptote over w in
+	 * [1, 2]). Must match HILLAIRE_AERIAL_BEYOND_ASYMPTOTE.
+	 */
+	constexpr float AerialBeyondAsymptote = 0.55f;
+	/** Knee of the distance ramp (near value holds at/below, full at w = 1). Must match HILLAIRE_AERIAL_RAMP_KNEE_W. */
+	constexpr float AerialRampKneeW = 0.70f;
+	/** High-altitude endpoint of the entry scale. Must match HILLAIRE_AERIAL_ENTRY_MIN_SCALE. */
+	constexpr float AerialEntryMinScale = 0.25f;
+
+	/** CPU mirror of HillaireAerialDistanceScale in HillaireCommon.ush. */
+	inline float AerialDistanceScale(float SliceW)
+	{
+		const float Knee = FMath::Clamp((SliceW - AerialRampKneeW) / (1.0f - AerialRampKneeW), 0.0f, 1.0f);
+		const float S = Knee * Knee * (3.0f - 2.0f * Knee);
+		const float NearFar = FMath::Lerp(AerialInscatterPresentationScale, AerialFarPresentationScale, S);
+		const float B = FMath::Clamp(SliceW - 1.0f, 0.0f, 1.0f);
+		const float BS = B * B * (3.0f - 2.0f * B);
+		return NearFar * FMath::Lerp(1.0f, AerialBeyondAsymptote, BS);
+	}
+
+	/** CPU mirror of HillaireAerialAltitudeScale in HillaireCommon.ush (0 = surface, 1 = top). */
+	inline float AerialAltitudeScale(float Altitude01)
+	{
+		const float T = FMath::Clamp(Altitude01, 0.0f, 1.0f);
+		const float S = T * T * (3.0f - 2.0f * T);
+		return FMath::Lerp(1.0f, AerialEntryMinScale, S);
+	}
+
+	/** Boundary fade width in envelope fraction (top 1%). Must match HILLAIRE_AERIAL_BOUNDARY_FADE_WIDTH. */
+	constexpr float AerialBoundaryFadeWidth = 0.01f;
+
+	/** CPU mirror of HillaireAerialBoundaryFade in HillaireCommon.ush. */
+	inline float AerialBoundaryFade(float Altitude01)
+	{
+		const float T = FMath::Clamp((1.0f - Altitude01) / AerialBoundaryFadeWidth, 0.0f, 1.0f);
+		return T * T * (3.0f - 2.0f * T);
+	}
+
+	/** HLSL smoothstep mirror (HillaireSunsetBand needs the exact edge semantics). */
+	inline float SunsetSmoothstep(float Edge0, float Edge1, float X)
+	{
+		const float T = FMath::Clamp((X - Edge0) / (Edge1 - Edge0), 0.0f, 1.0f);
+		return T * T * (3.0f - 2.0f * T);
+	}
+
+	/** CPU mirror of HillaireSunsetBand in HillaireCommon.ush. */
+	inline float SunsetBandWeight(float SunElevCos, float Rise0, float Rise1, float Fall0, float Fall1)
+	{
+		return SunsetSmoothstep(Rise0, Rise1, SunElevCos) * (1.0f - SunsetSmoothstep(Fall0, Fall1, SunElevCos));
+	}
+
+	/** Sunset band windows (rise0, rise1, fall0, fall1) shared by sky + aerial. */
+	struct FSunsetBandWindow { float Rise0, Rise1, Fall0, Fall1; };
+	constexpr FSunsetBandWindow SunsetBandViolet = { -0.04f, 0.00f, 0.08f, 0.20f };
+	constexpr FSunsetBandWindow SunsetBandPink = { -0.11f, -0.05f, 0.02f, 0.10f };
+	constexpr FSunsetBandWindow SunsetBandGold = { -0.07f, -0.02f, 0.04f, 0.12f };
+	constexpr FSunsetBandWindow SunsetBandOrange = { -0.14f, -0.07f, -0.01f, 0.06f };
+	constexpr FSunsetBandWindow SunsetBandRed = { -0.20f, -0.14f, -0.08f, -0.02f };
+
+	/** CPU mirror of HillaireSunsetTint (BaseTint mixed toward SunChroma). */
+	inline FVector3f SunsetTint(const FVector3f& BaseTint, const FVector3f& SunChroma)
+	{
+		const FVector3f Mixed(BaseTint.X * SunChroma.X, BaseTint.Y * SunChroma.Y, BaseTint.Z * SunChroma.Z);
+		return FVector3f(
+			FMath::Lerp(BaseTint.X, Mixed.X, 0.5f),
+			FMath::Lerp(BaseTint.Y, Mixed.Y, 0.5f),
+			FMath::Lerp(BaseTint.Z, Mixed.Z, 0.5f));
+	}
+
+	/** Sun chromaticity from a slot-0 ColorAttenuation (ratio: intensity cancels). White sun = (1,1,1). */
+	inline FVector3f SunsetSunChroma(const FVector3f& SunColorAttenuation)
+	{
+		const float Luma = 0.2126f * SunColorAttenuation.X + 0.7152f * SunColorAttenuation.Y + 0.0722f * SunColorAttenuation.Z;
+		const float Inv = 1.0f / FMath::Max(Luma, 1e-6f);
+		return FVector3f(
+			FMath::Clamp(SunColorAttenuation.X * Inv, 0.3f, 2.0f),
+			FMath::Clamp(SunColorAttenuation.Y * Inv, 0.3f, 2.0f),
+			FMath::Clamp(SunColorAttenuation.Z * Inv, 0.3f, 2.0f));
+	}
+
+	/** CPU mirror of HillaireSunsetSkyMultiplier in HillaireCommon.ush. */
+	inline FVector3f SunsetSkyMultiplier(float SunElevCos, float LightViewCos, float ViewZenithCos, const FVector3f& SunChroma)
+	{
+		const float SunProx = FMath::Clamp(LightViewCos * 0.5f + 0.5f, 0.0f, 1.0f);
+		const float Horizon = FMath::Clamp(1.0f - ViewZenithCos * ViewZenithCos, 0.0f, 1.0f);
+
+		const float WViol = SunsetBandWeight(SunElevCos, SunsetBandViolet.Rise0, SunsetBandViolet.Rise1, SunsetBandViolet.Fall0, SunsetBandViolet.Fall1);
+		const float WPink = SunsetBandWeight(SunElevCos, SunsetBandPink.Rise0, SunsetBandPink.Rise1, SunsetBandPink.Fall0, SunsetBandPink.Fall1);
+		const float WGold = SunsetBandWeight(SunElevCos, SunsetBandGold.Rise0, SunsetBandGold.Rise1, SunsetBandGold.Fall0, SunsetBandGold.Fall1);
+		const float WOran = SunsetBandWeight(SunElevCos, SunsetBandOrange.Rise0, SunsetBandOrange.Rise1, SunsetBandOrange.Fall0, SunsetBandOrange.Fall1);
+		const float WRed = SunsetBandWeight(SunElevCos, SunsetBandRed.Rise0, SunsetBandRed.Rise1, SunsetBandRed.Fall0, SunsetBandRed.Fall1);
+
+		const float MV = FMath::Lerp(0.55f, 1.0f, SunProx) * FMath::Lerp(0.45f, 1.0f, Horizon);
+		const float MP = FMath::Lerp(0.45f, 1.0f, SunProx) * FMath::Lerp(0.30f, 1.0f, Horizon);
+		const float MG = SunProx * FMath::Lerp(0.15f, 1.0f, Horizon);
+		const float MO = SunProx * SunProx * FMath::Lerp(0.10f, 1.0f, Horizon);
+		const float MR = FMath::Lerp(0.35f, 1.0f, SunProx) * FMath::Lerp(0.05f, 1.0f, Horizon);
+
+		FVector3f Mult(1.0f, 1.0f, 1.0f);
+		auto Accumulate = [&](const FVector3f& BaseTint, float W)
+		{
+			const FVector3f T = SunsetTint(BaseTint, SunChroma);
+			Mult.X += (T.X - 1.0f) * W;
+			Mult.Y += (T.Y - 1.0f) * W;
+			Mult.Z += (T.Z - 1.0f) * W;
+		};
+		Accumulate(FVector3f(1.10f, 0.85f, 1.30f), WViol * MV * 0.40f);
+		Accumulate(FVector3f(1.35f, 0.80f, 1.25f), WPink * MP * 0.52f);
+		Accumulate(FVector3f(1.45f, 1.15f, 0.75f), WGold * MG * 0.58f);
+		Accumulate(FVector3f(1.60f, 0.95f, 0.55f), WOran * MO * 0.65f);
+		Accumulate(FVector3f(1.50f, 0.70f, 0.60f), WRed * MR * 0.58f);
+		return Mult;
+	}
+
+	/** CPU mirror of HillaireSunsetAerialMultiplier in HillaireCommon.ush (elevation-only, half strength). */
+	inline FVector3f SunsetAerialMultiplier(float SunElevCos, const FVector3f& SunChroma)
+	{
+		const float WViol = SunsetBandWeight(SunElevCos, SunsetBandViolet.Rise0, SunsetBandViolet.Rise1, SunsetBandViolet.Fall0, SunsetBandViolet.Fall1);
+		const float WPink = SunsetBandWeight(SunElevCos, SunsetBandPink.Rise0, SunsetBandPink.Rise1, SunsetBandPink.Fall0, SunsetBandPink.Fall1);
+		const float WGold = SunsetBandWeight(SunElevCos, SunsetBandGold.Rise0, SunsetBandGold.Rise1, SunsetBandGold.Fall0, SunsetBandGold.Fall1);
+		const float WOran = SunsetBandWeight(SunElevCos, SunsetBandOrange.Rise0, SunsetBandOrange.Rise1, SunsetBandOrange.Fall0, SunsetBandOrange.Fall1);
+		const float WRed = SunsetBandWeight(SunElevCos, SunsetBandRed.Rise0, SunsetBandRed.Rise1, SunsetBandRed.Fall0, SunsetBandRed.Fall1);
+
+		FVector3f Mult(1.0f, 1.0f, 1.0f);
+		auto Accumulate = [&](const FVector3f& BaseTint, float W)
+		{
+			const FVector3f T = SunsetTint(BaseTint, SunChroma);
+			Mult.X += (T.X - 1.0f) * W;
+			Mult.Y += (T.Y - 1.0f) * W;
+			Mult.Z += (T.Z - 1.0f) * W;
+		};
+		Accumulate(FVector3f(1.10f, 0.85f, 1.30f), WViol * 0.20f);
+		Accumulate(FVector3f(1.35f, 0.80f, 1.25f), WPink * 0.26f);
+		Accumulate(FVector3f(1.45f, 1.15f, 0.75f), WGold * 0.29f);
+		Accumulate(FVector3f(1.60f, 0.95f, 0.55f), WOran * 0.325f);
+		Accumulate(FVector3f(1.50f, 0.70f, 0.60f), WRed * 0.29f);
+		return Mult;
+	}
+
+	// ---- Terminator / solar-elevation gate (sky composite) ----
+	// The normalized volumetric density fills the full 1.10x envelope, so the
+	// optically significant atmosphere reaches a large height and the geometric
+	// earth shadow keeps the upper limb illuminated far past civil twilight
+	// (the top of this envelope is still lit with the sun ~25 deg below the
+	// horizon). The LUT content is physically correct for that atmosphere; the
+	// terminator is enforced at COMPOSITE time with the same smooth
+	// solar-elevation curve the ZEPHYR presentation layer already uses
+	// (ZephyrTypes.h ZephyrPresentation::DaylightFactor), evaluated at the
+	// ray's atmosphere point (entry point outside, camera up inside). It is a
+	// scalar luminance gate on the geometric terminator, not a color overlay:
+	// it preserves the LUT's warm sunset/reddened in-scatter and only removes
+	// the over-driven (tonemap-desaturating) and night-side energy.
+	// VISUAL CALIBRATION: widened from (-0.12, 0.25) which gated the sunset
+	// itself (~0.27 at elev 0). Now ~0.74 at horizon (broad warm band),
+	// ~0.25 at -6 deg (gradual twilight contraction), 0 at ~-11.5 deg.
+	constexpr float TerminatorBeginElevCos = -0.20f; // nautical twilight (~-11.5 deg)
+	constexpr float TerminatorFullElevCos = 0.10f;   // full day (~5.7 deg)
+
+	/** CPU mirror of HillaireTerminatorFactor in HillaireCommon.ush. */
+	inline float TerminatorFactor(float SunElevationCos)
+	{
+		const float T = FMath::Clamp(
+			(SunElevationCos - TerminatorBeginElevCos)
+				/ (TerminatorFullElevCos - TerminatorBeginElevCos),
+			0.0f, 1.0f);
+		return T * T * (3.0f - 2.0f * T);
+	}
+
+	// ---- Sky ambient (terrain fill from the atmosphere) ----
+	//
+	// The rendered terrain is lit by a constant direct light (day/night via
+	// N dot L only) plus a STATIC weak skylight fill that knows nothing of
+	// the sky: at sunset the sky blazes while terrain collapses to black.
+	// The ambient transfer (hemisphere-integrated sky in-scatter,
+	// HillaireLutCpu::ComputeSkyAmbientTransfer, same scattering core as the
+	// LUTs) drives the EXISTING skylight instead: no probes, no GI, no scene
+	// capture. Day: subtle blue fill under dominant direct. Sunset: warm
+	// ambient so readable terrain survives the direct collapse. Twilight:
+	// faint remnant. Night: exactly zero (earth-shadowed transfer x
+	// terminator gate). Symmetric by construction (pure solar geometry).
+	/** Transfer -> skylight intensity gain (calibrated: day ambient ~10-15% of typical direct). */
+	constexpr float SkyAmbientPresentationScale = 2.5f;
+
+	/** Sky-ambient light state pushed into the existing skylight (color + intensity). */
+	struct FSkyAmbientLightState
+	{
+		FVector3f Color = FVector3f::ZeroVector;
+		float Intensity = 0.0f;
+	};
+
+	/**
+	 * Maps unit-white sky-ambient transfer to a skylight state.
+	 * SunIrradiance is the slot-0 delivered color x intensity WITHOUT the
+	 * x30 sky SunScale (the ambient lives in the base pass with the direct
+	 * light, not in sky buffer space). TerminatorFactor mirrors the sky
+	 * extinction curve so no warm residual survives into night.
+	 */
+	inline FSkyAmbientLightState SkyAmbientLightState(
+		const FVector3f& TransferUnitWhite,
+		float SunElevCos,
+		const FVector3f& SunIrradiance,
+		float AmbientScale)
+	{
+		FSkyAmbientLightState Out;
+		const float Gate = TerminatorFactor(SunElevCos);
+		const FVector3f Gated(TransferUnitWhite.X * Gate, TransferUnitWhite.Y * Gate, TransferUnitWhite.Z * Gate);
+		const float Luma = 0.2126f * Gated.X + 0.7152f * Gated.Y + 0.0722f * Gated.Z;
+		Out.Intensity = AmbientScale * Luma;
+		const FVector3f AmbChroma(
+			FMath::Clamp(Gated.X / FMath::Max(Luma, 1e-9f), 0.2f, 4.0f),
+			FMath::Clamp(Gated.Y / FMath::Max(Luma, 1e-9f), 0.2f, 4.0f),
+			FMath::Clamp(Gated.Z / FMath::Max(Luma, 1e-9f), 0.2f, 4.0f));
+		const FVector3f SunChroma = SunsetSunChroma(SunIrradiance);
+		Out.Color = FVector3f(
+			FMath::Max(AmbChroma.X * SunChroma.X, 0.0f),
+			FMath::Max(AmbChroma.Y * SunChroma.Y, 0.0f),
+			FMath::Max(AmbChroma.Z * SunChroma.Z, 0.0f));
+		return Out;
+	}
+
 	// Unit scale.
 	constexpr double CmPerKm = 100000.0;
 	constexpr double KmPerCm = 1e-5;

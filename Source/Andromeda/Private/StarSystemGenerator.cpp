@@ -11,6 +11,11 @@ namespace
     constexpr float MinPlanetRadius = 250000.0f;
     constexpr float MaxPlanetRadius = 1200000.0f;
 
+    // Uniform effective density: a 5 km reference gameplay planet has Earth-g.
+    // With no authored mass/composition, g scales with R and GM scales with R^3.
+    constexpr double ReferenceGravityRadius = 500000.0;
+    constexpr double ReferenceSurfaceGravity = 980.0;
+
     constexpr float MinTerrainHeightRatio = 0.035f;
     constexpr float MaxTerrainHeightRatio = 0.090f;
 
@@ -210,6 +215,9 @@ FStarSystemData UStarSystemGenerator::GenerateSystem(
         PlanetData.TerrainHeight =
             PlanetData.PlanetRadius
             * TerrainHeightRatio;
+
+        PlanetData.SurfaceGravity = ReferenceSurfaceGravity *
+            PlanetData.PlanetRadius / ReferenceGravityRadius;
 
 
         // =====================================================

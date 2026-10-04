@@ -1,407 +1,214 @@
 #include "AndromedaPawn.h"
+#include "AndromedaPlayerController.h"
 
-#include "Kismet/GameplayStatics.h"
-#include "PlanetaryGravitySystem.h"
-#include "StarSystem.h"
+#include "Camera/CameraTypes.h"
+#include "Components/StaticMeshComponent.h"
+#include "GameFramework/Controller.h"
+#include "PlanetaryMotionMath.h"
 
-
-// =========================================================
-// HELPERS
-// =========================================================
-
-namespace
+AAndromedaPawn::AAndromedaPawn(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer.SetDefaultSubobjectClass<UAndromedaPawnMovement>(Super::MovementComponentName))
 {
-    /**
-     * Check di finitezza completo per un vettore: FVector::ContainsNaN non
-     * copre Infinity, quindi ogni componente viene validata con
-     * FMath::IsFinite (che rifiuta sia NaN sia +/-Infinity).
-     */
-    bool IsVectorFinite(const FVector& Vector)
+    bUseControllerRotationYaw = false;
+    bUseControllerRotationPitch = false;
+    bUseControllerRotationRoll = false;
+    // Only the root collision shape participates in physics.
+    GetMeshComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+}
+
+void AAndromedaPawn::BeginPlay()
+{
+    Super::BeginPlay();
+    InitializeNavigation();
+}
+
+void AAndromedaPawn::InitializeNavigation()
+{
+    if (!bNavigationInitialized)
     {
-        return FMath::IsFinite(Vector.X) &&
-               FMath::IsFinite(Vector.Y) &&
-               FMath::IsFinite(Vector.Z);
+        // Spawn orientation is the inertial frame. Never restore world Z on exit.
+        NavigationQuat = GetActorQuat().GetNormalized();
+        bNavigationInitialized = true;
     }
 }
 
-
-// =========================================================
-// ANDROMEDA PAWN MOVEMENT
-// =========================================================
-
-UAndromedaPawnMovement::UAndromedaPawnMovement(
-    const FObjectInitializer& ObjectInitializer
-)
-    : Super(ObjectInitializer)
+void AAndromedaPawn::PawnClientRestart()
 {
+    Super::PawnClientRestart();
+    InitializeNavigation();
+    PublishView();
+    if (Controller)
+    {
+        GetMovementComponent()->AddTickPrerequisiteActor(Controller);
+    }
 }
 
-
-void UAndromedaPawnMovement::SetPlanetaryInfluence(
-    bool bInInfluence,
-    FVector InPlanetFrameVelocity,
-    FVector InGravityDirection,
-    float InGravityAcceleration
-)
+void AAndromedaPawn::PossessedBy(AController* NewController)
 {
-    // =========================================================
-    // VALIDAZIONE INPUT (NaN / Infinity)
-    //
-    // Input non finito: lo stato corrente viene PRESERVATO (no-op)
-    // invece di propagare valori invalidi nella velocita' del pawn.
-    // =========================================================
+    Super::PossessedBy(NewController);
+    GetMovementComponent()->AddTickPrerequisiteActor(NewController);
+}
 
-    if (
-        !IsVectorFinite(InPlanetFrameVelocity) ||
-        !IsVectorFinite(InGravityDirection) ||
-        !FMath::IsFinite(InGravityAcceleration)
-        )
+void AAndromedaPawn::UnPossessed()
+{
+    if (Controller)
+    {
+        GetMovementComponent()->RemoveTickPrerequisiteActor(Controller);
+    }
+    LocalInput = FVector::ZeroVector;
+    Super::UnPossessed();
+}
+
+void AAndromedaPawn::MoveForward(float Value) { LocalInput.X = FMath::IsFinite(Value) ? Value : 0.f; }
+void AAndromedaPawn::MoveRight(float Value) { LocalInput.Y = FMath::IsFinite(Value) ? Value : 0.f; }
+void AAndromedaPawn::MoveUp_World(float Value) { LocalInput.Z = FMath::IsFinite(Value) ? Value : 0.f; }
+
+void AAndromedaPawn::FaceRotation(FRotator NewControlRotation, float DeltaTime)
+{
+    // ControlRotation is an output of PublishView, never an actor-rotation input.
+}
+
+void AAndromedaPawn::ApplyLocalLook(const FRotator& InputDelta)
+{
+    InitializeNavigation();
+    if (InputDelta.ContainsNaN())
     {
         return;
     }
+    NavigationQuat = (NavigationQuat * FQuat(FVector::UpVector, FMath::DegreesToRadians(double(InputDelta.Yaw)))
+        * FQuat(FVector::ForwardVector, FMath::DegreesToRadians(double(InputDelta.Roll)))).GetNormalized();
+    // A local ergonomic pitch limit (independent of world latitude or influence).
+    // No world-Euler pitch/roll normalization and no changing input sensitivity.
+    LookPitchDegrees = FMath::Clamp(LookPitchDegrees + InputDelta.Pitch, -89.5, 89.5);
+    PublishView();
+}
 
-    if (bInInfluence)
+void AAndromedaPawn::TransportNavigation(const FPlanetaryFieldSample& Field, double DeltaTime)
+{
+    InitializeNavigation();
+    const double Weight = Field.OrientationInfluence;
+    const FVector Heading = NavigationQuat.GetAxisX();
+    FQuat Delta = FQuat::Identity;
+    const double SpinRate = Field.AngularVelocity.Size();
+    if (SpinRate > UE_DOUBLE_SMALL_NUMBER)
     {
-        // =========================================================
-        // TRANSIZIONE DI FRAME (continuita' della velocita' mondiale)
-        //
-        // La velocita' mondiale totale non deve mai scattare: la parte
-        // relativa viene ribasata sul nuovo frame compensando il delta:
-        //
-        //     RelativeVelocity += FramePrecedente - FrameNuovo
-        //
-        // Questa singola formula copre TUTTI i casi:
-        // - ingresso nel volume (il "frame precedente" e' la velocita'
-        //   inerziale congelata: spazio libero o uscita precedente);
-        // - drift orbitale/rotazionale del pianeta mentre si e' dentro;
-        // - cambio pianeta dominante (A -> B).
-        // In tutti i casi: WorldVelocity = PlayerVelocity +
-        // RelativeVelocity + PlanetFrameVelocity resta CONTINUA.
-        // =========================================================
-
-        RelativeVelocity +=
-            PlanetFrameVelocity - InPlanetFrameVelocity;
-
-        PlanetFrameVelocity = InPlanetFrameVelocity;
-        bInsidePlanetInfluence = true;
-
-        if (
-            InGravityAcceleration > 0.0f &&
-            !InGravityDirection.IsNearlyZero()
-            )
+        Delta = FQuat(Field.AngularVelocity / SpinRate, SpinRate * DeltaTime);
+    }
+    if (!Field.LocalUp.IsNearlyZero() && Weight > 0.0)
+    {
+        if (!PreviousFieldUp.IsNearlyZero())
         {
-            GravityDirection = InGravityDirection.GetSafeNormal();
-            GravityAcceleration = InGravityAcceleration;
+            // Parallel transport after spin: spin and curvature do not apply
+            // the same swing twice. No geographic yaw/north/pole singularity.
+            const FQuat Curvature = PlanetaryMotion::Swing(Delta.RotateVector(PreviousFieldUp), Field.LocalUp, Heading);
+            Delta = (FQuat::Slerp(FQuat::Identity, Curvature, FMath::Min(Weight, PreviousOrientationInfluence)) * Delta).GetNormalized();
         }
-        else
+        const FVector TransportedUp = Delta.RotateVector(NavigationQuat.GetAxisZ());
+        FQuat Alignment = PlanetaryMotion::Swing(TransportedUp, Field.LocalUp, Heading);
+        const double Angle = Alignment.GetAngle();
+        if (Angle > UE_DOUBLE_SMALL_NUMBER)
         {
-            // Dati gravitazionali degradati: gravita' OFF, frame OK.
-            GravityDirection = FVector::ZeroVector;
-            GravityAcceleration = 0.0f;
-        }
-    }
-    else
-    {
-        // =========================================================
-        // USCITA DAL VOLUME
-        //
-        // Gravita' = 0. RelativeVelocity e PlanetFrameVelocity restano
-        // INVARIATI: frame congelato + velocita' relativa costituiscono la
-        // velocita' inerziale risultante, che il pawn conserva senza
-        // frenate artificiali, richiami verso il pianeta o azzeramenti.
-        // =========================================================
-
-        bInsidePlanetInfluence = false;
-        GravityDirection = FVector::ZeroVector;
-        GravityAcceleration = 0.0f;
-    }
-}
-
-
-bool UAndromedaPawnMovement::IsInsidePlanetGravityInfluence() const
-{
-    return bInsidePlanetInfluence;
-}
-
-
-FVector UAndromedaPawnMovement::GetPlanetFrameVelocity() const
-{
-    return PlanetFrameVelocity;
-}
-
-
-FVector UAndromedaPawnMovement::GetPlanetaryRelativeVelocity() const
-{
-    // Dentro l'influenza: velocita' del pawn rispetto al frame del pianeta
-    // dominante. Fuori: la velocita' mondiale (nessun frame attivo).
-    if (bInsidePlanetInfluence)
-    {
-        return Velocity - PlanetFrameVelocity;
-    }
-
-    return Velocity;
-}
-
-
-void UAndromedaPawnMovement::ApplyControlInputToVelocity(
-    float DeltaTime
-)
-{
-    // =========================================================
-    // 0) Difensivo: accumulatori non finiti (NaN / Infinity) vengono
-    //    azzerati. La logica di gravita'/frame non deve mai contaminare
-    //    la velocita' del pawn.
-    // =========================================================
-
-    if (!IsVectorFinite(RelativeVelocity))
-    {
-        RelativeVelocity = FVector::ZeroVector;
-    }
-
-    if (!IsVectorFinite(PlanetFrameVelocity))
-    {
-        PlanetFrameVelocity = FVector::ZeroVector;
-    }
-
-    // =========================================================
-    // 1) Integra la gravita' sulla velocita' RELATIVA al frame del
-    //    pianeta: v_rel += dir * accel * dt.
-    //    Fuori da qualsiasi volume la velocita' resta inerziale (nessun
-    //    azzeramento artificiale). DeltaTime non valido: nessuna
-    //    integrazione.
-    // =========================================================
-
-    if (
-        DeltaTime > 0.0f &&
-        GravityAcceleration > 0.0f &&
-        !GravityDirection.IsNearlyZero()
-        )
-    {
-        RelativeVelocity +=
-            GravityDirection * (GravityAcceleration * DeltaTime);
-    }
-
-    // =========================================================
-    // 2) Isola la velocita' NON gestita dal giocatore (velocita' relativa
-    //    + velocita' ereditata dal pianeta): l'input handling del
-    //    FloatingPawnMovement (accelerazione, decelerazione a riposo,
-    //    clamp a MaxSpeed) deve agire SOLO sulla parte del giocatore,
-    //    altrimenti decelererebbe o clamperebbe caduta libera e moto
-    //    planetario.
-    // =========================================================
-
-    const FVector InheritedVelocity =
-        RelativeVelocity + PlanetFrameVelocity;
-
-    Velocity -= InheritedVelocity;
-
-    // =========================================================
-    // 3) Gestione input del giocatore INVARIATA rispetto al Default Pawn.
-    // =========================================================
-
-    Super::ApplyControlInputToVelocity(DeltaTime);
-
-    // =========================================================
-    // 4) Ricomponi: la velocita' totale usata come Delta di posizione da
-    //    TickComponent (via SafeMoveUpdatedComponent, con le collisioni
-    //    del Default Pawn intatte) e':
-    //        input del giocatore + velocita' relativa + frame pianeta.
-    //    WorldVelocity = PlanetVelocity + RelativeVelocity + Input.
-    // =========================================================
-
-    Velocity += InheritedVelocity;
-}
-
-
-// =========================================================
-// ANDROMEDA PAWN
-// =========================================================
-
-AAndromedaPawn::AAndromedaPawn(
-    const FObjectInitializer& ObjectInitializer
-)
-    : Super(
-        ObjectInitializer.SetDefaultSubobjectClass<UAndromedaPawnMovement>(
-            Super::MovementComponentName
-        )
-    )
-{
-}
-
-
-void AAndromedaPawn::Tick(
-    float DeltaTime
-)
-{
-    Super::Tick(
-        DeltaTime
-    );
-
-    UpdatePlanetaryGravity(
-        DeltaTime
-    );
-}
-
-
-void AAndromedaPawn::UpdatePlanetaryGravity(
-    float DeltaTime
-)
-{
-    if (DeltaTime <= 0.0f)
-    {
-        return;
-    }
-
-    // =========================================================
-    // MOVEMENT COMPONENT
-    // =========================================================
-
-    if (!GravityMovementComponent)
-    {
-        GravityMovementComponent =
-            Cast<UAndromedaPawnMovement>(
-                GetMovementComponent()
-            );
-
-        // Senza movement component valido il movimento normale del
-        // Default Pawn continua a funzionare, semplicemente senza gravita'.
-        if (!GravityMovementComponent)
-        {
-            return;
+            const auto* Movement = CastChecked<UAndromedaPawnMovement>(GetMovementComponent());
+            const double MaxRate = FMath::DegreesToRadians(Movement->Settings.AlignmentDegreesPerSecond);
+            // Acquisition rate vanishes with influence. Curvature transport is
+            // not clamped, so aligned high-speed surface travel does not lag.
+            const double Fraction = FMath::Min(1.0, MaxRate * Weight * DeltaTime / Angle);
+            Delta = (FQuat::Slerp(FQuat::Identity, Alignment, Fraction) * Delta).GetNormalized();
         }
     }
+    NavigationQuat = (Delta * NavigationQuat).GetNormalized();
+    PreviousFieldUp = Field.LocalUp;
+    PreviousOrientationInfluence = Weight;
+    SetActorRotation(NavigationQuat);
+}
 
-    // =========================================================
-    // STAR SYSTEM (caché: nessuna ricerca costosa ogni frame)
-    // =========================================================
-
-    if (!CachedStarSystem && StarSystemSearchCooldown > 0.0f)
+FVector AAndromedaPawn::GetMovementIntent(double SurfaceInfluence) const
+{
+    if (IsMoveInputIgnored())
     {
-        StarSystemSearchCooldown -= DeltaTime;
+        return FVector::ZeroVector;
     }
+    // A quaternion pitch interpolation cannot collapse or invert an axis like
+    // lerping/projection of nearly antipodal world directions can.
+    const FQuat MovementPitch(FVector::RightVector,
+        -FMath::DegreesToRadians(LookPitchDegrees) * (1.0 - SurfaceInfluence));
+    const FQuat MovementBasis = NavigationQuat * MovementPitch;
+    return (MovementBasis.GetAxisX() * LocalInput.X + MovementBasis.GetAxisY() * LocalInput.Y
+        + MovementBasis.GetAxisZ() * LocalInput.Z).GetClampedToMaxSize(1.0);
+}
 
-    AStarSystem* StarSystem = AcquireStarSystem();
+FRotator AAndromedaPawn::GetViewRotation() const
+{
+    return (NavigationQuat * FQuat(FVector::RightVector, -FMath::DegreesToRadians(LookPitchDegrees))).Rotator();
+}
 
-    if (!StarSystem)
+void AAndromedaPawn::PublishView()
+{
+    if (auto* PlanetaryController = Cast<AAndromedaPlayerController>(Controller))
     {
-        // Spazio libero (nessuno StarSystem): gravita' OFF, velocita'
-        // inerziale preservata.
-        GravityMovementComponent->SetPlanetaryInfluence(
-            false,
-            FVector::ZeroVector,
-            FVector::ZeroVector,
-            0.0f
-        );
-
-        return;
+        PlanetaryController->PublishPlanetaryView(GetViewRotation());
     }
-
-    // =========================================================
-    // SNAPSHOT DEI PIANETI (array riusato ogni frame)
-    // =========================================================
-
-    StarSystem->GetAllPlanetRuntimeData(
-        CachedPlanetRuntimeData
-    );
-
-    if (CachedPlanetRuntimeData.Num() == 0)
+    else if (Controller)
     {
-        // Nessun pianeta: gravita' OFF, velocita' inerziale preservata.
-        GravityMovementComponent->SetPlanetaryInfluence(
-            false,
-            FVector::ZeroVector,
-            FVector::ZeroVector,
-            0.0f
-        );
-
-        return;
-    }
-
-    // =========================================================
-    // INFLUENZA GRAVITAZIONALE (pianeta dominante, direzione, falloff)
-    // =========================================================
-
-    const FPlanetaryInfluenceData Influence =
-        UPlanetaryGravitySystem::CalculatePlanetaryInfluenceDefault(
-            CachedPlanetRuntimeData,
-            GetActorLocation()
-        );
-
-    if (
-        Influence.bValid &&
-        Influence.bIsInsideInfluenceRadius
-        )
-    {
-        // =========================================================
-        // VELOCITA' DEL FRAME PLANETARIO
-        //
-        // Velocita' del pianeta dominante valutata alla posizione del pawn:
-        // moto orbitale + moto di rotazione (omega x r). E' la velocita'
-        // che il pawn eredita mentre e' dentro il Gravity Influence Volume.
-        // =========================================================
-
-        const FVector PlanetFrameVelocity =
-            Influence.OrbitalVelocity + Influence.RotationVelocity;
-
-        GravityMovementComponent->SetPlanetaryInfluence(
-            true,
-            PlanetFrameVelocity,
-            Influence.GravityDirection,
-            Influence.GravityAcceleration
-        );
-    }
-    else
-    {
-        // Spazio libero: nessun volume contiene il pawn. Gravita' = 0 e il
-        // movimento torna a essere quello standard del Default Pawn,
-        // conservando la velocita' inerziale risultante.
-        GravityMovementComponent->SetPlanetaryInfluence(
-            false,
-            FVector::ZeroVector,
-            FVector::ZeroVector,
-            0.0f
-        );
+        Controller->SetControlRotation(GetViewRotation());
     }
 }
 
-
-AStarSystem* AAndromedaPawn::AcquireStarSystem()
+void AAndromedaPawn::SetExternalView(const FQuat& WorldView)
 {
-    if (CachedStarSystem)
+    if (!WorldView.ContainsNaN() && WorldView.SizeSquared() > UE_DOUBLE_SMALL_NUMBER)
     {
-        return CachedStarSystem;
+        NavigationQuat = WorldView.GetNormalized();
+        LookPitchDegrees = 0.0;
+        PreviousFieldUp = FVector::ZeroVector;
+        PreviousOrientationInfluence = 0.0;
+        bNavigationInitialized = true;
+        SetActorRotation(NavigationQuat);
     }
+}
 
-    // Ritenta la ricerca solo a intervalli (cooldown) invece che ogni frame,
-    // per il caso in cui lo StarSystem non esista o sia ancora in spawn.
-    if (StarSystemSearchCooldown > 0.0f)
+void AAndromedaPawn::CalcCamera(float DeltaTime, FMinimalViewInfo& OutResult)
+{
+    OutResult.Location = GetActorLocation();
+    OutResult.Rotation = GetViewRotation();
+    // PlayerCameraManager remains responsible for FOV, postprocess and modifiers.
+}
+
+FVector AAndromedaPawn::GetPlanetaryUp() const
+{
+    return NavigationQuat.GetAxisZ();
+}
+
+float AAndromedaPawn::GetPlanetaryInfluence() const
+{
+    const auto* Movement = Cast<UAndromedaPawnMovement>(GetMovementComponent());
+    return Movement ? float(Movement->GetField().ReferenceInfluence) : 0.f;
+}
+
+float AAndromedaPawn::GetBaseVelocity() const
+{
+    const auto* Movement = Cast<UAndromedaPawnMovement>(GetMovementComponent());
+    return Movement ? Movement->BaseVelocity : 0.f;
+}
+
+void AAndromedaPawn::SetBaseVelocity(float NewBaseVelocity)
+{
+    if (auto* Movement = Cast<UAndromedaPawnMovement>(GetMovementComponent()))
     {
-        return nullptr;
+        Movement->BaseVelocity = FMath::Max(NewBaseVelocity, 0.f);
     }
+}
 
-    // Intervallo di retry (secondi) quando lo StarSystem non e' trovato.
-    const float StarSystemSearchRetryInterval = 1.0f;
-    StarSystemSearchCooldown = StarSystemSearchRetryInterval;
+float AAndromedaPawn::GetSpaceBaseVelocity() const
+{
+    const auto* Movement = Cast<UAndromedaPawnMovement>(GetMovementComponent());
+    return Movement ? Movement->SpaceBaseVelocity : 0.f;
+}
 
-    TArray<AActor*> StarSystemActors;
-
-    UGameplayStatics::GetAllActorsOfClass(
-        this,
-        AStarSystem::StaticClass(),
-        StarSystemActors
-    );
-
-    for (
-        AActor* CandidateActor :
-        StarSystemActors
-        )
+void AAndromedaPawn::SetSpaceBaseVelocity(float NewSpaceBaseVelocity)
+{
+    if (auto* Movement = Cast<UAndromedaPawnMovement>(GetMovementComponent()))
     {
-        if (AStarSystem* StarSystem = Cast<AStarSystem>(CandidateActor))
-        {
-            CachedStarSystem = StarSystem;
-            return StarSystem;
-        }
+        Movement->SpaceBaseVelocity = FMath::Max(NewSpaceBaseVelocity, 0.f);
     }
-
-    return nullptr;
 }

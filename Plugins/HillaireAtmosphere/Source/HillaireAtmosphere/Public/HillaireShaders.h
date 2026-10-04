@@ -289,6 +289,12 @@ class HILLAIREATMOSPHERE_API FHillaireAerialCompositeCS : public FGlobalShader
 // Slice depth: tDepth / AerialKmPerSlice (atmosphere-relative: the
 	// per-planet envelope / 25; see HillaireLimits).
 	SHADER_PARAMETER(float, AerialKmPerSlice)
+		// Camera height fraction in the envelope (0 = surface, 1 = top):
+		// entry/high-altitude presentation scale (CALIBRATION PASS 2).
+		SHADER_PARAMETER(float, AerialAltitude01)
+		// Sun elevation cosine at the camera up: elevation-only sunset
+		// response on distant terrain (CALIBRATION PASS 2).
+		SHADER_PARAMETER(float, AerialSunElevCos)
 		// Sky/background device-Z threshold (reversed-Z: 0 = far).
 		SHADER_PARAMETER(float, SkyDepthEpsilon)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, CompositeOutputUav)

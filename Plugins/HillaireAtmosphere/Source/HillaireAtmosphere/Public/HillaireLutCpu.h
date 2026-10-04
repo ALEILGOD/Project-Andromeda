@@ -184,6 +184,9 @@ namespace HillaireLutCpu
 	 * DeviceZ uses the reversed-Z convention (0 = sky/far -> identity).
 	 * SunColor is slot-0 ColorAttenuation (linear); PreExposure matches the
 	 * buffer convention (1.0 in tests, view value in production).
+	 * AerialAltitude01 is the camera height fraction in the envelope
+	 * (0 = surface, 1 = top); SunElevCos is the sun elevation cosine at the
+	 * camera up (drives the elevation-only sunset response on terrain).
 	 */
 	HILLAIREATMOSPHERE_API FLinearColor CompositeAerialPixel(
 		const FLinearColor& SceneColor,
@@ -193,7 +196,9 @@ namespace HillaireLutCpu
 		const TArray<FLinearColor>& Volume, int32 VW, int32 VH, int32 VD,
 		const FVector3f& SunColor,
 		float PreExposure,
-		float AerialKmPerSlice);
+		float AerialKmPerSlice,
+		float AerialAltitude01,
+		float SunElevCos);
 
 	/**
 	 * Forward SkyView LUT mapping (mirrors HillaireSkyViewLutParamsToUv in
@@ -254,4 +259,30 @@ namespace HillaireLutCpu
 		const FMatrix& ViewToPlanetLocalRot,
 		const FVector3f& SunDirLocal,
 		TArray<FLinearColor>& OutVolume);
+
+	/**
+	 * Hemisphere-integrated sky ambient transfer at a surface point
+	 * (terrain ambient-illumination driver).
+	 *
+	 * Marches 17 upper-hemisphere directions (zenith + 8 at 40 deg + 8 at
+	 * 70 deg zenith angle, ring0 facing the sun azimuth) with the SAME
+	 * single-scattering core as the LUT integrator (SampleMedium, real
+	 * Rayleigh + Cornette-Shanks phases, Frostbite throughput form,
+	 * reference-verbatim earth shadow) and an analytic sun leg
+	 * (IntegrateOpticalDepth, no LUT needed), accumulating cosine-weighted
+	 * irradiance. Unit-white sun transfer, like every LUT path.
+	 *
+	 * Deliberate fill-light approximation: no multi-scattering LUT and no
+	 * ground bounce (both live on the GPU or need their bakes). The result
+	 * is validated against the hemisphere integral of the fully-baked
+	 * SkyView LUT (single+MS): same hue family, bounded fraction below.
+	 * Symmetric in solar elevation by construction (same geometry both
+	 * sides of the horizon); night is exactly zero via earth shadow
+	 * (callers additionally gate by TerminatorFactor, mirroring the sky).
+	 */
+	HILLAIREATMOSPHERE_API FVector3f ComputeSkyAmbientTransfer(
+		const FHillaireAtmosphereProfile& Profile,
+		const FVector3f& SunDirLocal,
+		const FVector3f& SurfaceUpLocal,
+		float SurfaceHeightKm);
 }

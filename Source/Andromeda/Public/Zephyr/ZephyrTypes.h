@@ -356,10 +356,10 @@ ANDROMEDA_API float ZephyrComputeTransitionFactor(
  */
 namespace ZephyrPresentation
 {
-	/** Sun elevation where presentation reaches full strength. */
-	constexpr float FullDayElevCos = 0.25f;
-	/** Sun elevation (civil-twilight depth) where presentation is extinct. */
-	constexpr float TwilightBeginElevCos = -0.12f;
+	/** Sun elevation where presentation reaches full strength (~+5.7 deg). */
+	constexpr float FullDayElevCos = 0.10f;
+	/** Sun elevation (nautical-twilight depth) where presentation is extinct (~-11.5 deg). */
+	constexpr float TwilightBeginElevCos = -0.20f;
 	/** Cap on total cloud HDR additions (bloom-headroom budget). */
 	constexpr float MaxCloudAdd = 0.45f;
 	/** Cap on total haze HDR additions (bloom-headroom budget). */

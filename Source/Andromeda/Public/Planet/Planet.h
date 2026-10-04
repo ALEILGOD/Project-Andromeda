@@ -118,6 +118,10 @@ public:
     )
     float TerrainHeight = 20000.0f;
 
+    /** Per-body gravity. Zero uses the star system's generated density model. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Andromeda|Planet|Gravity", meta = (ClampMin = "0.0"))
+    double SurfaceGravity = 0.0;
+
     UPROPERTY(
         EditAnywhere,
         BlueprintReadWrite,

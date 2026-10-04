@@ -772,6 +772,8 @@ namespace
 		const FMatrix44f& InvProjMatrix,
 		const FVector3f& SunColorAttenuation,
 		float AerialKmPerSlice,
+		float AerialAltitude01,
+		float AerialSunElevCos,
 		FRDGTextureRef RdgAerialVolume,
 		const FIntRect& ViewRect,
 		FRDGTextureRef RdgOutput)
@@ -790,6 +792,8 @@ namespace
 		Params->ViewRectMin = FVector2f((float)ViewRect.Min.X, (float)ViewRect.Min.Y);
 		Params->ViewRectSize = FVector2f((float)ViewRect.Width(), (float)ViewRect.Height());
 		Params->AerialKmPerSlice = AerialKmPerSlice;
+		Params->AerialAltitude01 = AerialAltitude01;
+		Params->AerialSunElevCos = AerialSunElevCos;
 		Params->SkyDepthEpsilon = HillaireLimits::CompositeSkyDepthEpsilon;
 		Params->CompositeOutputUav = GraphBuilder.CreateUAV(RdgOutput);
 
@@ -817,6 +821,8 @@ bool FHillaireLutManager::CompositeAerialPerspective(
 	const FMatrix& InvProjMatrix,
 	const FVector3f& SunColorAttenuation,
 	float AerialKmPerSlice,
+	float AerialAltitude01,
+	float AerialSunElevCos,
 	FRDGTextureRef RdgAerialVolume,
 	const FIntRect& ViewRect,
 	FRDGTextureRef& OutColor)
@@ -835,6 +841,7 @@ bool FHillaireLutManager::CompositeAerialPerspective(
 	AddAerialCompositePass(
 		GraphBuilder, SceneColorSrv, RdgSceneDepth, ViewUniformBuffer,
 		ToMatrix44f(InvProjMatrix), SunColorAttenuation, AerialKmPerSlice,
+		AerialAltitude01, AerialSunElevCos,
 		RdgAerialVolume, ViewRect, RdgOutput);
 	OutColor = RdgOutput;
 	return true;

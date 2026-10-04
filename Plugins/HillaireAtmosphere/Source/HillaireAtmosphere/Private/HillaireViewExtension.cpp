@@ -22,8 +22,8 @@ FHillaireViewExtension::~FHillaireViewExtension() = default;
 // and automation drive FHillaireLutManager::EvaluateAerialPerspective
 // directly; this path keeps the production ViewExtension wiring ready for
 // the Phase-2D composite with zero cost until then.
-static TAutoConsoleVariable<int32> CVarHillaireAerialEval(
-	TEXT("r.Hillaire.AerialEval"),
+static TAutoConsoleVariable<int32> CVarHillaireLegacyAerialEval(
+	TEXT("r.Hillaire.Legacy.AerialEval"),
 	0,
 	TEXT("Evaluate the Hillaire aerial perspective camera volume for the governing planet (0 = off, 1 = on)."),
 	ECVF_RenderThreadSafe);
@@ -32,8 +32,8 @@ static TAutoConsoleVariable<int32> CVarHillaireAerialEval(
 // Default ON: the SkyView LUT is already generated in PreRenderView whenever
 // the snapshot has content, so the sky is visible in a normal PIE without
 // opting into the (default-off, cost-bearing) aerial volume evaluation.
-static TAutoConsoleVariable<int32> CVarHillaireSkyEnable(
-	TEXT("r.Hillaire.SkyEnable"),
+static TAutoConsoleVariable<int32> CVarHillaireLegacySkyEnable(
+	TEXT("r.Hillaire.Legacy.SkyEnable"),
 	1,
 	TEXT("Composite the Hillaire SkyView sky background over background pixels (0 = off, 1 = on)."),
 	ECVF_RenderThreadSafe);
@@ -52,8 +52,8 @@ static TAutoConsoleVariable<int32> CVarHillaireSkyLog(
 // 0 = normal rendering, 1 = Transmittance LUT, 2 = MultiScattering LUT,
 // 3 = SkyView LUT, 4 = Aerial Perspective volume (needs r.Hillaire.AerialEval 1),
 // 5 = atmosphere density/profile. Replaces the normal composites while active.
-static TAutoConsoleVariable<int32> CVarHillaireDebugMode(
-	TEXT("r.Hillaire.DebugMode"),
+static TAutoConsoleVariable<int32> CVarHillaireLegacyDebugMode(
+	TEXT("r.Hillaire.Legacy.DebugMode"),
 	0,
 	TEXT("Visualize real Hillaire GPU LUT data instead of the normal composite (0 = off, 1 = Transmittance, 2 = MultiScattering, 3 = SkyView, 4 = Aerial volume, 5 = density/profile)."),
 	ECVF_RenderThreadSafe);
@@ -95,8 +95,8 @@ static TAutoConsoleVariable<int32> CVarHillaireDebugCoordinates(
 // whole chain is linear in sun throughput - the N-light exactness proof), so
 // it never alters gradients, limb shape, or contrast. This is calibration,
 // not a gain hack: LUT math stays transfer-pure.
-static TAutoConsoleVariable<float> CVarHillaireSunScale(
-	TEXT("r.Hillaire.SunScale"),
+static TAutoConsoleVariable<float> CVarHillaireLegacySunScale(
+	TEXT("r.Hillaire.Legacy.SunScale"),
 	1.0f,
 	TEXT("Linear sun throughput scale at composite (reference mSunIlluminanceScale, default 1.0 = validated transfer). 8-10 mirrors the reference fixed-exposure-10 look under UE adaptive exposure."),
 	ECVF_RenderThreadSafe);
@@ -296,7 +296,7 @@ FScreenPassTexture FHillaireViewExtension::AerialCompositePass(
 	}
 	// Slot-0 sun throughput with the reference illuminance scale applied once
 	// here (never inside LUTs: they stay transfer-pure). Default 1.0.
-	const float SunScale = CVarHillaireSunScale.GetValueOnRenderThread();
+	const float SunScale = CVarHillaireLegacySunScale.GetValueOnRenderThread();
 	const FVector3f ScaledSunAttenuation =
 		GoverningPlanet->ResolvedLights.Lights[0].ColorAttenuation * SunScale;
 	// Depth ref out of the post-processing scene-textures UB contents (same
@@ -425,7 +425,7 @@ FScreenPassTexture FHillaireViewExtension::AerialCompositePass(
 	// in-graph when its gate passes, else the previous frame's pooled
 	// scratch (same 1-frame latency as before the fix).
 	{
-		const int32 DebugMode = CVarHillaireDebugMode.GetValueOnRenderThread();
+		const int32 DebugMode = CVarHillaireLegacyDebugMode.GetValueOnRenderThread();
 		if (DebugMode >= 1 && DebugMode <= 22)
 		{
 			FRDGTextureRef RdgT = OutLuts.Transmittance;
@@ -438,7 +438,7 @@ FScreenPassTexture FHillaireViewExtension::AerialCompositePass(
 				const bool bCameraInsideDbg =
 					GoverningPlanet->ViewHeightKm < GoverningPlanet->Profile.TopRadiusKm;
 				if (FHillaireLutManager::ShouldCompositeAerial(
-					CVarHillaireAerialEval.GetValueOnRenderThread() != 0,
+					CVarHillaireLegacyAerialEval.GetValueOnRenderThread() != 0,
 					Snapshot->HasAtmosphereContent(), bCameraInsideDbg, bHaveLutT, bHaveLutMS)
 					&& LutManager->EvaluateAerialPerspective(
 						GraphBuilder,
@@ -507,7 +507,7 @@ FScreenPassTexture FHillaireViewExtension::AerialCompositePass(
 
 		// Single source of truth for the gating decision (unit-tested).
 		if (FHillaireLutManager::ShouldCompositeAerial(
-			CVarHillaireAerialEval.GetValueOnRenderThread() != 0,
+			CVarHillaireLegacyAerialEval.GetValueOnRenderThread() != 0,
 			Snapshot->HasAtmosphereContent(), bCameraInside, bHaveLutT, bHaveLutMS))
 		{
 			FRDGTextureRef RdgVolume = nullptr;
@@ -523,6 +523,23 @@ FScreenPassTexture FHillaireViewExtension::AerialCompositePass(
 			if (bEvalOk && RdgVolume)
 			{
 				FRDGTextureRef OutTex = nullptr;
+				// CALIBRATION PASS 2 presentation inputs: camera altitude
+				// fraction in the envelope (entry continuity) + sun elevation
+				// at the camera up (terrain sunset response). Same semantics
+				// as HillairePlanetMath (up falls back to +Z, clamped dot);
+				// transmittance stays physical, only in-scatter is scaled.
+				const float LegacyEnvelopeKm = GoverningPlanet->Profile.TopRadiusKm - GoverningPlanet->Profile.BottomRadiusKm;
+				const float LegacyAlt01 = FMath::Clamp(
+					(GoverningPlanet->ViewHeightKm - GoverningPlanet->Profile.BottomRadiusKm)
+						/ FMath::Max(LegacyEnvelopeKm, 1e-6f),
+					0.0f, 1.0f);
+				FVector3f LegacyCamUp = ViewInputs.CameraPlanetLocalKm;
+				const float LegacyUpLenSq = LegacyCamUp.SizeSquared();
+				if (LegacyUpLenSq < 1e-12f) { LegacyCamUp = FVector3f(0.0f, 0.0f, 1.0f); }
+				else { LegacyCamUp /= FMath::Sqrt(LegacyUpLenSq); }
+				const float LegacySunElev = FMath::Clamp(
+					LegacyCamUp | GoverningPlanet->ResolvedLights.Lights[0].LightDirLocal.GetSafeNormal(),
+					-1.0f, 1.0f);
 				const bool bOk = LutManager->CompositeAerialPerspective(
 					GraphBuilder,
 					CurrentColorSrv,
@@ -532,6 +549,8 @@ FScreenPassTexture FHillaireViewExtension::AerialCompositePass(
 					ScaledSunAttenuation,
 					HillaireLimits::AerialKmPerSliceForEnvelope(
 						GoverningPlanet->Profile.TopRadiusKm - GoverningPlanet->Profile.BottomRadiusKm),
+					LegacyAlt01,
+					LegacySunElev,
 					RdgVolume,
 					ViewRect,
 					OutTex);
@@ -553,7 +572,7 @@ FScreenPassTexture FHillaireViewExtension::AerialCompositePass(
 	// a full-screen atmospheric sky; the planet limb is handled by
 	// ray-marching when a view ray intersects the atmosphere.
 	{
-		const bool bSkyCVar = CVarHillaireSkyEnable.GetValueOnRenderThread() != 0;
+		const bool bSkyCVar = CVarHillaireLegacySkyEnable.GetValueOnRenderThread() != 0;
 		const bool bCameraInside =
 			GoverningPlanet->ViewHeightKm < GoverningPlanet->Profile.TopRadiusKm;
 		const bool bShouldSky = FHillaireLutManager::ShouldCompositeSky(
