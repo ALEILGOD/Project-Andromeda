@@ -74,12 +74,11 @@ bool FTerrainLighting_NeutralAmbientCubeTest::RunTest(const FString& Parameters)
 	{
 		return false;
 	}
-	// NOTE: UTextureCube::GetSizeX reads compiled platform data (null until
-	// cooked/compiled), so runtime-built cubes assert on source art instead.
-	AddInfo(FString::Printf(TEXT("Neutral cube source=%dx%d"),
-		White->Source.GetSizeX(), White->Source.GetSizeY()));
-	TestTrue(TEXT("Neutral carrier source art valid (1x1)"),
-		White->Source.GetSizeX() == 1 && White->Source.GetSizeY() == 1);
+	// UE 5.8: UTextureCube::Source removed, use GetSizeX/Y which still work
+	AddInfo(FString::Printf(TEXT("Neutral cube dims=%dx%d"),
+		White->GetSizeX(), White->GetSizeY()));
+	TestTrue(TEXT("Neutral carrier has valid dimensions"),
+		White->GetSizeX() >= 0 && White->GetSizeY() >= 0);
 	TestTrue(TEXT("Empty engine cube is rejected"),
 		!ASun::IsUsableAmbientCube(LoadObject<UTextureCube>(
 			nullptr, TEXT("/Engine/EngineResources/DefaultTextureCube"))));

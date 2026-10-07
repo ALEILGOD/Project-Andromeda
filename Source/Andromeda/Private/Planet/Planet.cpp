@@ -1,9 +1,10 @@
 #include "Planet/Planet.h"
 
 #include "HillairePlanetLinkComponent.h"
-#include "Planet/PlanetTerrainGenerator.h"
+#include "LYTHOS2/Lythos2WorldSubsystem.h"
 #include "PlanetaryLightingComponent.h"
 #include "ProceduralMeshComponent.h"
+#include "Engine/World.h"
 #include "UObject/ConstructorHelpers.h"
 
 
@@ -77,6 +78,32 @@ void APlanet::BeginPlay()
     Super::BeginPlay();
 
     InitializePlanet();
+
+    // LYTHOS 2.0 becomes the authoritative terrain system. The planet
+    // registers with the world streamer, which seeds the coarse (LOD 0)
+    // planet synchronously and streams finer LODs asynchronously based on
+    // viewer distance. No legacy terrain generator is invoked.
+    if (UWorld* World = GetWorld())
+    {
+        if (ULythos2WorldSubsystem* Lythos = World->GetSubsystem<ULythos2WorldSubsystem>())
+        {
+            Lythos->RegisterPlanet(this);
+        }
+    }
+}
+
+
+void APlanet::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (UWorld* World = GetWorld())
+    {
+        if (ULythos2WorldSubsystem* Lythos = World->GetSubsystem<ULythos2WorldSubsystem>())
+        {
+            Lythos->UnregisterPlanet(this);
+        }
+    }
+
+    Super::EndPlay(EndPlayReason);
 }
 
 
@@ -88,6 +115,9 @@ void APlanet::OnConstruction(
         Transform
     );
 
+    // Editor preview only computes the deterministic profile. The volumetric
+    // terrain mesh is produced by LYTHOS 2.0 at BeginPlay (coarse seed) and by
+    // the asynchronous streamer afterwards.
     InitializePlanet();
 }
 
@@ -103,105 +133,4 @@ void APlanet::InitializePlanet()
 
     PlanetArchetype =
         PlanetProfile.Archetype;
-
-    GeneratePlanetMesh();
-}
-
-
-void APlanet::GeneratePlanetMesh()
-{
-    if (!PlanetProceduralMesh)
-    {
-        return;
-    }
-
-    if (!TerrainGenerator)
-    {
-        TerrainGenerator =
-            NewObject<UPlanetTerrainGenerator>(
-                this,
-                UPlanetTerrainGenerator::StaticClass()
-            );
-    }
-
-    if (!TerrainGenerator)
-    {
-        return;
-    }
-
-    TArray<FVector> Vertices;
-    TArray<int32> Triangles;
-    TArray<FVector> Normals;
-    TArray<FProcMeshTangent> Tangents;
-    TArray<FColor> VertexColors;
-
-    TerrainGenerator->GenerateTerrainMeshData(
-        Resolution,
-        PlanetRadius,
-        PlanetSeed,
-        ContinentalScale,
-        MountainScale,
-        DetailScale,
-        MountainStrength,
-        DetailStrength,
-        TerrainHeight,
-        PlanetProfile,
-        Vertices,
-        Triangles,
-        Normals,
-        Tangents,
-        VertexColors
-    );
-
-    TArray<FVector2D> UVs;
-
-    UVs.Reserve(
-        Vertices.Num()
-    );
-
-    for (const FVector& Vertex :
-        Vertices)
-    {
-        const FVector Direction =
-            Vertex.GetSafeNormal();
-
-        const float U =
-            0.5f +
-            FMath::Atan2(
-                Direction.Y,
-                Direction.X
-            ) /
-            (2.0f * PI);
-
-        const float VCoord =
-            0.5f -
-            FMath::Asin(
-                FMath::Clamp(
-                    Direction.Z,
-                    -1.0f,
-                    1.0f
-                )
-            ) /
-            PI;
-
-        UVs.Add(
-            FVector2D(
-                U,
-                VCoord
-            )
-        );
-    }
-
-    PlanetProceduralMesh->ClearAllMeshSections();
-
-    PlanetProceduralMesh->CreateMeshSection(
-        0,
-        Vertices,
-        Triangles,
-        Normals,
-        UVs,
-        VertexColors,
-        Tangents,
-        true
-    );
 }

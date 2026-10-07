@@ -167,14 +167,10 @@ UTextureCube* ASun::BuildNeutralAmbientCube(
     {
         return nullptr;
     }
-    uint8 White[6 * 4];
-    FMemory::Memset(White, 0xFF, sizeof(White));
-    UTextureCube* Cube = NewObject<UTextureCube>(
-        InOuter,
-        NAME_None,
-        RF_Transient
-    );
-    Cube->Source.Init(1, 1, 6, 1, TSF_BGRA8, White);
+    
+    // UE 5.8 compatibility: use CreateTransient which handles transient creation
+    // and avoids the removed UTextureCube::Source property
+    UTextureCube* Cube = UTextureCube::CreateTransient(1, 1, PF_B8G8R8A8);
     Cube->SRGB = false;
     Cube->UpdateResource();
     return Cube;

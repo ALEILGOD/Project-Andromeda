@@ -6,7 +6,6 @@
 #include "Planet.generated.h"
 
 class UProceduralMeshComponent;
-class UPlanetTerrainGenerator;
 class UPlanetaryLightingComponent;
 class UHillairePlanetLinkComponent;
 
@@ -22,6 +21,8 @@ public:
 protected:
 
     virtual void BeginPlay() override;
+
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
     virtual void OnConstruction(
         const FTransform& Transform
@@ -164,16 +165,7 @@ public:
     )
     float DetailStrength = 0.1f;
 
-    UPROPERTY(
-        Transient,
-        BlueprintReadOnly,
-        Category = "Andromeda|Planet"
-    )
-    TObjectPtr<UPlanetTerrainGenerator> TerrainGenerator;
-
 protected:
 
     void InitializePlanet();
-
-    void GeneratePlanetMesh();
 };
