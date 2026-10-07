@@ -112,6 +112,9 @@ void ULythos2WorldSubsystem::RegisterPlanet(APlanet* Planet)
     NewEntry.Context.DetailStrength = Planet->DetailStrength;
     NewEntry.Context.Archetype = static_cast<int32>(Planet->PlanetArchetype);
     NewEntry.Context.VolumetricDetailAmount = Settings.bEnableVolumetricDetail ? 0.12f : 0.0f;
+    NewEntry.Context.GeologyAmount = Settings.GeologyAmount;
+    NewEntry.Context.ClimateProxy = Settings.ClimateProxy;
+    NewEntry.Context.TalusAmount = Settings.TalusAmount;
     NewEntry.Context.WorldPosition = Planet->GetActorLocation();
 
     const int32 Index = Planets.Add(MoveTemp(NewEntry));
@@ -527,9 +530,11 @@ void ULythos2WorldSubsystem::ApplyRemovals()
 
 void ULythos2WorldSubsystem::BeginCollisionBatch()
 {
-    // Disable collision on every section for the duration of the mutation
-    // batch, so the UpdateCollision() calls made internally by
-    // Create/ClearMeshSection snapshot no geometry (they become ~free).
+    // Disable every section's collision flag for the duration of the mutation
+    // batch. Create/ClearMeshSection call UpdateCollision internally; with the
+    // flags off those internal cooks produce empty (cheap) collision instead of
+    // repeatedly re-cooking the full viewer-bounded trimesh on the worker pool.
+    // EndCollisionBatch always restores the correct flags afterwards.
     for (FPlanetEntry& Entry : Planets)
     {
         APlanet* Planet = Entry.Planet.Get();
@@ -551,13 +556,6 @@ void ULythos2WorldSubsystem::BeginCollisionBatch()
 
 void ULythos2WorldSubsystem::EndCollisionBatch()
 {
-    if (!Settings.bEnableCollision)
-    {
-        return;
-    }
-
-    const int32 Interval = FMath::Max(1, Settings.CollisionUpdateIntervalTicks);
-
     for (FPlanetEntry& Entry : Planets)
     {
         APlanet* Planet = Entry.Planet.Get();
@@ -566,30 +564,27 @@ void ULythos2WorldSubsystem::EndCollisionBatch()
             continue;
         }
 
+        UProceduralMeshComponent* PMC = Planet->PlanetProceduralMesh;
+
         ++Entry.TicksSinceCollisionCook;
 
         TSet<FLythos2RegionKey> DesiredCollision;
-        for (const FLythos2RegionKey& Key : Scheduler.GetActiveRegions())
+        if (Settings.bEnableCollision)
         {
-            if (Key.PlanetID == Entry.Context.PlanetID && ShouldRegionHaveCollision(Key, Entry))
+            for (const FLythos2RegionKey& Key : Scheduler.GetActiveRegions())
             {
-                DesiredCollision.Add(Key);
+                if (Key.PlanetID == Entry.Context.PlanetID && ShouldRegionHaveCollision(Key, Entry))
+                {
+                    DesiredCollision.Add(Key);
+                }
             }
         }
 
         const bool bChanged = Entry.bCollisionDirty
             || !SetsEqual(DesiredCollision, Entry.CollisionRegions);
 
-        if (!bChanged || Entry.TicksSinceCollisionCook < Interval)
-        {
-            // Keep whatever collision representation is currently active.
-            continue;
-        }
-
-        UProceduralMeshComponent* PMC = Planet->PlanetProceduralMesh;
-
-        // Re-enable collision only on the viewer-bounded sections, then do a
-        // single coalesced cook for the whole component.
+        // Always restore the correct collision flags: the component's public
+        // state must reflect the viewer-bounded set on every tick.
         for (const TPair<FLythos2RegionKey, int32>& Pair : Entry.SectionByRegion)
         {
             if (FProcMeshSection* Section = PMC->GetProcMeshSection(Pair.Value))
@@ -598,6 +593,19 @@ void ULythos2WorldSubsystem::EndCollisionBatch()
             }
         }
 
+        // Throttle the (bounded) recook so streaming does not dispatch an async
+        // collision cook every tick. The previous representation stays valid and
+        // viewer-bounded until the next cook.
+        const int32 Interval = FMath::Max(1, Settings.CollisionUpdateIntervalTicks);
+        if (!bChanged || Entry.TicksSinceCollisionCook < Interval)
+        {
+            continue;
+        }
+
+        // One coalesced cook for the whole component, over exactly the desired
+        // sections. Uses the configured (async in PIE) cooking path; the engine
+        // aborts any earlier in-flight cook so the latest result wins.
+        PMC->bUseAsyncCooking = Settings.bUseAsyncCollisionCooking;
         const double CookStart = FPlatformTime::Seconds();
         PMC->ClearCollisionConvexMeshes();
         TickCollisionMs += (FPlatformTime::Seconds() - CookStart) * 1000.0;
@@ -607,6 +615,7 @@ void ULythos2WorldSubsystem::EndCollisionBatch()
         Entry.TicksSinceCollisionCook = 0;
     }
 }
+
 
 bool ULythos2WorldSubsystem::ShouldRegionHaveCollision(const FLythos2RegionKey& Key, const FPlanetEntry& Entry) const
 {
@@ -679,6 +688,7 @@ void ULythos2WorldSubsystem::ApplyMeshToEntry(FPlanetEntry& Entry, const FLythos
     AppliedVertices += Size.X;
     AppliedTriangles += Size.Y;
     UploadVerticesThisTick += Mesh.Positions.Num();
+    Entry.VoxelsByRegion.Add(Key, Mesh.VoxelsUsed);
 
     Entry.bCollisionDirty = true;
 }
@@ -702,6 +712,7 @@ void ULythos2WorldSubsystem::RemoveMeshFromEntry(FPlanetEntry& Entry, const FLyt
     Entry.UsedSections.Remove(*SectionIndex);
     Entry.SectionByRegion.Remove(Key);
     Entry.CollisionRegions.Remove(Key);
+    Entry.VoxelsByRegion.Remove(Key);
     if (FIntPoint* Size = Entry.MeshSizeByRegion.Find(Key))
     {
         AppliedVertices -= Size->X;
@@ -747,5 +758,21 @@ void ULythos2WorldSubsystem::PublishStats(double SelectMs, double SchedulerMs)
             ++Settings.LastActiveRegionsByLOD[Key.Lod];
         }
     }
+
+    int32 MaxVoxels = 0;
+    int32 VolumetricRegions = 0;
+    for (FPlanetEntry& Entry : Planets)
+    {
+        for (const TPair<FLythos2RegionKey, int32>& Pair : Entry.VoxelsByRegion)
+        {
+            MaxVoxels = FMath::Max(MaxVoxels, Pair.Value);
+            if (Pair.Value > Settings.VoxelsPerAxis)
+            {
+                ++VolumetricRegions;
+            }
+        }
+    }
+    Settings.LastMaxVoxelsUsed = MaxVoxels;
+    Settings.LastVolumetricRegionCount = VolumetricRegions;
 }
 

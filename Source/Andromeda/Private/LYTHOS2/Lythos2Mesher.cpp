@@ -102,6 +102,8 @@ namespace
             const FColor& CA, const FColor& CB, const FColor& CC) const
         {
             const FVector FaceNormal = FVector::CrossProduct(B - A, C - A);
+            // Reject only genuinely zero-area triangles; thin slivers are valid
+            // geometry for steep walls and thin roofs and must be kept.
             if (FaceNormal.IsNearlyZero())
             {
                 return;
@@ -125,6 +127,13 @@ namespace
             const int32 IB = GetOrAddVertex(VB, VNB, ColorB);
             const int32 IC = GetOrAddVertex(VC, VNC, ColorC);
 
+            // Welding can collapse two corners onto one vertex; emitting that
+            // triangle would store a duplicate-index (degenerate) face.
+            if (IA == IB || IB == IC || IA == IC)
+            {
+                return;
+            }
+
             Mesh->Indices.Add(IA);
             Mesh->Indices.Add(IB);
             Mesh->Indices.Add(IC);
@@ -142,6 +151,131 @@ namespace
             EmitTriangle(A, B, C, NA, NB, NC, OutwardNormal, CA, CB, CC);
         }
     };
+
+    /**
+     * Phase 3.3 geometry-aware complexity of a region, measured from the
+     * authoritative density field (never from viewer/order state). Combines the
+     * fraction of columns with multiple radial sign transitions (narrow/roofed
+     * voids), a radial curvature proxy, and LATERAL surface curvature (canyon
+     * walls, cliffs, narrow openings).
+     */
+    float MeasureRegionComplexity(
+        const FLythos2PlanetContext& Context,
+        const FLythos2RegionKey& Key,
+        int32 ProbeN,
+        double RMin,
+        double RMax,
+        float* OutDepression = nullptr)
+    {
+        ProbeN = FMath::Clamp(ProbeN, 4, 16);
+        const int32 PSu = ProbeN + 1;
+        // The radial probe must be fine enough to SEE a narrow (<0.1H) void,
+        // otherwise a thin feature is invisible and never triggers refinement.
+        const int32 PSr = FMath::Clamp(ProbeN * 8, 24, 80);
+        const double H = FMath::Max(1.0f, Context.TerrainHeightCm);
+
+        TArray<double> Radii;
+        TArray<double> Vals;
+        TArray<double> SurfR;
+        Radii.SetNumUninitialized(PSr);
+        Vals.SetNumUninitialized(PSr);
+        SurfR.Init(-1.0, PSu * PSu);
+
+        int32 Columns = 0;
+        double MultiSum = 0.0;
+        double CurveSum = 0.0;
+
+        for (int32 I = 0; I < PSu; ++I)
+        {
+            const float LU = static_cast<float>(I) / static_cast<float>(ProbeN);
+            for (int32 J = 0; J < PSu; ++J)
+            {
+                const float LV = static_cast<float>(J) / static_cast<float>(ProbeN);
+                const FVector Dir = Lythos2::CubeSphere::RegionSampleDirection(Key, LU, LV);
+                for (int32 K = 0; K < PSr; ++K)
+                {
+                    Radii[K] = RMin + (RMax - RMin) * (static_cast<double>(K) / (PSr - 1));
+                }
+                Lythos2::Density::SampleDensityColumn(Context, Dir, Radii.GetData(), PSr, Vals.GetData());
+
+                int32 SignChanges = 0;
+                int32 PrevSign = 0;
+                double MaxCurv = 0.0;
+                double OuterSurface = -1.0;
+                for (int32 K = 0; K < PSr; ++K)
+                {
+                    const int32 S = Vals[K] > 0.0 ? 1 : (Vals[K] < 0.0 ? -1 : 0);
+                    if (S != 0 && PrevSign != 0 && S != PrevSign) { ++SignChanges; }
+                    if (S != 0) { PrevSign = S; }
+                }
+                for (int32 K = 1; K + 1 < PSr; ++K)
+                {
+                    MaxCurv = FMath::Max(MaxCurv, FMath::Abs(Vals[K + 1] - 2.0 * Vals[K] + Vals[K - 1]));
+                }
+                // Outermost solid crossing (first solid from the outside).
+                for (int32 K = PSr - 1; K >= 0; --K)
+                {
+                    if (Vals[K] > 0.0)
+                    {
+                        if (K == PSr - 1) { OuterSurface = Radii[K]; }
+                        else
+                        {
+                            const double Denom = Vals[K] - Vals[K + 1];
+                            const double T = FMath::Abs(Denom) > 1.0e-12 ? (-Vals[K + 1]) / Denom : 0.0;
+                            OuterSurface = FMath::Lerp(Radii[K + 1], Radii[K], T);
+                        }
+                        break;
+                    }
+                }
+                SurfR[I * PSu + J] = OuterSurface;
+
+                ++Columns;
+                MultiSum += FMath::Clamp(static_cast<double>(SignChanges) / 4.0, 0.0, 1.0);
+                CurveSum += FMath::Clamp(MaxCurv / (H * 0.25), 0.0, 1.0);
+            }
+        }
+
+        if (Columns == 0)
+        {
+            return 0.0f;
+        }
+
+        // Lateral second-difference of the surface radius -> cliff / canyon wall
+        // curvature, and first-difference -> large elevation drops / depressions.
+        double LatSum = 0.0;
+        int32 LatCount = 0;
+        double MaxDrop = 0.0;
+        for (int32 I = 0; I < PSu; ++I)
+        {
+            for (int32 J = 0; J < PSu; ++J)
+            {
+                if (I + 1 >= PSu || J + 1 >= PSu) { continue; }
+                const double A = SurfR[I * PSu + J];
+                const double B = SurfR[(I + 1) * PSu + J];
+                const double C = SurfR[I * PSu + (J + 1)];
+                const double D = SurfR[(I + 1) * PSu + (J + 1)];
+                if (A < 0.0 || B < 0.0 || C < 0.0 || D < 0.0) { continue; }
+                const double D2 = FMath::Abs((A + D) - (B + C));
+                LatSum += FMath::Clamp(D2 / (H * 0.20), 0.0, 1.0);
+                MaxDrop = FMath::Max(MaxDrop, FMath::Abs(A - B));
+                MaxDrop = FMath::Max(MaxDrop, FMath::Abs(A - C));
+                ++LatCount;
+            }
+        }
+        const double Lateral = LatCount > 0 ? (LatSum / LatCount) : 0.0;
+        // Phase 3.4: a large elevation drop / deep depression is a first-class
+        // geometric complexity, normalised by the local geological height scale.
+        const double Depression = FMath::Clamp(MaxDrop / (H * 0.55), 0.0, 1.0);
+        if (OutDepression)
+        {
+            *OutDepression = static_cast<float>(Depression);
+        }
+
+        return FMath::Clamp(
+            static_cast<float>(0.28 * (MultiSum / Columns) + 0.14 * (CurveSum / Columns)
+                + 0.28 * Lateral + 0.30 * Depression),
+            0.0f, 1.0f);
+    }
 }
 
 namespace Lythos2
@@ -170,15 +304,70 @@ namespace Lythos2
                 return;
             }
 
-            const int32 N = FMath::Clamp(Settings.VoxelsPerAxis, 4, 32);
-            const int32 S = N + 1;
-
+            // -----------------------------------------------------------------
+            // Phase 3.3 dynamic, geometry-aware local resolution.
+            //
+            // Ordinary terrain keeps the base resolution. Only when the density
+            // field genuinely needs detail does the region refine: the region
+            // resolution is selected from the MEASURED geometric complexity
+            // (multiple radial sign transitions + radial curvature), then each
+            // individual column may locally redistribute its radial samples onto
+            // its own surface and narrow layers. Every decision comes from the
+            // density field alone, so it is deterministic and independent of the
+            // viewer, generation order or neighbouring regions.
+            // -----------------------------------------------------------------
             const double R = Context.RadiusCm;
             const double H = Context.TerrainHeightCm;
-            const double RMin = FMath::Max(R * 0.05, R - H * Settings.RadialBelowScale - H * Settings.RadialMarginScale);
+            // The deepest roofed void / cavity can sit over a TerrainHeight below
+            // the macro envelope; the radial domain must contain the topology.
+            const double GeologyDepth = 0.55 * FMath::Clamp(Context.GeologyAmount, 0.0f, 1.0f);
+            const double RMin = FMath::Max(R * 0.05, R - H * (Settings.RadialBelowScale + Settings.RadialMarginScale + GeologyDepth));
             const double RMax = R + H * Settings.RadialAboveScale + H * Settings.RadialMarginScale;
 
-            const int32 SampleCount = S * S * S;
+            const int32 BaseN = FMath::Clamp(Settings.VoxelsPerAxis, 4, 32);
+            int32 N = BaseN;
+            float RegionComplexity = 0.0f;
+            float DepressionComplexity = 0.0f;
+            if (Context.GeologyAmount > 0.0f && Settings.bAdaptiveResolution && Settings.VolumetricResolutionLevels > 0)
+            {
+                const int32 MaxN = FMath::Clamp(Settings.MaxVolumetricVoxelsPerAxis, BaseN, 32);
+                if (MaxN > BaseN)
+                {
+                    // Cheap pre-check: only pay for the measured probe where a
+                    // feature/canyon/depression could plausibly be present.
+                    const float Importance = Density::FeatureImportance(Context, CubeSphere::RegionCenterDirection(Key));
+                    if (Importance > 0.02f)
+                    {
+                        RegionComplexity = MeasureRegionComplexity(Context, Key, FMath::Min(BaseN, 8), RMin, RMax, &DepressionComplexity);
+                    }
+                    // Phase 3.4: a smooth, curved mapping keeps ordinary terrain
+                    // at base resolution while giving moderate/steep terrain a
+                    // modest increase in detail (not a global density increase).
+                    const float T = FMath::SmoothStep(0.25f, 0.90f, RegionComplexity);
+                    N = FMath::Clamp(FMath::RoundToInt(FMath::Lerp(static_cast<float>(BaseN), static_cast<float>(MaxN), T)), BaseN, 32);
+                }
+            }
+            OutMesh.BaseVoxelsUsed = BaseN;
+            OutMesh.VoxelsUsed = N;
+            OutMesh.RegionComplexity = RegionComplexity;
+            OutMesh.DepressionComplexity = DepressionComplexity;
+            OutMesh.MaxSurfaceDisplacementCm = static_cast<double>(DepressionComplexity) * H * 0.55;
+            OutMesh.RadialRangeUsedCm = RMax - RMin;
+            OutMesh.RefinementLevels = (N > BaseN) ? 1 : 0;
+
+            int32 Nr = N;
+            if (Context.GeologyAmount > 0.0f)
+            {
+                float Oversample = FMath::Clamp(Settings.GeologyRadialOversample, 1.0f, 3.0f);
+                Oversample += 0.75f * RegionComplexity;
+                Nr = FMath::Clamp(FMath::RoundToInt(static_cast<float>(N) * Oversample), N, 64);
+            }
+            const int32 Su = N + 1;
+            const int32 Sr = Nr + 1;
+            const double RadialStep = (RMax - RMin) / static_cast<double>(FMath::Max(1, Nr));
+            OutMesh.TotalCellCount = N * N * Nr;
+
+            const int32 SampleCount = Su * Su * Sr;
 
             TArray<FVector> Positions;
             TArray<double> Values;
@@ -187,40 +376,155 @@ namespace Lythos2
             Values.SetNumUninitialized(SampleCount);
             Gradients.SetNumUninitialized(SampleCount);
 
-            auto Index = [S](int32 I, int32 J, int32 K) { return (I * S + J) * S + K; };
+            auto Index = [Su, Sr](int32 I, int32 J, int32 K) { return (I * Su + J) * Sr + K; };
 
             const double DensityStart = FPlatformTime::Seconds();
 
-            // 1. Sample the authoritative density field exactly once per grid
-            //    point. This is the only place density is evaluated.
-            for (int32 I = 0; I < S; ++I)
+            // 1. Sample the authoritative density field once per grid point. Each
+            //    radial column shares one direction, so the direction-only
+            //    geomorphology is evaluated once per column and reused for every
+            //    radius (SampleDensityColumn).
+            TArray<double> UniformRadii;
+            TArray<double> UniformVals;
+            TArray<double> WarpedRadii;
+            TArray<double> WarpedVals;
+            UniformRadii.SetNumUninitialized(Sr);
+            UniformVals.SetNumUninitialized(Sr);
+            WarpedRadii.SetNumUninitialized(Sr);
+            WarpedVals.SetNumUninitialized(Sr);
+
+            const bool bLocalRadialRefine = Context.GeologyAmount > 0.0f
+                && Settings.bLocalRadialRefinement && Settings.bAdaptiveResolution;
+
+            for (int32 I = 0; I < Su; ++I)
             {
                 const float LU = static_cast<float>(I) / static_cast<float>(N);
-                for (int32 J = 0; J < S; ++J)
+                for (int32 J = 0; J < Su; ++J)
                 {
                     const float LV = static_cast<float>(J) / static_cast<float>(N);
                     const FVector Dir = CubeSphere::RegionSampleDirection(Key, LU, LV);
-                    for (int32 K = 0; K < S; ++K)
+
+                    for (int32 K = 0; K < Sr; ++K)
                     {
-                        const double Radius = RMin + (RMax - RMin) * (static_cast<double>(K) / N);
-                        const FVector P = Dir * Radius;
+                        UniformRadii[K] = RMin + RadialStep * K;
+                    }
+                    Density::SampleDensityColumn(Context, Dir, UniformRadii.GetData(), Sr, UniformVals.GetData());
+
+                    const double* UseVals = UniformVals.GetData();
+                    const double* UseRadii = UniformRadii.GetData();
+
+                    // Local radial refinement for geometrically complex columns.
+                    if (bLocalRadialRefine)
+                    {
+                        int32 SignChanges = 0;
+                        int32 PrevSign = 0;
+                        double MaxCurv = 0.0;
+                        for (int32 K = 0; K < Sr; ++K)
+                        {
+                            const int32 S = UniformVals[K] > 0.0 ? 1 : (UniformVals[K] < 0.0 ? -1 : 0);
+                            if (S != 0 && PrevSign != 0 && S != PrevSign) { ++SignChanges; }
+                            if (S != 0) { PrevSign = S; }
+                        }
+                        for (int32 K = 1; K + 1 < Sr; ++K)
+                        {
+                            MaxCurv = FMath::Max(MaxCurv,
+                                FMath::Abs(UniformVals[K + 1] - 2.0 * UniformVals[K] + UniformVals[K - 1]));
+                        }
+                        // Local radial refinement is triggered only by genuine
+                        // topological complexity (a real void: multiple sign
+                        // changes) or a truly steep layer, never by the broad
+                        // low-amplitude density curvature of ordinary terrain.
+                        const float ColComplexity = FMath::Clamp(
+                            (SignChanges >= 3 ? 0.7f : 0.0f)
+                            + (MaxCurv > H * 0.28 ? 0.5f : 0.0f),
+                            0.0f, 1.0f);
+
+                        if (ColComplexity > 0.4f)
+                        {
+                            TArray<double> Weight;
+                            Weight.SetNumUninitialized(Sr);
+                            const double SurfaceScale = H * 0.05;
+                            for (int32 K = 0; K < Sr; ++K)
+                            {
+                                const double D = FMath::Abs(UniformVals[K]) / SurfaceScale;
+                                const double NearSurface = FMath::Exp(-D * D);
+                                double Curv = 0.0;
+                                if (K > 0 && K + 1 < Sr)
+                                {
+                                    Curv = FMath::Min(1.0,
+                                        FMath::Abs(UniformVals[K + 1] - 2.0 * UniformVals[K] + UniformVals[K - 1]) / (H * 0.15));
+                                }
+                                Weight[K] = 1.0 + 6.0 * NearSurface + 4.0 * Curv;
+                            }
+
+                            double Total = 0.0;
+                            for (int32 K = 0; K + 1 < Sr; ++K)
+                            {
+                                Total += 0.5 * (Weight[K] + Weight[K + 1]);
+                            }
+
+                            if (Total > 0.0)
+                            {
+                                WarpedRadii[0] = RMin;
+                                WarpedRadii[Nr] = RMax;
+                                int32 Cursor = 0;
+                                double Acc = 0.0;
+                                for (int32 M = 1; M < Nr; ++M)
+                                {
+                                    const double Target = Total * (static_cast<double>(M) / Nr);
+                                    while (Cursor + 1 < Sr - 1 && Acc + 0.5 * (Weight[Cursor] + Weight[Cursor + 1]) < Target)
+                                    {
+                                        Acc += 0.5 * (Weight[Cursor] + Weight[Cursor + 1]);
+                                        ++Cursor;
+                                    }
+                                    const double Seg = FMath::Max(1.0e-12, 0.5 * (Weight[Cursor] + Weight[Cursor + 1]));
+                                    const double Frac = FMath::Clamp((Target - Acc) / Seg, 0.0, 1.0);
+                                    WarpedRadii[M] = UniformRadii[Cursor] + (UniformRadii[Cursor + 1] - UniformRadii[Cursor]) * Frac;
+                                }
+                                // Strict monotonicity with a minimum cell size so
+                                // refinement never creates degenerate (hole-
+                                // producing) slivers.
+                                const double MinGap = RadialStep * 0.5;
+                                WarpedRadii[1] = FMath::Max(WarpedRadii[1], RMin + MinGap);
+                                for (int32 M = 2; M < Nr; ++M)
+                                {
+                                    WarpedRadii[M] = FMath::Max(WarpedRadii[M], WarpedRadii[M - 1] + MinGap);
+                                }
+                                WarpedRadii[Nr - 1] = FMath::Min(WarpedRadii[Nr - 1], RMax - MinGap);
+                                for (int32 M = Nr - 2; M >= 1; --M)
+                                {
+                                    WarpedRadii[M] = FMath::Min(WarpedRadii[M], WarpedRadii[M + 1] - MinGap);
+                                }
+
+                                Density::SampleDensityColumn(Context, Dir, WarpedRadii.GetData(), Sr, WarpedVals.GetData());
+                                UseRadii = WarpedRadii.GetData();
+                                UseVals = WarpedVals.GetData();
+                                ++OutMesh.RadialRefinedColumns;
+                            }
+                        }
+                    }
+
+                    for (int32 K = 0; K < Sr; ++K)
+                    {
                         const int32 Idx = Index(I, J, K);
-                        Positions[Idx] = P;
-                        Values[Idx] = Density::EvaluateDensity(Context, P);
+                        Positions[Idx] = Dir * UseRadii[K];
+                        Values[Idx] = UseVals[K];
                     }
                 }
             }
+            OutMesh.RefinedCellCount = OutMesh.RadialRefinedColumns * Nr;
+            OutMesh.DeepRefinedColumns = (DepressionComplexity > 0.25f) ? OutMesh.RadialRefinedColumns : 0;
 
             // 2. Derive the gradient from the sampled grid with finite
             //    differences instead of re-evaluating the density field six
             //    more times per sample. The gradient is only used for surface
             //    normals and triangle orientation, so this is both exact to the
             //    sampled field and ~7x cheaper. Fully deterministic.
-            for (int32 I = 0; I < S; ++I)
+            for (int32 I = 0; I < Su; ++I)
             {
-                for (int32 J = 0; J < S; ++J)
+                for (int32 J = 0; J < Su; ++J)
                 {
-                    for (int32 K = 0; K < S; ++K)
+                    for (int32 K = 0; K < Sr; ++K)
                     {
                         const int32 Idx = Index(I, J, K);
 
@@ -229,7 +533,7 @@ namespace Lythos2
                         int32 J0 = FMath::Max(J - 1, 0);
                         int32 J1 = FMath::Min(J + 1, N);
                         int32 K0 = FMath::Max(K - 1, 0);
-                        int32 K1 = FMath::Min(K + 1, N);
+                        int32 K1 = FMath::Min(K + 1, Nr);
 
                         FVector Gradient = FVector::ZeroVector;
 
@@ -271,7 +575,7 @@ namespace Lythos2
             {
                 for (int32 J = 0; J < N; ++J)
                 {
-                    for (int32 K = 0; K < N; ++K)
+                    for (int32 K = 0; K < Nr; ++K)
                     {
                         int32 CornerIdx[8];
                         FVector CornerPos[8];
@@ -404,55 +708,162 @@ namespace Lythos2
             }
 
             // -----------------------------------------------------------------
-            // Crack-prevention skirts: a hidden radial curtain hanging inward
-            // along every region boundary. It fills the geometric seam between
-            // neighbouring regions at different LODs.
+            // Phase 3.2 seamless transition collar.
+            //
+            // The collar is only a bounded crack-filler at the real density
+            // surface. Phase 3.1 sized it from the LATERAL cell, which at low
+            // LOD produced kilometre-long vertical sheets (visible stretch) that
+            // also sealed across cavities. It is now sized from the actual seam
+            // magnitude (the fine boundary surface's deviation from the coarser
+            // every-other chord) plus a couple of radial cells, and it is
+            // clamped to the local SOLID thickness so it never crosses a void.
             // -----------------------------------------------------------------
-            const double SkirtDepth = Settings.SkirtDepthCells
-                * RegionSampleSpacingCm(Key, Context, Settings);
-            if (SkirtDepth > 0.0)
-            {
-                struct FBoundaryDef { float StartU, StartV, StepU, StepV; };
+            const double RadialCell = (RMax - RMin) / FMath::Max(1, Nr);
 
+            if (Settings.SkirtDepthCells > 0.0)
+            {
+                // Outer surface radius + contiguous solid thickness from an
+                // already-sampled grid column. Exact to the surface mesh samples.
+                auto ColumnInfo = [&](int32 CI, int32 CJ, double& OutSurf, double& OutThick) -> bool
+                {
+                    double PrevR = 0.0;
+                    double PrevV = 0.0;
+                    bool bHavePrev = false;
+                    for (int32 K = Sr - 1; K >= 0; --K)
+                    {
+                        const int32 Idx = Index(CI, CJ, K);
+                        const double V = Values[Idx];
+                        const double Rr = Positions[Idx].Size();
+                        if (V > 0.0)
+                        {
+                            if (!bHavePrev) { OutSurf = Rr; }
+                            else
+                            {
+                                const double T = (-PrevV) / (V - PrevV);
+                                OutSurf = FMath::Lerp(PrevR, Rr, T);
+                            }
+                            // First empty sample below -> contiguous solid thickness.
+                            double SolidR = Rr;
+                            double SolidV = V;
+                            bool bFoundInner = false;
+                            for (int32 K2 = K - 1; K2 >= 0; --K2)
+                            {
+                                const int32 Idx2 = Index(CI, CJ, K2);
+                                const double V2 = Values[Idx2];
+                                const double R2 = Positions[Idx2].Size();
+                                if (V2 <= 0.0)
+                                {
+                                    const double T2 = SolidV / (SolidV - V2);
+                                    OutThick = OutSurf - FMath::Lerp(SolidR, R2, T2);
+                                    bFoundInner = true;
+                                    break;
+                                }
+                                SolidR = R2;
+                                SolidV = V2;
+                            }
+                            if (!bFoundInner)
+                            {
+                                OutThick = OutSurf - RMin;
+                            }
+                            return true;
+                        }
+                        PrevR = Rr;
+                        PrevV = V;
+                        bHavePrev = true;
+                    }
+                    return false;
+                };
+
+                struct FBoundaryDef { int32 FixedAxis; int32 FixedIndex; };
                 const FBoundaryDef Boundaries[4] =
                 {
-                    { 0.0f, 0.0f, 0.0f, 1.0f }, // U = 0
-                    { 1.0f, 0.0f, 0.0f, 1.0f }, // U = 1
-                    { 0.0f, 0.0f, 1.0f, 0.0f }, // V = 0
-                    { 0.0f, 1.0f, 1.0f, 0.0f }  // V = 1
+                    { 0, 0 }, { 0, N }, { 1, 0 }, { 1, N }
                 };
 
                 for (const FBoundaryDef& B : Boundaries)
                 {
+                    TArray<double> Surf;
+                    TArray<double> Thick;
+                    TArray<uint8> Valid;
+                    Surf.SetNumUninitialized(N + 1);
+                    Thick.SetNumUninitialized(N + 1);
+                    Valid.SetNumUninitialized(N + 1);
+
+                    for (int32 C = 0; C <= N; ++C)
+                    {
+                        const int32 CI = (B.FixedAxis == 0) ? B.FixedIndex : C;
+                        const int32 CJ = (B.FixedAxis == 0) ? C : B.FixedIndex;
+                        double S = 0.0, Tk = 0.0;
+                        Valid[C] = ColumnInfo(CI, CJ, S, Tk) ? uint8(1) : uint8(0);
+                        Surf[C] = S;
+                        Thick[C] = Tk;
+                    }
+
+                    // Actual seam magnitude against a one-step-coarser neighbour:
+                    // curvature (second difference) AND the elevation drop (first
+                    // difference) across the boundary. A deep depression produces
+                    // a large seam that the curvature term alone under-sizes.
+                    double Crack = 0.0;
+                    double MaxDropC = 0.0;
+                    for (int32 C = 1; C < N; ++C)
+                    {
+                        if (Valid[C] && Valid[C - 1])
+                        {
+                            MaxDropC = FMath::Max(MaxDropC, FMath::Abs(Surf[C] - Surf[C - 1]));
+                        }
+                        if (Valid[C] && Valid[C - 1] && Valid[C + 1])
+                        {
+                            Crack = FMath::Max(Crack,
+                                FMath::Abs(Surf[C] - 0.5 * (Surf[C - 1] + Surf[C + 1])));
+                        }
+                    }
+                    const double BoundaryDepth = FMath::Min(
+                        Crack * 1.25 + MaxDropC * 1.5 + 2.0 * RadialCell, H * 0.40);
+
                     for (int32 C = 0; C < N; ++C)
                     {
-                        const float T0 = static_cast<float>(C) / static_cast<float>(N);
-                        const float T1 = static_cast<float>(C + 1) / static_cast<float>(N);
-
-                        const float U0 = B.StartU + B.StepU * T0;
-                        const float V0 = B.StartV + B.StepV * T0;
-                        const float U1 = B.StartU + B.StepU * T1;
-                        const float V1 = B.StartV + B.StepV * T1;
-
-                        const FVector D0 = CubeSphere::RegionSampleDirection(Key, U0, V0);
-                        const FVector D1 = CubeSphere::RegionSampleDirection(Key, U1, V1);
-
-                        const double RS0 = Density::SurfaceRadiusCm(Context, D0);
-                        const double RS1 = Density::SurfaceRadiusCm(Context, D1);
-
-                        if (RS0 < RMin || RS0 > RMax || RS1 < RMin || RS1 > RMax)
+                        if (!Valid[C] || !Valid[C + 1])
+                        {
+                            continue;
+                        }
+                        const double SegDepth = FMath::Min(BoundaryDepth, FMath::Min(Thick[C], Thick[C + 1]));
+                        if (SegDepth <= 1.0)
                         {
                             continue;
                         }
 
-                        const FVector Top0 = D0 * RS0;
-                        const FVector Top1 = D1 * RS1;
-                        const FVector Bot0 = D0 * FMath::Max(RS0 - SkirtDepth, RMin);
-                        const FVector Bot1 = D1 * FMath::Max(RS1 - SkirtDepth, RMin);
+                        int32 I0 = 0, J0 = 0, I1 = 0, J1 = 0;
+                        float U0 = 0.0f, V0 = 0.0f, U1 = 0.0f, V1 = 0.0f;
+                        if (B.FixedAxis == 0)
+                        {
+                            I0 = I1 = B.FixedIndex;
+                            J0 = C; J1 = C + 1;
+                            U0 = U1 = static_cast<float>(B.FixedIndex) / static_cast<float>(N);
+                            V0 = static_cast<float>(C) / static_cast<float>(N);
+                            V1 = static_cast<float>(C + 1) / static_cast<float>(N);
+                        }
+                        else
+                        {
+                            J0 = J1 = B.FixedIndex;
+                            I0 = C; I1 = C + 1;
+                            V0 = V1 = static_cast<float>(B.FixedIndex) / static_cast<float>(N);
+                            U0 = static_cast<float>(C) / static_cast<float>(N);
+                            U1 = static_cast<float>(C + 1) / static_cast<float>(N);
+                        }
 
-                        // The curtain's outward face points away from the chunk
-                        // centre, tangentially. EmitTriangle applies the same
-                        // Unreal winding convention as the surface.
+                        const FVector D0 = CubeSphere::RegionSampleDirection(Key, U0, V0);
+                        const FVector D1 = CubeSphere::RegionSampleDirection(Key, U1, V1);
+
+                        // A hair inward keeps the collar from z-fighting; it
+                        // never rises above the real surface.
+                        const double Top0R = FMath::Max(Surf[C] - 1.0, RMin);
+                        const double Top1R = FMath::Max(Surf[C + 1] - 1.0, RMin);
+
+                        const FVector Top0 = D0 * Top0R;
+                        const FVector Top1 = D1 * Top1R;
+                        const FVector Bot0 = D0 * FMath::Max(Top0R - SegDepth, RMin);
+                        const FVector Bot1 = D1 * FMath::Max(Top1R - SegDepth, RMin);
+
                         const FVector QuadCenter = (Top0 + Top1 + Bot1 + Bot0) * 0.25;
                         const FVector CenterPoint = CubeSphere::RegionCenterDirection(Key) * QuadCenter.Size();
                         FVector OutwardRef = (QuadCenter - CenterPoint).GetSafeNormal();
@@ -461,9 +872,8 @@ namespace Lythos2
                             OutwardRef = QuadCenter.GetSafeNormal();
                         }
 
-                        const FColor SkirtColor(90, 110, 90, 255);
-                        Build.EmitTriangle(Top0, Top1, Bot1, D0, D1, D1, OutwardRef, SkirtColor, SkirtColor, SkirtColor);
-                        Build.EmitTriangle(Top0, Bot1, Bot0, D0, D1, D0, OutwardRef, SkirtColor, SkirtColor, SkirtColor);
+                        Build.AppendTriangle(Top0, Top1, Bot1, D0, D1, D1, OutwardRef);
+                        Build.AppendTriangle(Top0, Bot1, Bot0, D0, D1, D0, OutwardRef);
                     }
                 }
             }

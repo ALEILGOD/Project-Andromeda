@@ -130,6 +130,9 @@ private:
 
         /** Applied mesh size per region (X=vertices, Y=triangles). */
         TMap<FLythos2RegionKey, FIntPoint> MeshSizeByRegion;
+
+        /** Adaptive voxel resolution actually used per applied region. */
+        TMap<FLythos2RegionKey, int32> VoxelsByRegion;
     };
 
     FPlanetEntry* FindEntry(int64 PlanetID);
