@@ -206,7 +206,11 @@ void ULythos2WorldSubsystem::SeedCoarsePlanet(APlanet* Planet, FPlanetEntry& Ent
 
     if (PMC)
     {
-        PMC->bUseAsyncCooking = Settings.bUseAsyncCollisionCooking;
+        // Phase 3.6: streaming collision is cooked SYNCHRONOUSLY (deterministic,
+        // bounded to the viewer's regions). Async cooking could apply a stale or
+        // empty cook after a newer mesh was installed; sync guarantees the last
+        // cook (this frame's authoritative geometry) always wins.
+        PMC->bUseAsyncCooking = false;
     }
 }
 
@@ -602,10 +606,10 @@ void ULythos2WorldSubsystem::EndCollisionBatch()
             continue;
         }
 
-        // One coalesced cook for the whole component, over exactly the desired
-        // sections. Uses the configured (async in PIE) cooking path; the engine
-        // aborts any earlier in-flight cook so the latest result wins.
-        PMC->bUseAsyncCooking = Settings.bUseAsyncCollisionCooking;
+        // One coalesced, SYNCHRONOUS cook for the whole component, over exactly
+        // the desired sections. Deterministic and race-free (see BeginCollision
+        // note); bounded to the viewer's regions and throttled below.
+        PMC->bUseAsyncCooking = false;
         const double CookStart = FPlatformTime::Seconds();
         PMC->ClearCollisionConvexMeshes();
         TickCollisionMs += (FPlatformTime::Seconds() - CookStart) * 1000.0;
@@ -624,12 +628,10 @@ bool ULythos2WorldSubsystem::ShouldRegionHaveCollision(const FLythos2RegionKey& 
         return false;
     }
 
-    // Coarse roots always collide so the initial planet is solid.
-    if (Key.Lod == 0)
-    {
-        return true;
-    }
-
+    // With no viewer yet, only the coarse seed collides so the initial planet
+    // is solid. Once a viewer exists, collision is strictly viewer-bounded for
+    // EVERY LOD (including the huge LOD-0 roots), so a synchronous cook stays
+    // cheap and never re-cooks the whole planet.
     if (!Entry.bHasViewer)
     {
         return Key.Lod <= 1;

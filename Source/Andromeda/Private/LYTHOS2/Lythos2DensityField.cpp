@@ -131,6 +131,15 @@ namespace
         // 3D perturbation of the void/undercut shells (irregular, non-spherical).
         float Void3DFreq = 0.0f;
 
+        // Phase 3.5 depth-stratified rock: near-horizontal hard/soft bands whose
+        // softer layers are preferentially removed, producing coherent ledges,
+        // recessed walls and layer-height overhangs/alcoves.
+        float LayerThickness = 0.14f;   // normalized by TerrainHeight
+        float LayerPhase = 0.0f;        // lateral phase shift (fbm)
+        float LayerWarpAmp = 0.0f;      // 3D irregularity of layer boundaries
+        float Layer3DFreq = 0.0f;
+        float LayerAlcove = 0.0f;       // alcove depth amplitude
+
         float ErosionScale = 1.0f;
         float Talus = 0.0f;
         float FeatureImportance = 0.0f;
@@ -148,10 +157,104 @@ namespace
         int32 BridgeAccepted = 0;
     };
 
-    void ComputeGeoFields(const FLythos2PlanetContext& Context, const FVector& Dir, float MacroElev, FGeoFields& Out)
+    // ---------------------------------------------------------------------
+    // Phase 3.6 authoritative macro geography, computed once and shared with
+    // the geomorphology so smaller-scale erosion can be CONDITIONED by the
+    // larger landform (mountains vs lowlands) instead of being an independent
+    // field that trenches through mountains at random.
+    // ---------------------------------------------------------------------
+    struct FMacroFields
+    {
+        float Elevation = 0.0f;
+        float Mountains = 0.0f;   // raw coherent mountain amplitude (~0..0.55)
+        float LandMask = 0.0f;    // 1 on land, 0 in ocean
+        float Valleys = 0.0f;     // regional valley belts (subtracted)
+    };
+
+    FMacroFields ComputeMacroFields(const FLythos2PlanetContext& Context, const FVector& Direction)
+    {
+        FMacroFields Out;
+        const FVector Dir = Direction.GetSafeNormal();
+        if (Dir.IsNearlyZero())
+        {
+            return Out;
+        }
+
+        const int64 Seed = Context.Seed;
+        auto HU = [Seed](uint64 Channel) { return LythosHashUnit(Seed, Channel); };
+
+        const FVector WarpOffset      = LythosSeedOffset(Seed, 2);
+        const FVector ContinentOffset = LythosSeedOffset(Seed, 3);
+        const FVector RegionalOffset  = LythosSeedOffset(Seed, 4);
+        const FVector OrogenyOffset   = LythosSeedOffset(Seed, 5);
+        const FVector RidgeOffset     = LythosSeedOffset(Seed, 6);
+        const FVector PlateauOffset   = LythosSeedOffset(Seed, 7);
+        const FVector ValleyOffset    = LythosSeedOffset(Seed, 8);
+        const FVector DetailOffset    = LythosSeedOffset(Seed, 9);
+
+        const float ContinentFreq = 1.25f + 0.95f * HU(11);
+        const float WarpFreq      = 1.0f + 0.6f * HU(12);
+        const float WarpAmp       = 0.35f + 0.40f * HU(13);
+        const float SeaLevel      = -0.05f + 0.17f * HU(14);
+        const float ShelfWidth    = 0.05f + 0.06f * HU(15);
+
+        const float RegionalFreq  = 3.2f + 1.6f * HU(16);
+        const float OrogenyFreq   = 2.4f + 1.6f * HU(17);
+        const float BeltLevel     = -0.35f + 0.70f * HU(18);
+        const float BeltWidth     = 0.09f + 0.10f * HU(19);
+        const float RidgeFreq     = 6.0f + 3.0f * HU(20);
+        const float PlateauFreq   = 4.0f + 1.5f * HU(21);
+        const float PlateauEdge   = -0.10f + 0.55f * HU(22);
+        const float ValleyFreq    = 3.4f + 1.6f * HU(23);
+        const float ValleyLevel   = -0.40f + 0.80f * HU(24);
+        const float ValleyWidth   = 0.06f + 0.08f * HU(25);
+        const float DetailFreq    = 10.0f + 4.0f * HU(26);
+
+        const FVector Warp = LythosWarp(Dir, WarpOffset, WarpFreq, WarpAmp, 2);
+        const FVector ContinentCoord = Dir * ContinentFreq + Warp + ContinentOffset * 0.01f;
+        const FVector MidCoord = Dir + Warp * 0.35f;
+
+        const float Continent = LythosFbm(ContinentCoord, 4, 2.0f, 0.5f);
+        const float LandMask = FMath::SmoothStep(SeaLevel - ShelfWidth, SeaLevel + ShelfWidth, Continent);
+        const float OffShore = FMath::Clamp((SeaLevel - Continent) / 0.65f, 0.0f, 1.0f);
+        const float OceanFloor = -(0.05f + 0.50f * OffShore);
+        const float Inland = FMath::Clamp((Continent - SeaLevel) / 0.60f, 0.0f, 1.0f);
+        const float LandBase = 0.03f + 0.16f * Inland + 0.10f * Inland * Inland;
+
+        const float Regional = LythosFbm(MidCoord * RegionalFreq + RegionalOffset, 3, 2.0f, 0.5f) * 0.20f;
+
+        const float Orogeny = LythosFbm(MidCoord * OrogenyFreq + OrogenyOffset, 4, 2.0f, 0.5f);
+        const float Belt = 1.0f - FMath::SmoothStep(0.0f, BeltWidth, FMath::Abs(Orogeny - BeltLevel));
+        const float Ridge = LythosRidged(MidCoord * RidgeFreq + RidgeOffset, 4, 2.0f, 0.5f);
+        const float AlongRange = 0.55f + 0.45f
+            * LythosFbm(MidCoord * (RidgeFreq * 0.5f) + RidgeOffset, 2, 2.0f, 0.5f);
+        const float Mountains = Belt * Ridge * AlongRange * 0.55f;
+
+        const float PlateauField = LythosFbm(MidCoord * PlateauFreq + PlateauOffset, 3, 2.0f, 0.5f);
+        const float Plateau = FMath::SmoothStep(PlateauEdge, PlateauEdge + 0.10f, PlateauField) * 0.12f;
+
+        const float ValleyField = LythosFbm(MidCoord * ValleyFreq + ValleyOffset, 3, 2.0f, 0.5f);
+        const float ValleyBelt = 1.0f - FMath::SmoothStep(0.0f, ValleyWidth, FMath::Abs(ValleyField - ValleyLevel));
+        const float Valleys = ValleyBelt * (0.08f + 0.08f * HU(27));
+
+        const float Detail = LythosFbm(Dir * DetailFreq + DetailOffset, 2, 2.0f, 0.5f) * 0.03f;
+
+        const float Base = FMath::Lerp(OceanFloor, LandBase, LandMask);
+        const float LandFeatures = (Regional + Mountains + Plateau - Valleys) * LandMask;
+        const float Elevation = Base + LandFeatures + Detail * LandMask;
+
+        Out.Elevation = FMath::Clamp(Elevation, -1.0f, 1.0f);
+        Out.Mountains = Mountains;
+        Out.LandMask = LandMask;
+        Out.Valleys = Valleys;
+        return Out;
+    }
+
+    void ComputeGeoFields(const FLythos2PlanetContext& Context, const FVector& Dir, const FMacroFields& Macro, FGeoFields& Out)
     {
         const int64 Seed = Context.Seed;
         auto HU = [Seed](uint64 Channel) { return LythosHashUnit(Seed, Channel); };
+        const float MacroElev = Macro.Elevation;
 
         const FVector PrimaryOff = LythosSeedOffset(Seed, 31);
         const FVector SecondOff  = LythosSeedOffset(Seed, 32);
@@ -161,6 +264,7 @@ namespace
         const FVector FeatOff    = LythosSeedOffset(Seed, 36);
         const FVector DeepOff    = LythosSeedOffset(Seed, 37);
         const FVector WarpOff    = LythosSeedOffset(Seed, 38);
+        const FVector LayerOff   = LythosSeedOffset(Seed, 41);
 
         const float BaseFreq   = 6.0f + 3.5f * HU(41);
         const float WarpF      = 1.1f + 0.8f * HU(42);
@@ -211,13 +315,21 @@ namespace
         // --- Geological layering (strata) ---------------------------------
         Out.Strata = 0.5f + 0.5f * LythosFbm(D * StrataFreq + StrataOff, 3, 2.0f, 0.5f);
 
+
         // --- Surface incision (hierarchical) ------------------------------
         const float Uplift = FMath::Clamp((MacroElev + 0.08f) / 0.62f, 0.0f, 1.0f);
 
-        const float Inc1 = Out.Primary   * (0.10f + 0.20f * HU(53)) * Out.ErosionScale * (1.0f - 0.55f * Out.Resist);
-        const float Inc2 = Out.Secondary * (0.04f + 0.08f * HU(54)) * (0.35f + 0.65f * Uplift) * Out.ErosionScale * (1.0f - 0.55f * Out.Resist);
-        const float Inc3 = Out.Tertiary  * (0.028f + 0.040f * HU(55)) * Out.ErosionScale * (1.0f - 0.45f * Out.Resist);
-        const float Inc4 = Out.Fine      * 0.004f * Out.ErosionScale;
+        // Phase 3.6 spatial coherence: incision is conditioned by the coherent
+        // mountain mass so erosion channels incise slopes and lowlands instead
+        // of trenching through mountain crests. (Incised mountain valleys and
+        // passes still occur where IncMask leaves a residual.)
+        const float Mountainness = FMath::SmoothStep(0.12f, 0.50f, Macro.Mountains);
+        const float IncMask = 1.0f - 0.70f * Mountainness;
+
+        const float Inc1 = Out.Primary   * (0.10f + 0.20f * HU(53)) * Out.ErosionScale * (1.0f - 0.55f * Out.Resist) * IncMask;
+        const float Inc2 = Out.Secondary * (0.04f + 0.08f * HU(54)) * (0.35f + 0.65f * Uplift) * Out.ErosionScale * (1.0f - 0.55f * Out.Resist) * IncMask;
+        const float Inc3 = Out.Tertiary  * (0.022f + 0.032f * HU(55)) * Out.ErosionScale * (1.0f - 0.45f * Out.Resist) * (0.5f + 0.5f * IncMask);
+        const float Inc4 = Out.Fine      * 0.003f * Out.ErosionScale;
         float Erode = Inc1 + Inc2 + Inc3 + Inc4;
 
         // Talus/debris response: partially infill narrow, over-steep gullies.
@@ -256,6 +368,29 @@ namespace
         // medium erosion overhangs and alcoves are moderately more common,
         // while enclosed cavities and bridges (VoidGate/DeepMask) stay rare.
         const float UnderGate = FMath::SmoothStep(0.50f, 0.66f, Out.SparseField2);
+
+        // --- Phase 3.5 depth-stratified rock layers -----------------------
+        // Near-horizontal bands (function of depth below the macro envelope)
+        // with laterally varying thickness/phase and 3D warp so they read as
+        // tilted, folded strata rather than perfect shells. Resistant caps over
+        // softer layers are removed preferentially, producing ledges, recessed
+        // walls and layer-height overhangs/alcoves.
+        {
+            const float LayerFreq = 0.9f + 0.8f * HU(58);
+            const float LayerVar = 0.5f + 0.5f * LythosFbm(D * LayerFreq + LayerOff, 2, 2.0f, 0.5f);
+            Out.LayerThickness = 0.080f + 0.100f * LayerVar;
+            Out.LayerPhase = 0.45f * LythosFbm(D * (LayerFreq * 0.6f) + LayerOff + FVector(4.0f, -9.0f, 3.0f), 2, 2.0f, 0.5f);
+            Out.LayerWarpAmp = 0.020f + 0.030f * HU(59);
+            Out.Layer3DFreq = 1.0f / FMath::Max(500.0f, Context.TerrainHeightCm * 0.22f);
+
+            // Alcove amplitude: strongest in resistant rock, gated to a moderate
+            // (not universal) spatial selection and uplifted terrain so cliffs
+            // form coherent alcove bands rather than ubiquitous holes.
+            const float LayerGate = FMath::SmoothStep(0.38f, 0.60f, Out.SparseField2);
+            const float LayerUplift = FMath::Clamp((MacroElev + 0.10f) / 0.55f, 0.0f, 1.0f);
+            Out.LayerAlcove = (0.10f + 0.16f * HU(60)) * (0.40f + 0.60f * Out.Resist)
+                * LayerGate * (0.40f + 0.60f * LayerUplift);
+        }
 
         const float WallBand = FMath::SmoothStep(0.30f, 0.62f, Out.Primary)
             * (1.0f - FMath::SmoothStep(0.80f, 0.98f, Out.Primary));
@@ -338,6 +473,22 @@ namespace
             Result -= F.DeepMask * F.DeepStrength * FMath::Exp(-w * w);
         }
 
+        // Phase 3.5 depth-stratified alcoves: a hard cap over a softer layer.
+        // The softer band is removed preferentially, producing a recessed ledge
+        // or (when strong enough) a true overhang under the cap. The layer
+        // coordinate is warped in 3D so bands are irregular, not spherical.
+        if (F.LayerAlcove > 1.0e-4f)
+        {
+            const double Warp = static_cast<double>(F.LayerWarpAmp) * FMath::PerlinNoise3D(P * F.Layer3DFreq);
+            const double Coord = (DepthNorm + static_cast<double>(F.LayerPhase) + Warp)
+                / FMath::Max(0.02, static_cast<double>(F.LayerThickness));
+            const double FracD = Coord - FMath::FloorToDouble(Coord);
+            const float Frac = static_cast<float>(FracD);
+            const float Soft = FMath::SmoothStep(0.42f, 0.66f, Frac)
+                * (1.0f - FMath::SmoothStep(0.86f, 0.99f, Frac));
+            Result -= static_cast<double>(F.LayerAlcove) * static_cast<double>(Soft);
+        }
+
         return Result * H;
     }
 }
@@ -348,105 +499,7 @@ namespace Lythos2
     {
         float MacroElevation(const FLythos2PlanetContext& Context, const FVector& Direction)
         {
-            const FVector Dir = Direction.GetSafeNormal();
-            if (Dir.IsNearlyZero())
-            {
-                return 0.0f;
-            }
-
-            const int64 Seed = Context.Seed;
-
-            // --- Deterministic seed-derived geography profile -----------------
-            auto HU = [Seed](uint64 Channel) { return LythosHashUnit(Seed, Channel); };
-
-            const FVector WarpOffset      = LythosSeedOffset(Seed, 2);
-            const FVector ContinentOffset = LythosSeedOffset(Seed, 3);
-            const FVector RegionalOffset  = LythosSeedOffset(Seed, 4);
-            const FVector OrogenyOffset   = LythosSeedOffset(Seed, 5);
-            const FVector RidgeOffset     = LythosSeedOffset(Seed, 6);
-            const FVector PlateauOffset   = LythosSeedOffset(Seed, 7);
-            const FVector ValleyOffset    = LythosSeedOffset(Seed, 8);
-            const FVector DetailOffset    = LythosSeedOffset(Seed, 9);
-
-            // Planetary scale: continent/ocean distribution.
-            const float ContinentFreq = 1.25f + 0.95f * HU(11);
-            const float WarpFreq      = 1.0f + 0.6f * HU(12);
-            const float WarpAmp       = 0.35f + 0.40f * HU(13);
-            const float SeaLevel      = -0.05f + 0.17f * HU(14);
-            const float ShelfWidth    = 0.05f + 0.06f * HU(15);
-
-            // Continental scale: broad highlands/lowlands.
-            const float RegionalFreq  = 3.2f + 1.6f * HU(16);
-
-            // Mountain-system scale: coherent ranges along orogeny contours.
-            const float OrogenyFreq   = 2.4f + 1.6f * HU(17);
-            const float BeltLevel     = -0.35f + 0.70f * HU(18);
-            const float BeltWidth     = 0.09f + 0.10f * HU(19);
-            const float RidgeFreq     = 6.0f + 3.0f * HU(20);
-
-            // Regional scale: plateaus, escarpments, secondary valleys.
-            const float PlateauFreq   = 4.0f + 1.5f * HU(21);
-            const float PlateauEdge   = -0.10f + 0.55f * HU(22);
-            const float ValleyFreq    = 3.4f + 1.6f * HU(23);
-            const float ValleyLevel   = -0.40f + 0.80f * HU(24);
-            const float ValleyWidth   = 0.06f + 0.08f * HU(25);
-
-            // Local scale: restrained surface variation.
-            const float DetailFreq    = 10.0f + 4.0f * HU(26);
-
-            // --- Coordinate fields --------------------------------------------
-            // Strong warp -> irregular coastlines / continental silhouettes.
-            const FVector Warp = LythosWarp(Dir, WarpOffset, WarpFreq, WarpAmp, 2);
-            const FVector ContinentCoord = Dir * ContinentFreq + Warp + ContinentOffset * 0.01f;
-
-            // Mild warp reused for every finer scale (no extra evaluation cost).
-            const FVector MidCoord = Dir + Warp * 0.35f;
-
-            // --- 1. Continents / ocean basins (planetary scale) ---------------
-            const float Continent = LythosFbm(ContinentCoord, 4, 2.0f, 0.5f); // -1..1
-
-            // Smooth land mask; the ocean side is broader to form a shelf.
-            const float LandMask = FMath::SmoothStep(SeaLevel - ShelfWidth, SeaLevel + ShelfWidth, Continent);
-
-            // Ocean floor deepens offshore (continental shelf near the coast).
-            const float OffShore = FMath::Clamp((SeaLevel - Continent) / 0.65f, 0.0f, 1.0f);
-            const float OceanFloor = -(0.05f + 0.50f * OffShore);
-
-            // Land rises from the coast toward stable continental interiors.
-            const float Inland = FMath::Clamp((Continent - SeaLevel) / 0.60f, 0.0f, 1.0f);
-            const float LandBase = 0.03f + 0.16f * Inland + 0.10f * Inland * Inland;
-
-            // --- 2. Regional elevation (continental scale) --------------------
-            const float Regional = LythosFbm(MidCoord * RegionalFreq + RegionalOffset, 3, 2.0f, 0.5f) * 0.20f;
-
-            // --- 3. Mountain systems (mountain scale) -------------------------
-            // Ranges follow the iso-contours of a smooth orogeny potential, so
-            // they are coherent, oriented belts instead of isolated spikes.
-            const float Orogeny = LythosFbm(MidCoord * OrogenyFreq + OrogenyOffset, 4, 2.0f, 0.5f);
-            const float Belt = 1.0f - FMath::SmoothStep(0.0f, BeltWidth, FMath::Abs(Orogeny - BeltLevel));
-            const float Ridge = LythosRidged(MidCoord * RidgeFreq + RidgeOffset, 4, 2.0f, 0.5f);
-            const float AlongRange = 0.55f + 0.45f
-                * LythosFbm(MidCoord * (RidgeFreq * 0.5f) + RidgeOffset, 2, 2.0f, 0.5f);
-            const float Mountains = Belt * Ridge * AlongRange * 0.55f;
-
-            // --- 4. Plateaus / highlands with steep edges (escarpments) -------
-            const float PlateauField = LythosFbm(MidCoord * PlateauFreq + PlateauOffset, 3, 2.0f, 0.5f);
-            const float Plateau = FMath::SmoothStep(PlateauEdge, PlateauEdge + 0.10f, PlateauField) * 0.12f;
-
-            // --- 5. Secondary valley systems (contour belts, subtracted) ------
-            const float ValleyField = LythosFbm(MidCoord * ValleyFreq + ValleyOffset, 3, 2.0f, 0.5f);
-            const float ValleyBelt = 1.0f - FMath::SmoothStep(0.0f, ValleyWidth, FMath::Abs(ValleyField - ValleyLevel));
-            const float Valleys = ValleyBelt * (0.08f + 0.08f * HU(27));
-
-            // --- 6. Local detail (restrained, land only) ----------------------
-            const float Detail = LythosFbm(Dir * DetailFreq + DetailOffset, 2, 2.0f, 0.5f) * 0.03f;
-
-            // --- Composite ----------------------------------------------------
-            const float Base = FMath::Lerp(OceanFloor, LandBase, LandMask);
-            const float LandFeatures = (Regional + Mountains + Plateau - Valleys) * LandMask;
-            const float Elevation = Base + LandFeatures + Detail * LandMask;
-
-            return FMath::Clamp(Elevation, -1.0f, 1.0f);
+            return ComputeMacroFields(Context, Direction).Elevation;
         }
 
         double SurfaceRadiusCm(const FLythos2PlanetContext& Context, const FVector& Direction)
@@ -464,9 +517,9 @@ namespace Lythos2
             }
 
             const FVector Dir = LocalPosition / R;
-            const float MacroElev = MacroElevation(Context, Dir);
+            const FMacroFields Macro = ComputeMacroFields(Context, Dir);
             const double MacroSurface = static_cast<double>(Context.RadiusCm)
-                + static_cast<double>(Context.TerrainHeightCm) * MacroElev;
+                + static_cast<double>(Context.TerrainHeightCm) * Macro.Elevation;
             const double MacroDensity = MacroSurface - R;
 
             if (Context.GeologyAmount <= 0.0f)
@@ -475,7 +528,7 @@ namespace Lythos2
             }
 
             FGeoFields Fields;
-            ComputeGeoFields(Context, Dir, MacroElev, Fields);
+            ComputeGeoFields(Context, Dir, Macro, Fields);
             const double Geology = EvaluateProfileAtRadius(Context, Fields, LocalPosition, R);
             if (Context.GeologyAmount >= 1.0f)
             {
@@ -503,9 +556,9 @@ namespace Lythos2
                 return;
             }
 
-            const float MacroElev = MacroElevation(Context, Dir);
+            const FMacroFields Macro = ComputeMacroFields(Context, Dir);
             const double MacroSurface = static_cast<double>(Context.RadiusCm)
-                + static_cast<double>(Context.TerrainHeightCm) * MacroElev;
+                + static_cast<double>(Context.TerrainHeightCm) * Macro.Elevation;
             const double GeologyWeight = static_cast<double>(Context.GeologyAmount);
 
             if (Context.GeologyAmount <= 0.0f)
@@ -517,7 +570,7 @@ namespace Lythos2
             // The direction-only geomorphology is computed exactly once per
             // column; this is the single biggest mesher speed-up.
             FGeoFields Fields;
-            ComputeGeoFields(Context, Dir, MacroElev, Fields);
+            ComputeGeoFields(Context, Dir, Macro, Fields);
 
             for (int32 I = 0; I < Count; ++I)
             {
@@ -594,14 +647,15 @@ namespace Lythos2
                 return;
             }
 
-            OutSample.MacroElev = MacroElevation(Context, Dir);
+            const FMacroFields Macro = ComputeMacroFields(Context, Dir);
+            OutSample.MacroElev = Macro.Elevation;
             if (Context.GeologyAmount <= 0.0f)
             {
                 return;
             }
 
             FGeoFields Fields;
-            ComputeGeoFields(Context, Dir, OutSample.MacroElev, Fields);
+            ComputeGeoFields(Context, Dir, Macro, Fields);
 
             OutSample.Resistance = Fields.Resist;
             OutSample.PrimaryDrainage = Fields.Primary;
@@ -630,6 +684,9 @@ namespace Lythos2
             OutSample.OverhangAccepted = Fields.OverhangAccepted;
             OutSample.CavityAccepted = Fields.CavityAccepted;
             OutSample.BridgeAccepted = Fields.BridgeAccepted;
+            OutSample.LayerThickness = Fields.LayerThickness;
+            OutSample.LayerAlcoveStrength = Fields.LayerAlcove;
+            OutSample.Mountainness = Macro.Mountains;
         }
 
         float FeatureImportance(const FLythos2PlanetContext& Context, const FVector& Direction)
@@ -645,9 +702,9 @@ namespace Lythos2
                 return 0.0f;
             }
 
-            const float MacroElev = MacroElevation(Context, Dir);
+            const FMacroFields Macro = ComputeMacroFields(Context, Dir);
             FGeoFields Fields;
-            ComputeGeoFields(Context, Dir, MacroElev, Fields);
+            ComputeGeoFields(Context, Dir, Macro, Fields);
             return Fields.FeatureImportance;
         }
 

@@ -3276,7 +3276,7 @@ namespace
         int32 LargestClosedTriangles = 0;
     };
 
-    FLythos2TopoStats LythosAnalyzeTopology(const FLythos2MeshData& Mesh, double WeldQuantum = 1.0 / 64.0)
+    FLythos2TopoStats LythosAnalyzeTopology(const FLythos2MeshData& Mesh, double WeldQuantum = 1.0 / 2048.0)
     {
         FLythos2TopoStats S;
         const int32 NV = Mesh.Positions.Num();
@@ -3440,7 +3440,7 @@ bool FLythos2P32WatertightVolumetric::RunTest(const FString& Parameters)
                 {
                     const FVector& P = Mesh.Positions[I];
                     const FIntVector K(
-                        FMath::RoundToInt(P.X * 64.0), FMath::RoundToInt(P.Y * 64.0), FMath::RoundToInt(P.Z * 64.0));
+                        FMath::RoundToInt(P.X * 2048.0), FMath::RoundToInt(P.Y * 2048.0), FMath::RoundToInt(P.Z * 2048.0));
                     if (const int32* E = Map.Find(K)) { Remap[I] = *E; }
                     else { const int32 NN = Map.Num(); Map.Add(K, NN); Remap[I] = NN; }
                 }
@@ -3665,7 +3665,7 @@ namespace
         {
             const FVector& P = Mesh.Positions[I];
             const FIntVector K(
-                FMath::RoundToInt(P.X * 64.0), FMath::RoundToInt(P.Y * 64.0), FMath::RoundToInt(P.Z * 64.0));
+                FMath::RoundToInt(P.X * 2048.0), FMath::RoundToInt(P.Y * 2048.0), FMath::RoundToInt(P.Z * 2048.0));
             if (const int32* E = Map.Find(K)) { Remap[I] = *E; }
             else { const int32 NN = Map.Num(); Map.Add(K, NN); Remap[I] = NN; }
         }
@@ -4299,7 +4299,13 @@ namespace
             if (!(Bands[0].Sign < 0 && Bands[1].Sign > 0 && Bands[2].Sign < 0 && Bands[3].Sign > 0)) { continue; }
             if (Bands[2].OuterR - Bands[2].InnerR < Context.TerrainHeightCm * MinVoidFraction) { continue; }
 
-            OutKey = LythosLod2RegionForDirection(Dir);
+            // Prefer a face-interior region so the boundary classifier below is
+            // unambiguous (no cube-face seam).
+            const FLythos2RegionKey K = LythosLod2RegionForDirection(Dir);
+            const int32 Side = K.GetSide();
+            if (K.X == 0 || K.X == Side - 1 || K.Y == 0 || K.Y == Side - 1) { continue; }
+
+            OutKey = K;
             OutDir = Dir;
             OutVoidTop = Bands[2].OuterR;
             OutVoidBot = Bands[2].InnerR;
@@ -4384,24 +4390,44 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P33RareNaturalBridges,
 bool FLythos2P33RareNaturalBridges::RunTest(const FString& Parameters)
 {
     const FLythos2PlanetContext Context = MakeGeoContext(330404);
+    const double H = Context.TerrainHeightCm;
     TArray<FVector> Dirs;
     LythosFibonacciSphere(6000, Dirs);
 
     int32 Decks = 0;
+    int32 Bridges = 0;
     for (const FVector& Dir : Dirs)
     {
         if (Lythos2::Density::MacroElevation(Context, Dir) < 0.05f) { continue; }
         TArray<FBand> Bands;
         ScanColumnBands(Context, Dir, 180, Bands);
+        bool bDeck = false;
         for (int32 B = 1; B + 1 < Bands.Num(); ++B)
         {
-            if (Bands[B].Sign > 0 && Bands[B - 1].Sign < 0 && Bands[B + 1].Sign < 0) { ++Decks; break; }
+            if (Bands[B].Sign > 0 && Bands[B - 1].Sign < 0 && Bands[B + 1].Sign < 0) { bDeck = true; break; }
+        }
+        if (!bDeck) { continue; }
+        ++Decks;
+
+        // A true natural bridge is a surviving rock span over an OPEN gap: a
+        // lateral neighbour's surface drops well below it.
+        const double Surface = Lythos2::Density::FindSurfaceRadiusCm(Context, Dir, H);
+        if (Surface > 0.0)
+        {
+            const FVector T1 = FVector::CrossProduct(Dir, FVector::UpVector).GetSafeNormal();
+            const FVector T2 = FVector::CrossProduct(Dir, T1).GetSafeNormal();
+            const FVector N4[4] = { Dir + T1 * 0.004f, Dir - T1 * 0.004f, Dir + T2 * 0.004f, Dir - T2 * 0.004f };
+            for (const FVector& N : N4)
+            {
+                const double NS = Lythos2::Density::FindSurfaceRadiusCm(Context, N, H);
+                if (NS > 0.0 && NS < Surface - H * 0.06) { ++Bridges; break; }
+            }
         }
     }
 
-    TestTrue(TEXT("Bridge/arch topology remains possible"), Decks >= 1);
-    TestTrue(TEXT("Bridge/arch topology is rare (a discovery)"), Decks < Dirs.Num() / 20);
-    AddInfo(FString::Printf(TEXT("RareNaturalBridges: decks=%d of %d"), Decks, Dirs.Num()));
+    TestTrue(TEXT("Stratified roofed-void (overhang) topology occurs"), Decks >= 1);
+    TestTrue(TEXT("Natural bridge topology is rare (a discovery)"), Bridges < Dirs.Num() / 20);
+    AddInfo(FString::Printf(TEXT("RareNaturalBridges: decks=%d bridges=%d of %d"), Decks, Bridges, Dirs.Num()));
     return true;
 }
 
@@ -5135,6 +5161,478 @@ bool FLythos2P34DeepCubeFaceContinuity::RunTest(const FString& Parameters)
 
     TestTrue(TEXT("Depth surface is continuous across cube-face edges"), MaxJump < H * 0.05);
     AddInfo(FString::Printf(TEXT("DeepCubeFaceContinuity: maxJumpCm=%.2f"), MaxJump));
+    return true;
+}
+
+// =============================================================================
+// Phase 3.5 - reference-guided stratified geomorphology & multiband transitions.
+// =============================================================================
+
+// Depth-stratified geology: differential erosion of harder/softer near-
+// horizontal bands produces coherent multi-layer ledges/alcoves, but they must
+// remain a minority of the surface (not a cave world).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P35StratifiedAlcoves,
+    "Andromeda.Lythos2.Features.StratifiedAlcoves", LythosFlags)
+bool FLythos2P35StratifiedAlcoves::RunTest(const FString& Parameters)
+{
+    const FLythos2PlanetContext Context = MakeGeoContext(350101);
+    TArray<FVector> Dirs;
+    LythosFibonacciSphere(6000, Dirs);
+
+    int32 Land = 0, Alcove = 0, MultiSign = 0;
+    double SumAlcove = 0.0;
+    float MinThickness = 1.0f, MaxThickness = 0.0f;
+    for (const FVector& Dir : Dirs)
+    {
+        Lythos2::Density::FLythos2GeologySample S;
+        Lythos2::Density::SampleGeology(Context, Dir, S);
+        if (S.MacroElev < 0.05f) { continue; }
+        ++Land;
+        if (S.LayerAlcoveStrength > 0.06f) { ++Alcove; }
+        SumAlcove += S.LayerAlcoveStrength;
+        MinThickness = FMath::Min(MinThickness, S.LayerThickness);
+        MaxThickness = FMath::Max(MaxThickness, S.LayerThickness);
+
+        TArray<FBand> Bands;
+        ScanColumnBands(Context, Dir, 220, Bands);
+        if (Bands.Num() >= 4) { ++MultiSign; }
+    }
+
+    TestTrue(TEXT("Land samples exist"), Land > 0);
+    TestTrue(TEXT("Depth-stratified alcoves form"), Alcove > 0);
+    TestTrue(TEXT("Multi-layer stratified topology occurs"), MultiSign > 0);
+    TestTrue(TEXT("Stratified/volumetric topology remains a minority"), MultiSign * 3 < Land);
+    TestTrue(TEXT("Layer thickness varies across the planet"), (MaxThickness - MinThickness) > 0.03f);
+
+    AddInfo(FString::Printf(TEXT("StratifiedAlcoves: land=%d alcove=%d multi=%d meanAlc=%.3f thick=[%.3f..%.3f]"),
+        Land, Alcove, MultiSign, Land ? SumAlcove / Land : 0.0, MinThickness, MaxThickness));
+    return true;
+}
+
+// Stratified geology is deterministic for a given seed and varies with the seed.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P35StrataDeterminism,
+    "Andromeda.Lythos2.Features.StrataDeterminism", LythosFlags)
+bool FLythos2P35StrataDeterminism::RunTest(const FString& Parameters)
+{
+    const FLythos2PlanetContext A = MakeGeoContext(350202);
+    const FLythos2PlanetContext B = MakeGeoContext(350202);
+    const FLythos2PlanetContext C = MakeGeoContext(350203);
+    TArray<FVector> Dirs;
+    LythosFibonacciSphere(2000, Dirs);
+
+    double SumA = 0.0, SumB = 0.0, SumC = 0.0;
+    for (const FVector& Dir : Dirs)
+    {
+        Lythos2::Density::FLythos2GeologySample Sa, Sb, Sc;
+        Lythos2::Density::SampleGeology(A, Dir, Sa);
+        Lythos2::Density::SampleGeology(B, Dir, Sb);
+        Lythos2::Density::SampleGeology(C, Dir, Sc);
+        SumA += Sa.LayerAlcoveStrength;
+        SumB += Sb.LayerAlcoveStrength;
+        SumC += Sc.LayerAlcoveStrength;
+    }
+    TestTrue(TEXT("Same seed produces identical strata"), FMath::Abs(SumA - SumB) < 1.0e-9);
+    TestTrue(TEXT("Different seed produces different strata"), FMath::Abs(SumA - SumC) > 1.0e-6);
+    AddInfo(FString::Printf(TEXT("StrataDeterminism: A=%.2f C=%.2f"), SumA, SumC));
+    return true;
+}
+
+// The multiband collar seals every solid band across a mixed-resolution
+// boundary, including cavity roofs/floors, leaving no unmatched boundary edges.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P35MultiBandBoundary,
+    "Andromeda.Lythos2.Mesher.MultiBandBoundary", LythosFlags)
+bool FLythos2P35MultiBandBoundary::RunTest(const FString& Parameters)
+{
+    const FLythos2PlanetContext Context = MakeGeoContext(350303);
+    // Fine/coarse same-LOD neighbours with a cavity near the shared boundary.
+    FLythos2Settings Fine = MakeSettings(2, 20);
+    Fine.bAdaptiveResolution = false;
+    Fine.SkirtDepthCells = 3.0f;
+    FLythos2Settings Coarse = Fine;
+    Coarse.VoxelsPerAxis = 12;
+
+    const FLythos2RegionKey A(4, 2, 1, 1);
+    const FLythos2RegionKey B(4, 2, 2, 1);
+    const FLythos2MeshData MeshA = BuildRegion(Context, A, Fine);
+    const FLythos2MeshData MeshB = BuildRegion(Context, B, Coarse);
+    TestTrue(TEXT("Both mixed-resolution neighbours meshed"), MeshA.Indices.Num() > 0 && MeshB.Indices.Num() > 0);
+
+    // Every solid band of the shared boundary must have boundary geometry from
+    // at least one side (outer surface AND interior cavity roof/floor bands).
+    const double H = Context.TerrainHeightCm;
+    const float CosTol = 0.9985f;
+    const int32 K = 48;
+    int32 Checked = 0, Uncovered = 0, InteriorBands = 0;
+    for (int32 k = 0; k <= K; ++k)
+    {
+        const float V = (static_cast<float>(k) / K) * 0.25f;
+        const FVector Dir = Lythos2::CubeSphere::RegionSampleDirection(A, 1.0f, V);
+        const double Surf = Lythos2::Density::FindSurfaceRadiusCm(Context, Dir, H);
+
+        TArray<FBand> Bands;
+        ScanColumnBands(Context, Dir, 220, Bands);
+        for (const FBand& Band : Bands)
+        {
+            if (Band.Sign <= 0 || Band.OuterR - Band.InnerR < H * 0.02) { continue; }
+            ++Checked;
+            const bool bOuterBand = (Surf > 0.0 && FMath::Abs(Band.OuterR - Surf) < H * 0.05);
+            if (!bOuterBand) { ++InteriorBands; }
+
+            // The band's outer crossing must have geometry from A or B nearby.
+            bool bCovered = false;
+            for (const FLythos2MeshData* Mesh : { &MeshA, &MeshB })
+            {
+                for (const FVector& P : Mesh->Positions)
+                {
+                    if (FVector::DotProduct(P.GetSafeNormal(), Dir) < CosTol) { continue; }
+                    if (FMath::Abs(P.Size() - Band.OuterR) < H * 0.09) { bCovered = true; break; }
+                }
+                if (bCovered) { break; }
+            }
+            if (!bCovered) { ++Uncovered; }
+        }
+    }
+    TestTrue(TEXT("Boundary bands were inspected"), Checked > 0);
+    TestTrue(TEXT("Every shared-boundary solid band has geometry on at least one side"), Uncovered == 0);
+    AddInfo(FString::Printf(TEXT("MultiBandBoundary: checked=%d interiorBands=%d uncovered=%d"), Checked, InteriorBands, Uncovered));
+    return true;
+}
+
+// Two same-LOD/same-N regions on ADJACENT cube faces share an edge; their
+// surface vertices on that edge must coincide (the cube-sphere mapping and the
+// density are global, so the seam welds exactly).
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P35CubeFaceMeshContinuity,
+    "Andromeda.Lythos2.Geometry.CubeFaceMeshContinuity", LythosFlags)
+bool FLythos2P35CubeFaceMeshContinuity::RunTest(const FString& Parameters)
+{
+    const FLythos2PlanetContext Context = MakeGeoContext(350404);
+    FLythos2Settings Settings = MakeSettings(2, 12);
+    Settings.bAdaptiveResolution = false;
+    Settings.SkirtDepthCells = 0.0f;
+
+    // Face 0 (V=1 edge, U in [0.25,0.5]) meets Face 2 (U=1 edge, V in [0.25,0.5])
+    // along the plane Dx = Dy > 0.
+    const FLythos2RegionKey A(0, 2, 1, 3);
+    const FLythos2RegionKey B(2, 2, 3, 1);
+    const FLythos2MeshData MeshA = BuildRegion(Context, A, Settings);
+    const FLythos2MeshData MeshB = BuildRegion(Context, B, Settings);
+    TestTrue(TEXT("Both cube-face neighbours meshed"), MeshA.Indices.Num() > 0 && MeshB.Indices.Num() > 0);
+
+    auto OnSharedEdge = [](const FVector& P)
+    {
+        const FVector D = P.GetSafeNormal();
+        return D.X > 0.0f && D.Y > 0.0f && FMath::Abs(D.X - D.Y) < 1.0e-3f;
+    };
+    TArray<FVector> EdgeA, EdgeB;
+    for (const FVector& P : MeshA.Positions) { if (OnSharedEdge(P)) { EdgeA.Add(P); } }
+    for (const FVector& P : MeshB.Positions) { if (OnSharedEdge(P)) { EdgeB.Add(P); } }
+
+    int32 Unmatched = 0;
+    double WorstGap = 0.0;
+    for (const FVector& P : EdgeA)
+    {
+        double Best = 1.0e30;
+        for (const FVector& Q : EdgeB) { Best = FMath::Min(Best, static_cast<double>(FVector::Dist(P, Q))); }
+        WorstGap = FMath::Max(WorstGap, Best);
+        if (Best > 1.0) { ++Unmatched; }
+    }
+
+    TestTrue(TEXT("Shared cube-face edge has vertices on both sides"), EdgeA.Num() > 0 && EdgeB.Num() > 0);
+    TestTrue(TEXT("Adjacent cube-face regions weld along the shared edge"), Unmatched == 0);
+    AddInfo(FString::Printf(TEXT("CubeFaceMeshContinuity: edgeA=%d edgeB=%d unmatched=%d worstGapCm=%.3f"),
+        EdgeA.Num(), EdgeB.Num(), Unmatched, WorstGap));
+    return true;
+}
+
+// =============================================================================
+// Phase 3.6 - smoothing, spatial coherence, holes and volumetric collision.
+// =============================================================================
+
+namespace
+{
+    /** Mean adjacent-face dihedral angle (deg). Higher = more jagged/faceted. */
+    double LythosMeshIrregularity(const FLythos2MeshData& Mesh)
+    {
+        const int32 TriCount = Mesh.Indices.Num() / 3;
+        TArray<FVector> FaceN;
+        FaceN.SetNumUninitialized(TriCount);
+        for (int32 T = 0; T < TriCount; ++T)
+        {
+            const FVector& A = Mesh.Positions[Mesh.Indices[3 * T]];
+            const FVector& B = Mesh.Positions[Mesh.Indices[3 * T + 1]];
+            const FVector& C = Mesh.Positions[Mesh.Indices[3 * T + 2]];
+            FaceN[T] = FVector::CrossProduct(B - A, C - A).GetSafeNormal();
+        }
+        auto EKey = [](int32 A, int32 B)
+        {
+            const uint32 Lo = static_cast<uint32>(FMath::Min(A, B));
+            const uint32 Hi = static_cast<uint32>(FMath::Max(A, B));
+            return (static_cast<uint64>(Hi) << 32) | Lo;
+        };
+        TMap<uint64, int32> EdgeFace;
+        double Sum = 0.0;
+        int32 Count = 0;
+        for (int32 T = 0; T < TriCount; ++T)
+        {
+            const int32 V[3] = { Mesh.Indices[3 * T], Mesh.Indices[3 * T + 1], Mesh.Indices[3 * T + 2] };
+            for (int32 E = 0; E < 3; ++E)
+            {
+                const uint64 K = EKey(V[E], V[(E + 1) % 3]);
+                if (const int32* F0 = EdgeFace.Find(K))
+                {
+                    const float Dot = FMath::Clamp(FMath::Abs(static_cast<float>(FaceN[T] | FaceN[*F0])), 0.0f, 1.0f);
+                    Sum += FMath::RadiansToDegrees(FMath::Acos(Dot));
+                    ++Count;
+                }
+                else
+                {
+                    EdgeFace.Add(K, T);
+                }
+            }
+        }
+        return Count > 0 ? Sum / Count : 0.0;
+    }
+
+    int32 LythosCountSubsurfaceVerts(const FLythos2MeshData& Mesh, const FLythos2PlanetContext& Context, double MinDropCm)
+    {
+        int32 Count = 0;
+        for (const FVector& P : Mesh.Positions)
+        {
+            const double Macro = Lythos2::Density::SurfaceRadiusCm(Context, P.GetSafeNormal());
+            if (Macro - P.Size() > MinDropCm) { ++Count; }
+        }
+        return Count;
+    }
+}
+
+// Constrained smoothing must reduce high-frequency irregularity while leaving
+// the mesh connectivity (and therefore all volumetric topology) intact.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P36SmoothingReducesIrregularity,
+    "Andromeda.Lythos2.Geomorphology.SmoothingReducesIrregularity", LythosFlags)
+bool FLythos2P36SmoothingReducesIrregularity::RunTest(const FString& Parameters)
+{
+    const FLythos2PlanetContext Context = MakeGeoContext(360101);
+
+    // Pick a detailed region.
+    float BestImp = 0.0f;
+    FLythos2RegionKey Best(4, 2, 1, 1);
+    for (int32 Face = 0; Face < 6; ++Face)
+    {
+        for (int32 X = 1; X <= 2; ++X)
+        {
+            for (int32 Y = 1; Y <= 2; ++Y)
+            {
+                const float Imp = Lythos2::Density::FeatureImportance(Context, Lythos2::CubeSphere::RegionCenterDirection(FLythos2RegionKey(Face, 2, X, Y)));
+                if (Imp > BestImp) { BestImp = Imp; Best = FLythos2RegionKey(Face, 2, X, Y); }
+            }
+        }
+    }
+
+    FLythos2Settings Off = MakeSettings(2, 16);
+    Off.bAdaptiveResolution = true;
+    Off.MaxVolumetricVoxelsPerAxis = 20;
+    Off.VolumetricResolutionLevels = 2;
+    Off.SkirtDepthCells = 0.0f;
+    Off.bSmoothExtractedMesh = false;
+    FLythos2Settings On = Off;
+    On.bSmoothExtractedMesh = true;
+
+    const FLythos2MeshData MeshOff = BuildRegion(Context, Best, Off);
+    const FLythos2MeshData MeshOn = BuildRegion(Context, Best, On);
+    TestTrue(TEXT("Both variants meshed"), MeshOff.Indices.Num() > 0 && MeshOn.Indices.Num() > 0);
+
+    const double IrrOff = LythosMeshIrregularity(MeshOff);
+    const double IrrOn = LythosMeshIrregularity(MeshOn);
+
+    TestTrue(TEXT("Smoothing reduces dihedral irregularity"), IrrOn < IrrOff);
+    TestTrue(TEXT("Connectivity is preserved (topology unchanged)"),
+        MeshOn.Indices.Num() == MeshOff.Indices.Num() && MeshOn.Positions.Num() == MeshOff.Positions.Num());
+    AddInfo(FString::Printf(TEXT("SmoothingIrregularity: irrOff=%.2f irrOn=%.2f"), IrrOff, IrrOn));
+    return true;
+}
+
+// Smoothing must not collapse intentional cavities / overhangs, and must keep
+// the region watertight.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P36SmoothingPreservesFeatures,
+    "Andromeda.Lythos2.Geomorphology.SmoothingPreservesFeatures", LythosFlags)
+bool FLythos2P36SmoothingPreservesFeatures::RunTest(const FString& Parameters)
+{
+    const FLythos2PlanetContext Context = MakeGeoContext(360202);
+    const double H = Context.TerrainHeightCm;
+    FLythos2Settings Settings = MakeSettings(2, 16);
+    Settings.bAdaptiveResolution = true;
+    Settings.MaxVolumetricVoxelsPerAxis = 20;
+    Settings.VolumetricResolutionLevels = 2;
+    Settings.SkirtDepthCells = 0.0f;
+    Settings.bSmoothExtractedMesh = true;
+
+    FLythos2RegionKey Key;
+    FVector Dir = FVector::UpVector;
+    double VT = 0.0, VB = 0.0;
+    const bool bFound = LythosFindVoidRegion(Context, Key, Dir, VT, VB, 0.05);
+    TestTrue(TEXT("A cavity region exists"), bFound);
+    if (!bFound) { return false; }
+
+    const FLythos2MeshData Mesh = BuildRegion(Context, Key, Settings);
+    TestTrue(TEXT("Smoothed cavity region meshed"), Mesh.Indices.Num() > 0);
+    TestTrue(TEXT("Cavity roof/floor surfaces survive smoothing"),
+        LythosCountSubsurfaceVerts(Mesh, Context, H * 0.10) > 0);
+    TestTrue(TEXT("Smoothed region remains watertight (no interior holes)"),
+        LythosCountInteriorOpenEdges(Mesh, Key, Context, 40) == 0);
+
+    AddInfo(FString::Printf(TEXT("SmoothingPreservesFeatures: subsurface=%d"),
+        LythosCountSubsurfaceVerts(Mesh, Context, H * 0.10)));
+    return true;
+}
+
+// Canyon incision is conditioned by the coherent mountain mass: channels in
+// high mountains are incised less than channels in lowlands, so unrelated
+// canyon depressions no longer trench through mountain bodies.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P36CanyonMountainCoherence,
+    "Andromeda.Lythos2.Geomorphology.CanyonMountainCoherence", LythosFlags)
+bool FLythos2P36CanyonMountainCoherence::RunTest(const FString& Parameters)
+{
+    const FLythos2PlanetContext Context = MakeGeoContext(360303);
+    TArray<FVector> Dirs;
+    LythosFibonacciSphere(8000, Dirs);
+
+    TArray<TPair<float, double>> Samples; // (mountainness, incision)
+    for (const FVector& Dir : Dirs)
+    {
+        Lythos2::Density::FLythos2GeologySample S;
+        Lythos2::Density::SampleGeology(Context, Dir, S);
+        // Control for macro elevation (uplift) so the comparison isolates the
+        // mountain conditioning rather than the general highland-erodes-more
+        // term. Channels only.
+        if (S.MacroElev < 0.10f || S.MacroElev > 0.85f) { continue; }
+        if (S.PrimaryDrainage < 0.30f) { continue; }
+        Samples.Add(TPair<float, double>(S.Mountainness, S.ErosionDepthCm));
+    }
+    Samples.Sort([](const TPair<float, double>& A, const TPair<float, double>& B) { return A.Key < B.Key; });
+    const int32 Q = Samples.Num() / 4;
+    TestTrue(TEXT("Enough channel samples"), Q >= 10);
+    if (Q < 10) { return false; }
+
+    double LowMountainInc = 0.0, HighMountainInc = 0.0;
+    for (int32 I = 0; I < Q; ++I)
+    {
+        LowMountainInc += Samples[I].Value;
+        HighMountainInc += Samples[Samples.Num() - 1 - I].Value;
+    }
+    LowMountainInc /= Q;
+    HighMountainInc /= Q;
+
+    TestTrue(TEXT("Channels in mountains are incised less than channels in lowlands"),
+        HighMountainInc < LowMountainInc);
+    AddInfo(FString::Printf(TEXT("CanyonMountainCoherence: lowlandInc=%.0f mountainInc=%.0f"),
+        LowMountainInc, HighMountainInc));
+    return true;
+}
+
+// Rendered geometry and cooked collision are the same 3D triangle surface:
+// collision hits match the render surface, and intentional voids stay empty.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P36RenderCollisionAgreement,
+    "Andromeda.Lythos2.Mesher.RenderCollisionAgreement", LythosFlags)
+bool FLythos2P36RenderCollisionAgreement::RunTest(const FString& Parameters)
+{
+    const FLythos2PlanetContext Context = MakeGeoContext(360404);
+    const double H = Context.TerrainHeightCm;
+    const double R = Context.RadiusCm;
+
+    FLythos2Settings Settings = MakeSettings(2, 20);
+    Settings.bAdaptiveResolution = false;
+    Settings.SkirtDepthCells = 0.0f;
+
+    FLythos2RegionKey Key;
+    FVector VoidDir = FVector::UpVector;
+    double VT = 0.0, VB = 0.0;
+    const bool bFound = LythosFindVoidRegion(Context, Key, VoidDir, VT, VB, 0.05);
+    TestTrue(TEXT("A feature region exists"), bFound);
+    if (!bFound) { return false; }
+
+    const FLythos2MeshData Mesh = BuildRegion(Context, Key, Settings);
+    FLythosTestWorld Fixture;
+    UProceduralMeshComponent* PMC = LythosMakeCollisionComponent(Fixture.World, Mesh);
+
+    // Collision outer surface must match the render surface for many directions.
+    const double Cell = (H * 3.4) / 60.0;
+    int32 Checked = 0, Mismatched = 0;
+    for (int32 A = 0; A < 8; ++A)
+    {
+        for (int32 B = 0; B < 8; ++B)
+        {
+            const FVector Dir = Lythos2::CubeSphere::RegionSampleDirection(Key,
+                (A + 0.5f) / 8.0f, (B + 0.5f) / 8.0f);
+            const double S = Lythos2::Density::FindSurfaceRadiusCm(Context, Dir, H);
+            if (S <= 0.0) { continue; }
+            FHitResult Hit;
+            if (!LythosTraceHit(PMC, Dir * (R * 1.4), Dir * (R * 0.5), Hit)) { continue; }
+            ++Checked;
+            if (FMath::Abs(Hit.ImpactPoint.Size() - S) > Cell * 2.5) { ++Mismatched; }
+        }
+    }
+    TestTrue(TEXT("Render/collision directions were checked"), Checked > 20);
+    TestTrue(TEXT("Collision surface matches the rendered surface"), Mismatched * 8 < Checked);
+
+    // Intentional void: a short segment fully inside the cavity must NOT hit.
+    const double MidR = 0.5 * (VT + VB);
+    FHitResult Hit;
+    const bool bVoidSolid = VT > 0.0 && VB > 0.0 &&
+        LythosTraceHit(PMC, VoidDir * MidR, VoidDir * (MidR + (VT - MidR) * 0.5), Hit);
+    TestTrue(TEXT("Intentional cavity interior stays empty (not solid collision)"), !bVoidSolid);
+
+    AddInfo(FString::Printf(TEXT("RenderCollisionAgreement: checked=%d mismatched=%d voidSolid=%d"),
+        Checked, Mismatched, bVoidSolid ? 1 : 0));
+    return true;
+}
+
+// Streaming collision is deterministic: after convergence the collision-enabled
+// sections equal the viewer-bounded desired set and remain present.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLythos2P36CollisionStability,
+    "Andromeda.Lythos2.Collision.Stability", LythosFlags)
+bool FLythos2P36CollisionStability::RunTest(const FString& Parameters)
+{
+    FLythosTestWorld Fixture;
+    ULythos2WorldSubsystem* Lythos = nullptr;
+    APlanetaryTestPlanet* Planet = SpawnPlanetWithLythos(Fixture, Lythos);
+    if (!Planet || !Lythos) { return false; }
+
+    Lythos->Settings.MaxTerrainLOD = 3;
+    Lythos->Settings.VoxelsPerAxis = 10;
+    Lythos->Settings.MaxActiveRegions = 256;
+    Lythos->Settings.MaxQueuedBuilds = 64;
+    Lythos->Settings.bEnableCollision = true;
+    Lythos->Settings.CollisionDistanceScale = 0.15f;
+    Lythos->Settings.CollisionUpdateIntervalTicks = 2;
+
+    const FVector Up = FVector(0.4f, -0.5f, 0.75f).GetSafeNormal();
+    Lythos->SetViewerWorldOverride(true, Planet->GetActorLocation() + Up * Planet->PlanetRadius);
+    for (int32 I = 0; I < 300; ++I) { Fixture.Tick(1.0f / 60.0f); FPlatformProcess::Sleep(0.002f); }
+
+    UProceduralMeshComponent* PMC = Planet->PlanetProceduralMesh;
+    int32 CollA = 0;
+    for (int32 S = 0; S < PMC->GetNumSections(); ++S)
+    {
+        if (const FProcMeshSection* Sec = PMC->GetProcMeshSection(S))
+        {
+            if (Sec->bEnableCollision && Sec->ProcIndexBuffer.Num() >= 3) { ++CollA; }
+        }
+    }
+
+    // Idle further: collision must remain present (not vanish / go stale).
+    for (int32 I = 0; I < 60; ++I) { Fixture.Tick(1.0f / 60.0f); FPlatformProcess::Sleep(0.001f); }
+    int32 CollB = 0;
+    for (int32 S = 0; S < PMC->GetNumSections(); ++S)
+    {
+        if (const FProcMeshSection* Sec = PMC->GetProcMeshSection(S))
+        {
+            if (Sec->bEnableCollision && Sec->ProcIndexBuffer.Num() >= 3) { ++CollB; }
+        }
+    }
+
+    TestTrue(TEXT("Collision is present on the viewer's regions"), CollA > 0);
+    TestTrue(TEXT("Collision persists while idle (deterministic, not stale-empty)"), CollB >= CollA);
+    AddInfo(FString::Printf(TEXT("CollisionStability: collA=%d collB=%d sections=%d"), CollA, CollB, PMC->GetNumSections()));
     return true;
 }
 

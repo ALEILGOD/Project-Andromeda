@@ -55,6 +55,13 @@ namespace Lythos2
             int32 OverhangAccepted = 0;
             int32 CavityAccepted = 0;
             int32 BridgeAccepted = 0;
+
+            // Phase 3.5 depth-stratified geology (diagnostics/tests).
+            float LayerThickness = 0.0f;
+            float LayerAlcoveStrength = 0.0f;
+
+            // Phase 3.6 macro conditioning (diagnostics/tests).
+            float Mountainness = 0.0f;
         };
 
         ANDROMEDA_API void SampleGeology(

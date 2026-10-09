@@ -62,9 +62,9 @@ namespace
         int32 GetOrAddVertex(const FVector& P, const FVector& N, const FColor& Color) const
         {
             const FIntVector Key(
-                FMath::RoundToInt(P.X * 64.0),
-                FMath::RoundToInt(P.Y * 64.0),
-                FMath::RoundToInt(P.Z * 64.0));
+                FMath::RoundToInt(P.X * 2048.0),
+                FMath::RoundToInt(P.Y * 2048.0),
+                FMath::RoundToInt(P.Z * 2048.0));
 
             if (const int32* Existing = VertexLookup.Find(Key))
             {
@@ -707,71 +707,211 @@ namespace Lythos2
                 }
             }
 
-            // -----------------------------------------------------------------
-            // Phase 3.2 seamless transition collar.
-            //
-            // The collar is only a bounded crack-filler at the real density
-            // surface. Phase 3.1 sized it from the LATERAL cell, which at low
-            // LOD produced kilometre-long vertical sheets (visible stretch) that
-            // also sealed across cavities. It is now sized from the actual seam
-            // magnitude (the fine boundary surface's deviation from the coarser
-            // every-other chord) plus a couple of radial cells, and it is
-            // clamped to the local SOLID thickness so it never crosses a void.
-            // -----------------------------------------------------------------
+            // Radial cell size (used by smoothing fix-tolerance and the collar).
             const double RadialCell = (RMax - RMin) / FMath::Max(1, Nr);
+
+            // -----------------------------------------------------------------
+            // Phase 3.6 constrained, topology-aware smoothing.
+            //
+            // Reduces high-frequency mesh jitter that makes the terrain look
+            // procedurally generated, while preserving real geology:
+            //   * only INTERIOR vertices move - domain-boundary vertices are
+            //     frozen, so cross-region welds and the density-conforming collar
+            //     stay exact;
+            //   * neighbour weights are bilateral (normal similarity), so the two
+            //     sides of a sharp crease or thin wall are not averaged together;
+            //   * displacement is bounded per iteration (no runaway shrinkage);
+            //   * connectivity is unchanged, so overhangs, alcoves and cavity
+            //     roofs/floors are preserved.
+            // -----------------------------------------------------------------
+            if (Settings.bSmoothExtractedMesh && Settings.MeshSmoothingIterations > 0
+                && OutMesh.Positions.Num() > 0)
+            {
+                const int32 VCount = OutMesh.Positions.Num();
+
+                // Neighbours + incident triangles + topology-based boundary set.
+                TArray<TArray<int32>> Neighbors;
+                TArray<TArray<int32>> IncidentTris;
+                Neighbors.SetNum(VCount);
+                IncidentTris.SetNum(VCount);
+                auto AddN = [&Neighbors](int32 A, int32 B)
+                {
+                    if (A != B && !Neighbors[A].Contains(B)) { Neighbors[A].Add(B); }
+                };
+                TMap<uint64, int32> EdgeUse;
+                auto EdgeKey = [](int32 A, int32 B)
+                {
+                    const uint32 Lo = static_cast<uint32>(FMath::Min(A, B));
+                    const uint32 Hi = static_cast<uint32>(FMath::Max(A, B));
+                    return (static_cast<uint64>(Hi) << 32) | Lo;
+                };
+                for (int32 T = 0; T + 2 < OutMesh.Indices.Num(); T += 3)
+                {
+                    const int32 A = OutMesh.Indices[T], B = OutMesh.Indices[T + 1], C = OutMesh.Indices[T + 2];
+                    AddN(A, B); AddN(A, C); AddN(B, C);
+                    IncidentTris[A].Add(T); IncidentTris[B].Add(T); IncidentTris[C].Add(T);
+                    ++EdgeUse.FindOrAdd(EdgeKey(A, B));
+                    ++EdgeUse.FindOrAdd(EdgeKey(B, C));
+                    ++EdgeUse.FindOrAdd(EdgeKey(C, A));
+                }
+                // Domain-boundary vertices = incident to an open (used-once)
+                // edge. The isosurface is watertight internally, so these are
+                // exactly the region sampling-domain boundary; freezing them
+                // preserves cross-region welds and the collar, and works even at
+                // ambiguous cube-face edges where DirectionToFaceUV is unreliable.
+                TArray<uint8> Fixed;
+                Fixed.Init(0, VCount);
+                for (const TPair<uint64, int32>& E : EdgeUse)
+                {
+                    if (E.Value == 1)
+                    {
+                        Fixed[static_cast<int32>(E.Key & 0xffffffffu)] = 1;
+                        Fixed[static_cast<int32>(E.Key >> 32)] = 1;
+                    }
+                }
+
+                const float Strength = FMath::Clamp(Settings.MeshSmoothingStrength, 0.0f, 1.0f);
+                TArray<FVector> Curr = OutMesh.Positions;
+                TArray<FVector> Next = Curr;
+                for (int32 Iter = 0; Iter < Settings.MeshSmoothingIterations; ++Iter)
+                {
+                    for (int32 V = 0; V < VCount; ++V)
+                    {
+                        if (Fixed[V] || Neighbors[V].Num() == 0)
+                        {
+                            Next[V] = Curr[V];
+                            continue;
+                        }
+                        const FVector Ni = OutMesh.Normals[V];
+                        FVector Sum = FVector::ZeroVector;
+                        float WSum = 0.0f;
+                        float AvgEdge = 0.0f;
+                        for (int32 J : Neighbors[V])
+                        {
+                            const float W = FMath::Max(0.0f, static_cast<float>(FVector::DotProduct(Ni, OutMesh.Normals[J])));
+                            Sum += Curr[J] * W;
+                            WSum += W;
+                            AvgEdge += static_cast<float>(FVector::Dist(Curr[V], Curr[J]));
+                        }
+                        AvgEdge /= static_cast<float>(Neighbors[V].Num());
+                        if (WSum > 1.0e-6f)
+                        {
+                            FVector Delta = (Sum / WSum) - Curr[V];
+                            const float MaxD = 0.30f * AvgEdge;
+                            if (Delta.SizeSquared() > MaxD * MaxD)
+                            {
+                                Delta = Delta.GetSafeNormal() * MaxD;
+                            }
+                            FVector Candidate = Curr[V] + Delta * Strength;
+
+                            // Anti-fold guard: never move a vertex if it would
+                            // invert any incident triangle's winding.
+                            for (int32 Guard = 0; Guard < 4; ++Guard)
+                            {
+                                bool bFlip = false;
+                                for (int32 T : IncidentTris[V])
+                                {
+                                    const int32 A = OutMesh.Indices[T], B = OutMesh.Indices[T + 1], C = OutMesh.Indices[T + 2];
+                                    const FVector PA = (A == V) ? Candidate : Curr[A];
+                                    const FVector PB = (B == V) ? Candidate : Curr[B];
+                                    const FVector PC = (C == V) ? Candidate : Curr[C];
+                                    const FVector N0 = FVector::CrossProduct(Curr[B] - Curr[A], Curr[C] - Curr[A]);
+                                    const FVector N1 = FVector::CrossProduct(PB - PA, PC - PA);
+                                    if (FVector::DotProduct(N0, N1) < 0.0f) { bFlip = true; break; }
+                                }
+                                if (!bFlip) { break; }
+                                Candidate = FMath::Lerp(Curr[V], Candidate, 0.5f);
+                            }
+                            Next[V] = Candidate;
+                        }
+                        else
+                        {
+                            Next[V] = Curr[V];
+                        }
+                    }
+                    Swap(Curr, Next);
+                }
+                OutMesh.Positions = MoveTemp(Curr);
+
+                // Recompute vertex normals from the smoothed geometry (area
+                // weighted). Outward convention = -cross(B-A, C-A), matching
+                // EmitTriangle (cross points into solid, -cross into empty space).
+                for (FVector& Nrm : OutMesh.Normals) { Nrm = FVector::ZeroVector; }
+                for (int32 T = 0; T + 2 < OutMesh.Indices.Num(); T += 3)
+                {
+                    const int32 A = OutMesh.Indices[T], B = OutMesh.Indices[T + 1], C = OutMesh.Indices[T + 2];
+                    const FVector Fn = -FVector::CrossProduct(
+                        OutMesh.Positions[B] - OutMesh.Positions[A],
+                        OutMesh.Positions[C] - OutMesh.Positions[A]);
+                    OutMesh.Normals[A] += Fn;
+                    OutMesh.Normals[B] += Fn;
+                    OutMesh.Normals[C] += Fn;
+                }
+                for (FVector& Nrm : OutMesh.Normals)
+                {
+                    if (!Nrm.Normalize()) { Nrm = FVector::UpVector; }
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // Phase 3.5 multi-band transition collar.
+            //
+            // The collar is a bounded, density-conforming crack-filler. It now
+            // seals EVERY solid band along the boundary (the terrain band AND the
+            // roof/floor bands of any cavity, overhang or bridge), not just the
+            // outermost surface, so volumetric features crossing a mixed-
+            // resolution boundary no longer leave open seams. Each curtain is
+            // sized from the actual seam magnitude and clamped to that band's
+            // thickness, so it never crosses empty space, creates a visible wall
+            // in the open, or stretches.
+            // -----------------------------------------------------------------
 
             if (Settings.SkirtDepthCells > 0.0)
             {
-                // Outer surface radius + contiguous solid thickness from an
-                // already-sampled grid column. Exact to the surface mesh samples.
-                auto ColumnInfo = [&](int32 CI, int32 CJ, double& OutSurf, double& OutThick) -> bool
+                struct FSolidBand { double Top; double Bot; };
+
+                auto ColumnSolidBands = [&](int32 CI, int32 CJ, TArray<FSolidBand>& OutBands)
                 {
-                    double PrevR = 0.0;
-                    double PrevV = 0.0;
-                    bool bHavePrev = false;
-                    for (int32 K = Sr - 1; K >= 0; --K)
+                    OutBands.Reset();
+                    double PrevR = Positions[Index(CI, CJ, Sr - 1)].Size();
+                    double PrevV = Values[Index(CI, CJ, Sr - 1)];
+                    int32 PrevSign = PrevV > 0.0 ? 1 : (PrevV < 0.0 ? -1 : 0);
+                    bool bOpen = PrevSign > 0;
+                    double OpenTop = bOpen ? PrevR : 0.0;
+                    for (int32 K = Sr - 2; K >= 0; --K)
                     {
                         const int32 Idx = Index(CI, CJ, K);
                         const double V = Values[Idx];
                         const double Rr = Positions[Idx].Size();
-                        if (V > 0.0)
+                        const int32 Sign = V > 0.0 ? 1 : (V < 0.0 ? -1 : 0);
+                        if (PrevSign <= 0 && Sign > 0)
                         {
-                            if (!bHavePrev) { OutSurf = Rr; }
-                            else
-                            {
-                                const double T = (-PrevV) / (V - PrevV);
-                                OutSurf = FMath::Lerp(PrevR, Rr, T);
-                            }
-                            // First empty sample below -> contiguous solid thickness.
-                            double SolidR = Rr;
-                            double SolidV = V;
-                            bool bFoundInner = false;
-                            for (int32 K2 = K - 1; K2 >= 0; --K2)
-                            {
-                                const int32 Idx2 = Index(CI, CJ, K2);
-                                const double V2 = Values[Idx2];
-                                const double R2 = Positions[Idx2].Size();
-                                if (V2 <= 0.0)
-                                {
-                                    const double T2 = SolidV / (SolidV - V2);
-                                    OutThick = OutSurf - FMath::Lerp(SolidR, R2, T2);
-                                    bFoundInner = true;
-                                    break;
-                                }
-                                SolidR = R2;
-                                SolidV = V2;
-                            }
-                            if (!bFoundInner)
-                            {
-                                OutThick = OutSurf - RMin;
-                            }
-                            return true;
+                            const double Den = V - PrevV;
+                            const double T = FMath::Abs(Den) > 1.0e-12 ? (-PrevV) / Den : 0.5;
+                            OpenTop = FMath::Lerp(PrevR, Rr, T);
+                            bOpen = true;
+                        }
+                        else if (PrevSign > 0 && Sign <= 0)
+                        {
+                            const double Den = PrevV - V;
+                            const double T = FMath::Abs(Den) > 1.0e-12 ? PrevV / Den : 0.5;
+                            FSolidBand Band;
+                            Band.Top = OpenTop;
+                            Band.Bot = FMath::Lerp(PrevR, Rr, T);
+                            OutBands.Add(Band);
+                            bOpen = false;
                         }
                         PrevR = Rr;
                         PrevV = V;
-                        bHavePrev = true;
+                        PrevSign = Sign;
                     }
-                    return false;
+                    if (bOpen)
+                    {
+                        FSolidBand Band;
+                        Band.Top = OpenTop;
+                        Band.Bot = RMin;
+                        OutBands.Add(Band);
+                    }
                 };
 
                 struct FBoundaryDef { int32 FixedAxis; int32 FixedIndex; };
@@ -780,38 +920,32 @@ namespace Lythos2
                     { 0, 0 }, { 0, N }, { 1, 0 }, { 1, N }
                 };
 
+                TArray<TArray<FSolidBand>> ColumnBands;
+                TArray<double> Surf;
+                ColumnBands.SetNum(N + 1);
+                Surf.SetNumUninitialized(N + 1);
+
                 for (const FBoundaryDef& B : Boundaries)
                 {
-                    TArray<double> Surf;
-                    TArray<double> Thick;
-                    TArray<uint8> Valid;
-                    Surf.SetNumUninitialized(N + 1);
-                    Thick.SetNumUninitialized(N + 1);
-                    Valid.SetNumUninitialized(N + 1);
-
                     for (int32 C = 0; C <= N; ++C)
                     {
                         const int32 CI = (B.FixedAxis == 0) ? B.FixedIndex : C;
                         const int32 CJ = (B.FixedAxis == 0) ? C : B.FixedIndex;
-                        double S = 0.0, Tk = 0.0;
-                        Valid[C] = ColumnInfo(CI, CJ, S, Tk) ? uint8(1) : uint8(0);
-                        Surf[C] = S;
-                        Thick[C] = Tk;
+                        ColumnSolidBands(CI, CJ, ColumnBands[C]);
+                        Surf[C] = ColumnBands[C].Num() > 0 ? ColumnBands[C][0].Top : -1.0;
                     }
 
-                    // Actual seam magnitude against a one-step-coarser neighbour:
-                    // curvature (second difference) AND the elevation drop (first
-                    // difference) across the boundary. A deep depression produces
-                    // a large seam that the curvature term alone under-sizes.
+                    // Seam magnitude against a one-step-coarser neighbour:
+                    // curvature (second difference) AND elevation drop (first).
                     double Crack = 0.0;
                     double MaxDropC = 0.0;
                     for (int32 C = 1; C < N; ++C)
                     {
-                        if (Valid[C] && Valid[C - 1])
+                        if (Surf[C] > 0.0 && Surf[C - 1] > 0.0)
                         {
                             MaxDropC = FMath::Max(MaxDropC, FMath::Abs(Surf[C] - Surf[C - 1]));
                         }
-                        if (Valid[C] && Valid[C - 1] && Valid[C + 1])
+                        if (Surf[C] > 0.0 && Surf[C - 1] > 0.0 && Surf[C + 1] > 0.0)
                         {
                             Crack = FMath::Max(Crack,
                                 FMath::Abs(Surf[C] - 0.5 * (Surf[C - 1] + Surf[C + 1])));
@@ -822,12 +956,8 @@ namespace Lythos2
 
                     for (int32 C = 0; C < N; ++C)
                     {
-                        if (!Valid[C] || !Valid[C + 1])
-                        {
-                            continue;
-                        }
-                        const double SegDepth = FMath::Min(BoundaryDepth, FMath::Min(Thick[C], Thick[C + 1]));
-                        if (SegDepth <= 1.0)
+                        const int32 BandCount = FMath::Min(ColumnBands[C].Num(), ColumnBands[C + 1].Num());
+                        if (BandCount <= 0)
                         {
                             continue;
                         }
@@ -854,26 +984,39 @@ namespace Lythos2
                         const FVector D0 = CubeSphere::RegionSampleDirection(Key, U0, V0);
                         const FVector D1 = CubeSphere::RegionSampleDirection(Key, U1, V1);
 
-                        // A hair inward keeps the collar from z-fighting; it
-                        // never rises above the real surface.
-                        const double Top0R = FMath::Max(Surf[C] - 1.0, RMin);
-                        const double Top1R = FMath::Max(Surf[C + 1] - 1.0, RMin);
-
-                        const FVector Top0 = D0 * Top0R;
-                        const FVector Top1 = D1 * Top1R;
-                        const FVector Bot0 = D0 * FMath::Max(Top0R - SegDepth, RMin);
-                        const FVector Bot1 = D1 * FMath::Max(Top1R - SegDepth, RMin);
-
-                        const FVector QuadCenter = (Top0 + Top1 + Bot1 + Bot0) * 0.25;
-                        const FVector CenterPoint = CubeSphere::RegionCenterDirection(Key) * QuadCenter.Size();
-                        FVector OutwardRef = (QuadCenter - CenterPoint).GetSafeNormal();
-                        if (OutwardRef.IsNearlyZero())
+                        for (int32 BandIdx = 0; BandIdx < BandCount; ++BandIdx)
                         {
-                            OutwardRef = QuadCenter.GetSafeNormal();
-                        }
+                            const FSolidBand& Band0 = ColumnBands[C][BandIdx];
+                            const FSolidBand& Band1 = ColumnBands[C + 1][BandIdx];
+                            const double Thick0 = Band0.Top - Band0.Bot;
+                            const double Thick1 = Band1.Top - Band1.Bot;
+                            const double SegDepth = FMath::Min(BoundaryDepth, FMath::Min(Thick0, Thick1));
+                            if (SegDepth <= 1.0)
+                            {
+                                continue;
+                            }
 
-                        Build.AppendTriangle(Top0, Top1, Bot1, D0, D1, D1, OutwardRef);
-                        Build.AppendTriangle(Top0, Bot1, Bot0, D0, D1, D0, OutwardRef);
+                            // A hair inward keeps the collar from z-fighting; it
+                            // never rises above the real surface.
+                            const double Top0R = FMath::Max(Band0.Top - 1.0, RMin);
+                            const double Top1R = FMath::Max(Band1.Top - 1.0, RMin);
+
+                            const FVector Top0 = D0 * Top0R;
+                            const FVector Top1 = D1 * Top1R;
+                            const FVector Bot0 = D0 * FMath::Max(Top0R - SegDepth, RMin);
+                            const FVector Bot1 = D1 * FMath::Max(Top1R - SegDepth, RMin);
+
+                            const FVector QuadCenter = (Top0 + Top1 + Bot1 + Bot0) * 0.25;
+                            const FVector CenterPoint = CubeSphere::RegionCenterDirection(Key) * QuadCenter.Size();
+                            FVector OutwardRef = (QuadCenter - CenterPoint).GetSafeNormal();
+                            if (OutwardRef.IsNearlyZero())
+                            {
+                                OutwardRef = QuadCenter.GetSafeNormal();
+                            }
+
+                            Build.AppendTriangle(Top0, Top1, Bot1, D0, D1, D1, OutwardRef);
+                            Build.AppendTriangle(Top0, Bot1, Bot0, D0, D1, D0, OutwardRef);
+                        }
                     }
                 }
             }

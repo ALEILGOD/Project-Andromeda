@@ -310,16 +310,19 @@ bool UAndromedaPawnMovement::SweepMotion(const FVector& Start, const FVector& En
             const FQuat QHit = FQuat::Slerp(QA, QB, Fraction);
             const FVector Center = FMath::Lerp(A.WorldPosition, B.WorldPosition, Fraction);
             const FVector Position = FMath::Lerp(Start, End, double(Hit.Time));
-            Hit.Normal = QHit.RotateVector(LivePose.GetRotation().UnrotateVector(Hit.Normal));
-            Hit.ImpactNormal = QHit.RotateVector(LivePose.GetRotation().UnrotateVector(Hit.ImpactNormal));
-            // These procedural planets are closed radial height fields. A
-            // solid-body contact points outward, including initial overlaps;
-            // a triangle's backface must not trap an ascending sphere inside.
-            if ((Hit.Normal | (Position - Center)) < 0.0)
+            // True 3D contact normal: from the obstacle surface toward the sphere
+            // centre. This is correct for ANY surface orientation (vertical
+            // walls, overhang ceilings, cavity roofs and floors) and does NOT
+            // assume the terrain is a radial height field.
+            const FVector CenterAtHit = FMath::Lerp(QueryStart, QueryEnd, double(Hit.Time));
+            FVector WorldNormal = CenterAtHit - Hit.ImpactPoint;
+            if (WorldNormal.SizeSquared() < 1.0e-12)
             {
-                Hit.Normal *= -1.0;
-                Hit.ImpactNormal *= -1.0;
+                WorldNormal = Hit.Normal;
             }
+            WorldNormal = WorldNormal.GetSafeNormal();
+            Hit.Normal = QHit.RotateVector(LivePose.GetRotation().UnrotateVector(WorldNormal));
+            Hit.ImpactNormal = Hit.Normal;
             Hit.Location = Position;
             Hit.ImpactPoint = Position - Hit.Normal * PlanetShape.GetSphereRadius();
             OutContactVelocity = FMath::Lerp(A.OrbitalVelocity, B.OrbitalVelocity, Fraction)

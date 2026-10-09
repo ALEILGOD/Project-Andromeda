@@ -351,6 +351,24 @@ struct ANDROMEDA_API FLythos2Settings
     bool bLocalRadialRefinement = true;
 
     // =====================================================================
+    // Phase 3.6 constrained, topology-aware smoothing of the extracted mesh.
+    // Interior vertices are smoothed with a bilateral (normal-similarity)
+    // filter; domain-boundary vertices are frozen so cross-region welds and the
+    // density-conforming collar stay exact. Connectivity is unchanged, so
+    // overhangs/alcoves/cavity roofs and floors are preserved.
+    // =====================================================================
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LYTHOS2|Geology")
+    bool bSmoothExtractedMesh = true;
+
+    /** Per-iteration blend of a vertex toward its filtered position [0,1]. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LYTHOS2|Geology", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float MeshSmoothingStrength = 0.40f;
+
+    /** Number of smoothing iterations. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LYTHOS2|Geology", meta = (ClampMin = "0", ClampMax = "8"))
+    int32 MeshSmoothingIterations = 2;
+
+    // =====================================================================
     // Phase 1.1 runtime budgets. These are what keep close-range streaming
     // responsive: work is bounded independently for generation, meshing,
     // completed backlog, uploads, collision, swaps and unloads.
@@ -385,19 +403,23 @@ struct ANDROMEDA_API FLythos2Settings
 
     /**
      * Only regions within (Radius * this) of the viewer receive collision.
-     * Coarse seed roots always collide. This keeps the per-tick collision cook
-     * bounded to the player's neighbourhood instead of the whole planet.
+     * This keeps the per-cook collision bounded to the player's neighbourhood
+     * instead of the whole planet (including the huge LOD-0 roots).
      */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LYTHOS2|Collision", meta = (ClampMin = "0.01"))
-    float CollisionDistanceScale = 0.2f;
+    float CollisionDistanceScale = 0.05f;
 
     /** Minimum ticks between collision recooks while streaming (throttle). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LYTHOS2|Collision", meta = (ClampMin = "1"))
-    int32 CollisionUpdateIntervalTicks = 2;
+    int32 CollisionUpdateIntervalTicks = 8;
 
-    /** Cook streamed collision off the game thread where supported. */
+    /**
+     * Phase 3.6: streamed collision is cooked synchronously for determinism
+     * (async cooks could apply stale/empty geometry after a newer mesh was
+     * installed). Kept configurable for future backends.
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LYTHOS2|Collision")
-    bool bUseAsyncCollisionCooking = true;
+    bool bUseAsyncCollisionCooking = false;
 
     // =====================================================================
     // Telemetry (written by the streamer; read by tests/debug tooling).
